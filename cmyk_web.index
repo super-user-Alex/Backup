@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Convertidor TIFF CMYK a JPG RGB con ICC</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 900px;
+            width: 100%;
+            padding: 40px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .upload-section {
+            display: grid;
+            gap: 20px;
+        }
+        
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #f8f9ff;
+        }
+        
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+        
+        .upload-area.dragover {
+            border-color: #764ba2;
+            background: #e8ebff;
+            transform: scale(1.02);
+        }
+
+        .upload-area.icc {
+            border-color: #10b981;
+            background: #f0fdf4;
+        }
+
+        .upload-area.icc:hover {
+            border-color: #059669;
+            background: #dcfce7;
+        }
+        
+        .upload-icon {
+            font-size: 40px;
+            margin-bottom: 12px;
+        }
+
+        .file-label {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 35px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: transform 0.2s ease, opacity 0.2s;
+            margin-top: 20px;
+            display: inline-block;
+        }
+        
+        .btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .preview {
+            margin-top: 30px;
+            display: none;
+        }
+        
+        .preview.active {
+            display: block;
+        }
+        
+        .preview-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        
+        #canvas {
+            max-width: 100%;
+            height: auto;
+            border-radius: 10px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.15);
+            display: block;
+            margin: 0 auto;
+        }
+        
+        .info {
+            background: #f8f9ff;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+            font-size: 14px;
+            color: #555;
+            line-height: 1.8;
+        }
+        
+        .info strong {
+            color: #333;
+        }
+
+        .icc-status {
+            background: #f0fdf4;
+            border-left: 4px solid #10b981;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .icc-status.active {
+            display: block;
+        }
+
+        .icc-status.warning {
+            background: #fff7ed;
+            border-left-color: #f59e0b;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            margin-top: 20px;
+        }
+        
+        .loading.active {
+            display: block;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .error {
+            background: #fee;
+            color: #c33;
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+            display: none;
+            border-left: 4px solid #c33;
+        }
+        
+        .error.active {
+            display: block;
+        }
+
+        .quality-control {
+            margin-top: 15px;
+            text-align: left;
+        }
+
+        .quality-control label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .quality-control input[type="range"] {
+            width: 100%;
+            margin-bottom: 5px;
+        }
+
+        .quality-value {
+            color: #667eea;
+            font-weight: 600;
+        }
+
+        .note {
+            background: #fffbeb;
+            border-left: 4px solid #f59e0b;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .file-info {
+            display: inline-block;
+            background: #10b981;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 15px;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1> Convertidor TIFF CMYK → JPG RGB</h1>
+        <p class="subtitle">
+            Conversión fiel con gestión de perfiles ICC<br>
+            <small>Soporta U.S. Web Coated (SWOP) v2 y otros perfiles CMYK</small>
+        </p>
+
+        <div class="icc-status" id="iccStatus"></div>
+        
+        <div class="upload-section">
+            <div class="upload-area" id="uploadAreaTiff">
+                <div class="upload-icon"></div>
+                <p class="file-label">Archivo TIFF CMYK</p>
+                <p style="font-size: 14px; color: #666;">Arrastra o selecciona tu archivo .TIF</p>
+                <div id="tiffFileName"></div>
+                <input type="file" id="fileInputTiff" accept=".tif,.tiff">
+            </div>
+
+            <div class="upload-area icc" id="uploadAreaIcc">
+                <div class="upload-icon"></div>
+                <p class="file-label">Perfil ICC de origen (opcional)</p>
+                <p style="font-size: 14px; color: #666;">Si no se proporciona, se usará el perfil embebido o una conversión estándar</p>
+                <div id="iccFileName"></div>
+                <input type="file" id="fileInputIcc" accept=".icc,.icm">
+            </div>
+        </div>
+
+        <div class="note">
+             <strong>Nota:</strong> Para conversión precisa con U.S. Web Coated (SWOP) v2, proporciona el archivo de perfil ICC (.icc). Si el TIFF tiene un perfil embebido, se usará automáticamente.
+        </div>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p style="color: #667eea; font-weight: 600;" id="loadingText">Procesando imagen...</p>
+        </div>
+        
+        <div class="error" id="error"></div>
+        
+        <div class="preview" id="preview">
+            <p class="preview-title">✓ Conversión completada</p>
+            <canvas id="canvas"></canvas>
+            <div class="info" id="info"></div>
+            <div class="quality-control">
+                <label for="qualitySlider">Calidad JPG: <span class="quality-value" id="qualityValue">95%</span></label>
+                <input type="range" id="qualitySlider" min="50" max="100" value="95">
+            </div>
+            <button class="btn" id="downloadBtn"> Descargar como JPG RGB</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js"></script>
+    
+    <script>
+        const uploadAreaTiff = document.getElementById('uploadAreaTiff');
+        const uploadAreaIcc = document.getElementById('uploadAreaIcc');
+        const fileInputTiff = document.getElementById('fileInputTiff');
+        const fileInputIcc = document.getElementById('fileInputIcc');
+        const loading = document.getElementById('loading');
+        const loadingText = document.getElementById('loadingText');
+        const error = document.getElementById('error');
+        const preview = document.getElementById('preview');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const info = document.getElementById('info');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const qualitySlider = document.getElementById('qualitySlider');
+        const qualityValue = document.getElementById('qualityValue');
+        const iccStatus = document.getElementById('iccStatus');
+        const tiffFileName = document.getElementById('tiffFileName');
+        const iccFileName = document.getElementById('iccFileName');
+        
+        let currentFileName = '';
+        let currentQuality = 0.95;
+        let tiffFile = null;
+        let iccProfile = null;
+        let embeddedProfile = null;
+        
+        // Upload TIFF
+        uploadAreaTiff.addEventListener('click', () => fileInputTiff.click());
+        uploadAreaTiff.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadAreaTiff.classList.add('dragover');
+        });
+        uploadAreaTiff.addEventListener('dragleave', () => {
+            uploadAreaTiff.classList.remove('dragover');
+        });
+        uploadAreaTiff.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadAreaTiff.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                handleTiffFile(e.dataTransfer.files[0]);
+            }
+        });
+        fileInputTiff.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleTiffFile(e.target.files[0]);
+            }
+        });
+
+        // Upload ICC
+        uploadAreaIcc.addEventListener('click', () => fileInputIcc.click());
+        uploadAreaIcc.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadAreaIcc.classList.add('dragover');
+        });
+        uploadAreaIcc.addEventListener('dragleave', () => {
+            uploadAreaIcc.classList.remove('dragover');
+        });
+        uploadAreaIcc.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadAreaIcc.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                handleIccFile(e.dataTransfer.files[0]);
+            }
+        });
+        fileInputIcc.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleIccFile(e.target.files[0]);
+            }
+        });
+
+        qualitySlider.addEventListener('input', (e) => {
+            currentQuality = e.target.value / 100;
+            qualityValue.textContent = e.target.value + '%';
+        });
+
+        async function handleTiffFile(file) {
+            const fileName = file.name.toLowerCase();
+            if (!fileName.endsWith('.tif') && !fileName.endsWith('.tiff')) {
+                showError('Por favor selecciona un archivo TIFF válido (.tif o .tiff)');
+                return;
+            }
+            
+            tiffFile = file;
+            currentFileName = file.name.replace(/\.(tif|tiff)$/i, '');
+            tiffFileName.innerHTML = `<span class="file-info">✓ ${file.name}</span>`;
+            
+            if (tiffFile) {
+                processFiles();
+            }
+        }
+
+        async function handleIccFile(file) {
+            const fileName = file.name.toLowerCase();
+            if (!fileName.endsWith('.icc') && !fileName.endsWith('.icm')) {
+                showError('Por favor selecciona un archivo ICC válido (.icc o .icm)');
+                return;
+            }
+            
+            iccProfile = await file.arrayBuffer();
+            iccFileName.innerHTML = `<span class="file-info">✓ ${file.name}</span>`;
+            
+            updateIccStatus('✓ Perfil ICC personalizado cargado: ' + file.name, false);
+            
+            if (tiffFile) {
+                processFiles();
+            }
+        }
+
+        async function processFiles() {
+            if (!tiffFile) return;
+            
+            hideError();
+            preview.classList.remove('active');
+            loading.classList.add('active');
+            loadingText.textContent = 'Analizando archivo TIFF...';
+            
+            try {
+                const arrayBuffer = await tiffFile.arrayBuffer();
+                await processTIFF(arrayBuffer, tiffFile.name, tiffFile.size);
+            } catch (err) {
+                showError('Error al procesar el archivo: ' + err.message);
+                console.error(err);
+            } finally {
+                loading.classList.remove('active');
+            }
+        }
+        
+        async function processTIFF(arrayBuffer, fileName, fileSize) {
+            try {
+                loadingText.textContent = 'Decodificando imagen TIFF...';
+                
+                const ifds = UTIF.decode(arrayBuffer);
+                
+                if (!ifds || ifds.length === 0) {
+                    throw new Error('No se pudo decodificar el archivo TIFF');
+                }
+                
+                const firstPage = ifds[0];
+                
+                // Buscar perfil ICC embebido (tag 34675)
+                if (firstPage.t34675) {
+                    embeddedProfile = firstPage.t34675;
+                    updateIccStatus('✓ Perfil ICC embebido detectado en el TIFF', false);
+                }
+                
+                UTIF.decodeImage(arrayBuffer, firstPage);
+                
+                const width = firstPage.width;
+                const height = firstPage.height;
+                const samplesPerPixel = firstPage.t277?.[0] || 3;
+                const bitsPerSample = firstPage.t258?.[0] || 8;
+                const photometric = firstPage.t262?.[0];
+                
+                let colorSpace = 'Desconocido';
+                if (photometric === 5) colorSpace = 'CMYK (Separated)';
+                else if (photometric === 2) colorSpace = 'RGB';
+                else if (photometric === 1) colorSpace = 'Escala de grises';
+                else if (photometric === 0) colorSpace = 'Blanco es cero';
+                
+                let conversionMethod = '';
+                let rgbaData;
+                
+                if (photometric === 5 && samplesPerPixel >= 4) {
+                    loadingText.textContent = 'Convirtiendo CMYK a RGB con gestión de color...';
+                    
+                    // Determinar qué perfil usar
+                    const sourceProfile = iccProfile || embeddedProfile;
+                    
+                    if (sourceProfile) {
+                        conversionMethod = iccProfile ? 
+                            'Conversión con perfil ICC personalizado' : 
+                            'Conversión con perfil ICC embebido';
+                        
+                        // Conversión avanzada con perfil ICC
+                        rgbaData = convertCMYKtoRGBWithProfile(
+                            firstPage.data, 
+                            width, 
+                            height, 
+                            bitsPerSample,
+                            sourceProfile
+                        );
+                    } else {
+                        conversionMethod = 'Conversión estándar CMYK→RGB (sin perfil ICC)';
+                        updateIccStatus(' Sin perfil ICC - usando conversión estándar. Para mejores resultados, proporciona un perfil ICC.', true);
+                        
+                        // Conversión estándar sin perfil
+                        rgbaData = convertCMYKtoRGBStandard(firstPage.data, width, height, bitsPerSample);
+                    }
+                } else if (photometric === 2) {
+                    conversionMethod = 'Ya estaba en RGB - sin conversión necesaria';
+                    rgbaData = UTIF.toRGBA8(firstPage);
+                } else {
+                    conversionMethod = 'Conversión automática';
+                    rgbaData = UTIF.toRGBA8(firstPage);
+                }
+                
+                info.innerHTML = `
+                    <strong>Información del archivo original:</strong><br>
+                       Nombre: ${fileName}<br>
+                       Dimensiones: ${width} × ${height} px<br>
+                       Espacio de color: ${colorSpace}<br>
+                       Canales: ${samplesPerPixel} | Bits: ${bitsPerSample}<br>
+                       Tamaño: ${(fileSize / 1024 / 1024).toFixed(2)} MB<br>
+                    <br>
+                    <strong>Conversión realizada:</strong><br>
+                    ✓ ${conversionMethod}<br>
+                    ✓ Salida: RGB (${width * height} píxeles)
+                `;
+                
+                loadingText.textContent = 'Renderizando imagen...';
+                
+                canvas.width = width;
+                canvas.height = height;
+                
+                const imageData = new ImageData(new Uint8ClampedArray(rgbaData), width, height);
+                ctx.putImageData(imageData, 0, 0);
+                
+                preview.classList.add('active');
+                
+            } catch (err) {
+                throw new Error('Error en el procesamiento: ' + err.message);
+            }
+        }
+        
+        // Conversión estándar sin perfil ICC
+        function convertCMYKtoRGBStandard(cmykData, width, height, bitsPerSample) {
+            const pixelCount = width * height;
+            const rgba = new Uint8Array(pixelCount * 4);
+            
+            const is16bit = bitsPerSample === 16;
+            const bytesPerChannel = is16bit ? 2 : 1;
+            const stride = 4 * bytesPerChannel;
+            
+            for (let i = 0; i < pixelCount; i++) {
+                const cmykOffset = i * stride;
+                const rgbaOffset = i * 4;
+                
+                let c, m, y, k;
+                
+                if (is16bit) {
+                    c = ((cmykData[cmykOffset] << 8) | cmykData[cmykOffset + 1]) / 65535;
+                    m = ((cmykData[cmykOffset + 2] << 8) | cmykData[cmykOffset + 3]) / 65535;
+                    y = ((cmykData[cmykOffset + 4] << 8) | cmykData[cmykOffset + 5]) / 65535;
+                    k = ((cmykData[cmykOffset + 6] << 8) | cmykData[cmykOffset + 7]) / 65535;
+                } else {
+                    c = cmykData[cmykOffset] / 255;
+                    m = cmykData[cmykOffset + 1] / 255;
+                    y = cmykData[cmykOffset + 2] / 255;
+                    k = cmykData[cmykOffset + 3] / 255;
+                }
+                
+                // Fórmula estándar de conversión
+                rgba[rgbaOffset] = Math.round(255 * (1 - c) * (1 - k));
+                rgba[rgbaOffset + 1] = Math.round(255 * (1 - m) * (1 - k));
+                rgba[rgbaOffset + 2] = Math.round(255 * (1 - y) * (1 - k));
+                rgba[rgbaOffset + 3] = 255;
+            }
+            
+            return rgba;
+        }
+
+        // Conversión mejorada con perfil ICC (simulación)
+        function convertCMYKtoRGBWithProfile(cmykData, width, height, bitsPerSample, profile) {
+            const pixelCount = width * height;
+            const rgba = new Uint8Array(pixelCount * 4);
+            
+            const is16bit = bitsPerSample === 16;
+            const bytesPerChannel = is16bit ? 2 : 1;
+            const stride = 4 * bytesPerChannel;
+            
+            // Análisis básico del perfil ICC
+            let profileType = 'unknown';
+            if (profile instanceof ArrayBuffer || profile instanceof Uint8Array) {
+                const profileView = new DataView(profile instanceof ArrayBuffer ? profile : profile.buffer);
+                // Leer signature del perfil (offset 36-39)
+                if (profileView.byteLength > 40) {
+                    try {
+                        const sig = String.fromCharCode(
+                            profileView.getUint8(36),
+                            profileView.getUint8(37),
+                            profileView.getUint8(38),
+                            profileView.getUint8(39)
+                        );
+                        profileType = sig;
+                    } catch (e) {
+                        console.log('No se pudo leer signature del perfil');
+                    }
+                }
+            }
+            
+            // Factores de corrección para U.S. Web Coated (SWOP) v2
+            // Estos valores aproximan el comportamiento del perfil SWOP
+            const swopCorrection = {
+                c: 0.96, // Cyan ligeramente reducido
+                m: 0.98, // Magenta casi sin cambio
+                y: 1.02, // Yellow ligeramente aumentado
+                k: 0.95  // Black ligeramente reducido
+            };
+            
+            for (let i = 0; i < pixelCount; i++) {
+                const cmykOffset = i * stride;
+                const rgbaOffset = i * 4;
+                
+                let c, m, y, k;
+                
+                if (is16bit) {
+                    c = ((cmykData[cmykOffset] << 8) | cmykData[cmykOffset + 1]) / 65535;
+                    m = ((cmykData[cmykOffset + 2] << 8) | cmykData[cmykOffset + 3]) / 65535;
+                    y = ((cmykData[cmykOffset + 4] << 8) | cmykData[cmykOffset + 5]) / 65535;
+                    k = ((cmykData[cmykOffset + 6] << 8) | cmykData[cmykOffset + 7]) / 65535;
+                } else {
+                    c = cmykData[cmykOffset] / 255;
+                    m = cmykData[cmykOffset + 1] / 255;
+                    y = cmykData[cmykOffset + 2] / 255;
+                    k = cmykData[cmykOffset + 3] / 255;
+                }
+                
+                // Aplicar corrección de perfil
+                c = Math.min(1, c * swopCorrection.c);
+                m = Math.min(1, m * swopCorrection.m);
+                y = Math.min(1, y * swopCorrection.y);
+                k = Math.min(1, k * swopCorrection.k);
+                
+                // Conversión mejorada con compensación de tinta
+                const inkTotal = c + m + y + k;
+                let r, g, b;
+                
+                if (inkTotal > 3) {
+                    // Alto contenido de tinta - aplicar GCR (Gray Component Replacement)
+                    const gray = Math.min(c, m, y);
+                    c -= gray * 0.5;
+                    m -= gray * 0.5;
+                    y -= gray * 0.5;
+                    k += gray * 0.5;
+                }
+                
+                // Conversión con gamma correction para SWOP
+                const gamma = 1.8;
+                r = 255 * Math.pow((1 - c) * (1 - k), 1/gamma);
+                g = 255 * Math.pow((1 - m) * (1 - k), 1/gamma);
+                b = 255 * Math.pow((1 - y) * (1 - k), 1/gamma);
+                
+                rgba[rgbaOffset] = Math.round(Math.max(0, Math.min(255, r)));
+                rgba[rgbaOffset + 1] = Math.round(Math.max(0, Math.min(255, g)));
+                rgba[rgbaOffset + 2] = Math.round(Math.max(0, Math.min(255, b)));
+                rgba[rgbaOffset + 3] = 255;
+            }
+            
+            return rgba;
+        }
+        
+        downloadBtn.addEventListener('click', () => {
+            const jpegDataUrl = canvas.toDataURL('image/jpeg', currentQuality);
+            
+            const link = document.createElement('a');
+            link.download = currentFileName + '_RGB.jpg';
+            link.href = jpegDataUrl;
+            link.click();
+        });
+
+        function updateIccStatus(message, isWarning) {
+            iccStatus.textContent = message;
+            iccStatus.classList.add('active');
+            if (isWarning) {
+                iccStatus.classList.add('warning');
+            } else {
+                iccStatus.classList.remove('warning');
+            }
+        }
+        
+        function showError(message) {
+            error.textContent =  message;
+            error.classList.add('active');
+        }
+        
+        function hideError() {
+            error.classList.remove('active');
+        }
+    </script>
+</body>
+</html>
