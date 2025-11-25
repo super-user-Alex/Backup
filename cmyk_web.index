@@ -1,489 +1,400 @@
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Geometric Matcher</title>
-    <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
-    
-    <style>
-        :root {
-            --primary: #6366f1;
-            --secondary: #ec4899;
-            --bg-dark: #0f172a;
-            --glass: rgba(255, 255, 255, 0.05);
-            --border: rgba(255, 255, 255, 0.1);
-            --success: #10b981;
-        }
-
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: radial-gradient(circle at top left, #1e293b, #0f172a);
-            color: white;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 20px;
-        }
-
-        .header {
-            text-align: center;
-            margin-bottom: 40px;
-            margin-top: 20px;
-        }
-
-        .header h1 {
-            font-weight: 800;
-            font-size: 2.5rem;
-            background: linear-gradient(to right, var(--primary), var(--secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 10px;
-        }
-
-        .header p { color: #94a3b8; font-size: 1rem; }
-
-        .main-card {
-            background: var(--glass);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--border);
-            border-radius: 24px;
-            padding: 30px;
-            width: 100%;
-            max-width: 1200px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-        }
-
-        .upload-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 30px;
-            margin-bottom: 30px;
-        }
-
-        .upload-zone {
-            position: relative;
-            border: 2px dashed var(--border);
-            border-radius: 16px;
-            height: 250px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            background: rgba(0,0,0,0.2);
-            overflow: hidden;
-        }
-
-        .upload-zone:hover {
-            border-color: var(--primary);
-            background: rgba(99, 102, 241, 0.05);
-        }
-
-        /* --- CAMBIOS APLICADOS AQUÍ --- */
-        
-        .upload-zone.has-image {
-            border-style: solid;
-            border-color: var(--success);
-        }
-
-        /* Esta regla oculta el texto cuando hay imagen */
-        .upload-zone.has-image .upload-content {
-            display: none;
-        }
-
-        /* Esta regla hace la imagen totalmente visible */
-        .upload-zone.has-image .preview-bg {
-            opacity: 1;
-        }
-
-        /* ------------------------------ */
-
-        .upload-zone input { display: none; }
-
-        .upload-content {
-            z-index: 2;
-            text-align: center;
-            pointer-events: none;
-        }
-
-        .icon { font-size: 3rem; margin-bottom: 10px; opacity: 0.7; }
-        .label-text { color: #94a3b8; font-weight: 500; }
-
-        .preview-bg {
-            position: absolute;
-            top: 0; left: 0; width: 100%; height: 100%;
-            object-fit: contain;
-            opacity: 0.6; /* Opacidad inicial para ver el texto detrás */
-            z-index: 1;
-            padding: 10px;
-            transition: opacity 0.3s ease;
-        }
-
-        .actions {
-            display: flex;
-            justify-content: center;
-            gap: 20px;
-            margin-bottom: 30px;
-            flex-wrap: wrap;
-        }
-
-        .btn {
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            border: none;
-            padding: 16px 40px;
-            border-radius: 12px;
-            color: white;
-            font-weight: 600;
-            font-size: 1.1rem;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .btn:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 25px -5px rgba(236, 72, 153, 0.4);
-        }
-
-        .btn:disabled {
-            background: #334155;
-            cursor: not-allowed;
-            opacity: 0.7;
-        }
-
-        .status-bar {
-            text-align: center;
-            margin-bottom: 20px;
-            min-height: 24px;
-            font-weight: 500;
-            color: #e2e8f0;
-        }
-
-        .status-bar.loading { color: var(--primary); }
-        .status-bar.success { color: var(--success); }
-        .status-bar.error { color: #ef4444; }
-
-        .canvas-container {
-            background: #000;
-            border-radius: 16px;
-            overflow: hidden;
-            border: 1px solid var(--border);
-            box-shadow: inset 0 0 20px rgba(0,0,0,0.5);
-            min-height: 100px;
-            display: none;
-        }
-
-        canvas {
-            display: block;
-            width: 100%;
-            height: auto;
-        }
-
-        .spinner {
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,0.3);
-            border-radius: 50%;
-            border-top-color: white;
-            animation: spin 1s ease-in-out infinite;
-            display: none;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        
-        @media (max-width: 768px) {
-            .upload-grid { grid-template-columns: 1fr; }
-            .header h1 { font-size: 2rem; }
-        }
-    </style>
-</head>
-<body>
-
-    <div class="header">
-        <h1>Geometric Matcher AI</h1>
-        <p>Emparejamiento híbrido: Detecta formas (Círculos, Triángulos) + Detalles (ORB)</p>
-    </div>
-
-    <div class="main-card">
-        
-        <div class="upload-grid">
-            <label class="upload-zone" id="zoneA">
-                <img id="prevA" class="preview-bg" style="display:none;">
-                <div class="upload-content">
-                    <div class="label-text">Click para subir Imagen A</div>
-                    <div style="font-size: 0.8rem; color: #64748b; margin-top: 5px;">(Referencia)</div>
-                </div>
-                <input type="file" id="imageA" accept="image/*">
-            </label>
-
-            <label class="upload-zone" id="zoneB">
-                <img id="prevB" class="preview-bg" style="display:none;">
-                <div class="upload-content">
-                    <div class="label-text">Click para subir Imagen B</div>
-                    <div style="font-size: 0.8rem; color: #64748b; margin-top: 5px;">(Búsqueda desordenada)</div>
-                </div>
-                <input type="file" id="imageB" accept="image/*">
-            </label>
-        </div>
-
-        <div class="status-bar" id="status">
-            <span id="statusText">Iniciando motor Python (Pyodide)...</span>
-            <div class="spinner" id="spinner" style="display: inline-block;"></div>
-        </div>
-
-        <div class="actions">
-            <button id="processBtn" class="btn" disabled>
-                <span class="spinner" id="btnSpinner"></span>
-                <span> Ejecutar Análisis</span>
-            </button>
-            <button id="downloadBtn" class="btn" style="background: #334155; display: none;">
-                Descargar Resultado
-            </button>
-        </div>
-
-        <div class="canvas-container" id="canvasContainer">
-            <canvas id="resultCanvas"></canvas>
-        </div>
-
-    </div>
-
-    <script>
-        let pyodide = null;
-        let imgDataA = null;
-        let imgDataB = null;
-
-        async function initSystem() {
-            try {
-                const statusText = document.getElementById('statusText');
-                
-                pyodide = await loadPyodide();
-                statusText.textContent = "Cargando librerías OpenCV & NumPy...";
-                
-                await pyodide.loadPackage(['numpy', 'opencv-python']);
-                
-                statusText.textContent = "Sistema listo. Sube tus imágenes.";
-                document.getElementById('status').classList.add('success');
-                document.getElementById('spinner').style.display = 'none';
-                checkReady();
-            } catch (err) {
-                document.getElementById('statusText').textContent = "Error al cargar Python. Recarga la página.";
-                document.getElementById('status').classList.add('error');
-            }
-        }
-
-        function handleFile(input, type) {
-            const file = input.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                const img = new Image();
-                img.onload = () => {
-                    const canvas = document.createElement('canvas');
-                    canvas.width = img.width;
-                    canvas.height = img.height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0);
-                    
-                    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                    
-                    if (type === 'A') {
-                        imgDataA = data;
-                        const prev = document.getElementById('prevA');
-                        prev.src = e.target.result;
-                        prev.style.display = 'block';
-                        // La clase 'has-image' dispara el CSS que oculta el texto
-                        document.getElementById('zoneA').classList.add('has-image');
-                    } else {
-                        imgDataB = data;
-                        const prev = document.getElementById('prevB');
-                        prev.src = e.target.result;
-                        prev.style.display = 'block';
-                        // La clase 'has-image' dispara el CSS que oculta el texto
-                        document.getElementById('zoneB').classList.add('has-image');
-                    }
-                    checkReady();
-                };
-                img.src = e.target.result;
-            };
-            reader.readAsDataURL(file);
-        }
-
-        function checkReady() {
-            if (pyodide && imgDataA && imgDataB) {
-                const btn = document.getElementById('processBtn');
-                btn.disabled = false;
-                btn.style.opacity = "1";
-            }
-        }
-
-        document.getElementById('imageA').addEventListener('change', function() { handleFile(this, 'A'); });
-        document.getElementById('imageB').addEventListener('change', function() { handleFile(this, 'B'); });
-
-        document.getElementById('processBtn').addEventListener('click', async () => {
-            const btn = document.getElementById('processBtn');
-            const btnSpinner = document.getElementById('btnSpinner');
-            const statusText = document.getElementById('statusText');
-            const container = document.getElementById('canvasContainer');
-            
-            btn.disabled = true;
-            btnSpinner.style.display = 'block';
-            statusText.textContent = "⏳ Procesando geometría y descriptores...";
-            document.getElementById('status').className = "status-bar loading";
-            container.style.display = 'none';
-
-            try {
-                pyodide.globals.set('raw_A', pyodide.toPy(imgDataA.data));
-                pyodide.globals.set('w_A', imgDataA.width);
-                pyodide.globals.set('h_A', imgDataA.height);
-                
-                pyodide.globals.set('raw_B', pyodide.toPy(imgDataB.data));
-                pyodide.globals.set('w_B', imgDataB.width);
-                pyodide.globals.set('h_B', imgDataB.height);
-
-                const pythonCode = `
-import cv2
 import numpy as np
-import io
+from scipy import ndimage
+from scipy.ndimage import center_of_mass
+from skimage import io
+from skimage.measure import moments, moments_central, moments_hu
+import matplotlib.pyplot as plt
 
-def process_img(data, w, h):
-    arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 4))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
-    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-    corners = [binary[0,0], binary[0,-1], binary[-1,0], binary[-1,-1]]
-    if np.mean(corners) > 127:
-        binary = cv2.bitwise_not(binary)
-    return binary, cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+def normalizar_imagen(img):
+    """Normaliza la imagen a valores binarios 0 y 1"""
+    return (img > 0.5).astype(float)
 
-def get_features(img_bin, orb):
-    contours, _ = cv2.findContours(img_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    objs = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 50: continue 
-        moments = cv2.moments(cnt)
-        if moments['m00'] == 0: continue
-        hu = cv2.HuMoments(moments).flatten()
-        hu = -1 * np.sign(hu) * np.log10(np.abs(hu) + 1e-10)
-        cx = int(moments['m10']/moments['m00'])
-        cy = int(moments['m01']/moments['m00'])
-        x,y,w,h = cv2.boundingRect(cnt)
-        mask = np.zeros(img_bin.shape, dtype=np.uint8)
-        cv2.drawContours(mask, [cnt], -1, 255, -1)
-        roi = img_bin[y:y+h, x:x+w]
-        roi_mask = mask[y:y+h, x:x+w]
-        kp, des = orb.detectAndCompute(roi, roi_mask)
-        objs.append({ 'hu': hu, 'area': area, 'des': des, 'center': (cx, cy), 'bbox': (x,y,w,h) })
-    return objs
+def redimensionar_a_canvas_comun(img1, img2):
+    """
+    Redimensiona ambas imágenes a un canvas común del tamaño del más grande.
+    """
+    h1, w1 = img1.shape
+    h2, w2 = img2.shape
+    
+    # Tamaño del canvas común (el máximo de ambas dimensiones)
+    max_h = max(h1, h2)
+    max_w = max(w1, w2)
+    
+    # Crear canvas para img1
+    canvas1 = np.zeros((max_h, max_w))
+    start_h1 = (max_h - h1) // 2
+    start_w1 = (max_w - w1) // 2
+    canvas1[start_h1:start_h1+h1, start_w1:start_w1+w1] = img1
+    
+    # Crear canvas para img2
+    canvas2 = np.zeros((max_h, max_w))
+    start_h2 = (max_h - h2) // 2
+    start_w2 = (max_w - w2) // 2
+    canvas2[start_h2:start_h2+h2, start_w2:start_w2+w2] = img2
+    
+    return canvas1, canvas2
 
-imgA, viewA = process_img(raw_A, w_A, h_A)
-imgB, viewB = process_img(raw_B, w_B, h_B)
-orb = cv2.ORB_create(nfeatures=1000)
-objsA = get_features(imgA, orb)
-objsB = get_features(imgB, orb)
-bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-matches_data = []
+def centrar_objeto(img):
+    """
+    Centra el objeto en la imagen moviendo su centro de masa al centro.
+    """
+    img_bin = normalizar_imagen(img)
+    
+    # Calcular centro de masa
+    cy, cx = center_of_mass(img_bin)
+    
+    if np.isnan(cy) or np.isnan(cx):
+        return img_bin
+    
+    # Calcular desplazamiento necesario
+    center_y, center_x = np.array(img.shape) / 2
+    shift_y = center_y - cy
+    shift_x = center_x - cx
+    
+    # Desplazar imagen
+    img_centrada = ndimage.shift(img_bin, [shift_y, shift_x], order=0, mode='constant', cval=0)
+    
+    return img_centrada
 
-for i, a in enumerate(objsA):
-    best_score = -1
-    best_idx = -1
-    for j, b in enumerate(objsB):
-        dist_hu = np.linalg.norm(a['hu'] - b['hu'])
-        shape_score = max(0, 100 - (dist_hu * 45))
-        ratio_area = min(a['area'], b['area']) / max(a['area'], b['area'])
-        area_score = ratio_area * 100
-        orb_score = 0
-        has_orb_match = False
-        if a['des'] is not None and b['des'] is not None and len(a['des']) > 2 and len(b['des']) > 2:
-            try:
-                m = bf.match(a['des'], b['des'])
-                if len(m) > 0:
-                    top_m = sorted(m, key=lambda x:x.distance)[:5]
-                    avg_dist = sum(x.distance for x in top_m)/len(top_m)
-                    orb_score = max(0, 100 - avg_dist)
-                    if orb_score > 40: has_orb_match = True
-            except: pass
-        if has_orb_match:
-            final_score = (orb_score * 0.5) + (shape_score * 0.3) + (area_score * 0.2)
+def calcular_momentos_hu_invariantes(img):
+    """
+    Calcula momentos de Hu que son invariantes a traslación, escala y rotación.
+    Útiles para comparar formas sin importar su posición.
+    """
+    img_bin = normalizar_imagen(img)
+    
+    # Los momentos de Hu son invariantes
+    hu_moments = moments_hu(moments(img_bin))
+    
+    return hu_moments
+
+def calcular_iou(img1, img2):
+    """Calcula Intersection over Union"""
+    img1_bin = img1 > 0.5
+    img2_bin = img2 > 0.5
+    
+    interseccion = np.sum(img1_bin & img2_bin)
+    union = np.sum(img1_bin | img2_bin)
+    
+    if union == 0:
+        return 0
+    
+    return interseccion / union
+
+def calcular_correlacion_normalizada(img1, img2):
+    """Correlación cruzada normalizada"""
+    img1_flat = img1.flatten()
+    img2_flat = img2.flatten()
+    
+    # Normalizar
+    img1_norm = (img1_flat - np.mean(img1_flat)) / (np.std(img1_flat) + 1e-8)
+    img2_norm = (img2_flat - np.mean(img2_flat)) / (np.std(img2_flat) + 1e-8)
+    
+    # Correlación
+    correlacion = np.dot(img1_norm, img2_norm) / len(img1_flat)
+    
+    return max(0, correlacion)
+
+def calcular_diferencia_contornos(img1, img2):
+    """
+    Compara los contornos de las imágenes usando distancia de Hausdorff aproximada.
+    """
+    # Obtener bordes
+    borde1 = img1 - ndimage.binary_erosion(img1)
+    borde2 = img2 - ndimage.binary_erosion(img2)
+    
+    # Contar píxeles de borde que coinciden
+    coincidencias = np.sum(borde1 * borde2)
+    total_borde = np.sum(borde1) + np.sum(borde2)
+    
+    if total_borde == 0:
+        return 0
+    
+    return 2 * coincidencias / total_borde
+
+def calcular_similitud_combinada(img1, img2):
+    """
+    Combina múltiples métricas después de centrar los objetos.
+    """
+    # Redimensionar a canvas común primero
+    img1_canvas, img2_canvas = redimensionar_a_canvas_comun(img1, img2)
+    
+    # Centrar ambas imágenes
+    img1_centrada = centrar_objeto(img1_canvas)
+    img2_centrada = centrar_objeto(img2_canvas)
+    
+    # Calcular métricas
+    iou = calcular_iou(img1_centrada, img2_centrada)
+    correlacion = calcular_correlacion_normalizada(img1_centrada, img2_centrada)
+    similitud_contorno = calcular_diferencia_contornos(img1_centrada, img2_centrada)
+    
+    # Similitud píxel a píxel
+    similitud_pixel = np.sum(img1_centrada == img2_centrada) / img1_centrada.size
+    
+    # Score combinado con pesos ajustados
+    score = 0.35 * iou + 0.30 * correlacion + 0.20 * similitud_contorno + 0.15 * similitud_pixel
+    
+    return score, iou, correlacion, similitud_contorno, similitud_pixel, img1_centrada, img2_centrada
+
+def encontrar_rotacion_optima_con_alineacion(imagen_a, imagen_b, verbose=True):
+    """
+    Encuentra la rotación óptima alineando los centros de masa primero.
+    Maneja imágenes de diferentes tamaños.
+    """
+    angulos = [0, 90, 180, 270]
+    resultados = []
+    
+    # Normalizar imágenes
+    imagen_a_norm = normalizar_imagen(imagen_a)
+    imagen_b_norm = normalizar_imagen(imagen_b)
+    
+    if verbose:
+        print(f"Tamaño Imagen A: {imagen_a_norm.shape}")
+        print(f"Tamaño Imagen B: {imagen_b_norm.shape}")
+        print("\nAnalizando rotaciones con alineación de centros de masa...")
+        print("=" * 75)
+    
+    # Redimensionar B a canvas común para visualización final
+    max_dim = max(imagen_a_norm.shape[0], imagen_a_norm.shape[1], 
+                  imagen_b_norm.shape[0], imagen_b_norm.shape[1])
+    canvas_b = np.zeros((max_dim, max_dim))
+    start_h = (max_dim - imagen_b_norm.shape[0]) // 2
+    start_w = (max_dim - imagen_b_norm.shape[1]) // 2
+    canvas_b[start_h:start_h+imagen_b_norm.shape[0], 
+             start_w:start_w+imagen_b_norm.shape[1]] = imagen_b_norm
+    imagen_b_centrada = centrar_objeto(canvas_b)
+    
+    for angulo in angulos:
+        # Rotar imagen A
+        img_rotada = ndimage.rotate(imagen_a_norm, angulo, reshape=False, order=0)
+        
+        # Calcular similitudes (la función maneja diferentes tamaños)
+        score, iou, corr, sim_contorno, sim_pixel, img_rot_centrada, _ = calcular_similitud_combinada(
+            img_rotada, imagen_b_norm
+        )
+        
+        resultados.append({
+            'angulo': angulo,
+            'score': score,
+            'iou': iou,
+            'correlacion': corr,
+            'similitud_contorno': sim_contorno,
+            'similitud_pixel': sim_pixel,
+            'imagen_centrada': img_rot_centrada
+        })
+        
+        if verbose:
+            print(f"Rotación {angulo:3d}°:")
+            print(f"  Score combinado:     {score:.4f}")
+            print(f"  IoU:                 {iou:.4f}")
+            print(f"  Correlación:         {corr:.4f}")
+            print(f"  Similitud contorno:  {sim_contorno:.4f}")
+            print(f"  Similitud píxel:     {sim_pixel:.4f}")
+            print("-" * 75)
+    
+    # Encontrar mejor resultado
+    mejor = max(resultados, key=lambda x: x['score'])
+    
+    if verbose:
+        print("\n✓ RESULTADO FINAL:")
+        print(f"  Rotación óptima: {mejor['angulo']}°")
+        print(f"  Score: {mejor['score']:.4f}")
+        
+        # Verificación adicional con momentos de Hu
+        img_a_rot_opt = ndimage.rotate(imagen_a_norm, mejor['angulo'], 
+                                        reshape=False, order=0)
+        hu_a = calcular_momentos_hu_invariantes(img_a_rot_opt)
+        hu_b = calcular_momentos_hu_invariantes(imagen_b_norm)
+        diferencia_hu = np.sum(np.abs(np.log(np.abs(hu_a) + 1e-10) - 
+                                       np.log(np.abs(hu_b) + 1e-10)))
+        print(f"  Diferencia momentos Hu: {diferencia_hu:.4f} (menor es mejor)")
+        print("=" * 75)
+    
+    return mejor['angulo'], mejor, resultados, imagen_b_centrada
+
+def visualizar_resultados_con_alineacion(imagen_a, imagen_b, angulo_optimo, resultados, imagen_b_centrada):
+    """
+    Visualización completa mostrando el proceso de alineación.
+    """
+    fig = plt.figure(figsize=(18, 12))
+    
+    # Asegurar que todas las imágenes centradas tengan el mismo tamaño
+    # Encontrar el tamaño máximo
+    max_h = imagen_b_centrada.shape[0]
+    max_w = imagen_b_centrada.shape[1]
+    
+    # Redimensionar todas las imágenes de resultados al mismo tamaño
+    for res in resultados:
+        if res['imagen_centrada'].shape != (max_h, max_w):
+            h, w = res['imagen_centrada'].shape
+            canvas = np.zeros((max_h, max_w))
+            h_start = (max_h - h) // 2
+            w_start = (max_w - w) // 2
+            canvas[h_start:h_start+h, w_start:w_start+w] = res['imagen_centrada']
+            res['imagen_centrada'] = canvas
+    
+    # Fila 1: Imágenes originales y sus centros
+    ax1 = plt.subplot(3, 5, 1)
+    img_a_display = normalizar_imagen(imagen_a)
+    cy_a, cx_a = center_of_mass(img_a_display)
+    ax1.imshow(img_a_display, cmap='gray')
+    ax1.plot(cx_a, cy_a, 'r+', markersize=15, markeredgewidth=2)
+    ax1.set_title('Imagen A Original\n(+ = centro de masa)', fontweight='bold', fontsize=10)
+    ax1.axis('off')
+    
+    ax2 = plt.subplot(3, 5, 2)
+    img_b_display = normalizar_imagen(imagen_b)
+    cy_b, cx_b = center_of_mass(img_b_display)
+    ax2.imshow(img_b_display, cmap='gray')
+    ax2.plot(cx_b, cy_b, 'b+', markersize=15, markeredgewidth=2)
+    ax2.set_title('Imagen B Original\n(+ = centro de masa)', fontweight='bold', fontsize=10)
+    ax2.axis('off')
+    
+    # Imagen A centrada
+    ax3 = plt.subplot(3, 5, 3)
+    img_a_centrada = centrar_objeto(imagen_a)
+    ax3.imshow(img_a_centrada, cmap='gray')
+    ax3.set_title('Imagen A Centrada', fontsize=10)
+    ax3.axis('off')
+    
+    # Imagen B centrada
+    ax4 = plt.subplot(3, 5, 4)
+    ax4.imshow(imagen_b_centrada, cmap='gray')
+    ax4.set_title('Imagen B Centrada', fontsize=10)
+    ax4.axis('off')
+    
+    # Fila 2: Todas las rotaciones centradas con scores
+    for i, res in enumerate(resultados):
+        ax = plt.subplot(3, 5, 6 + i)
+        ax.imshow(res['imagen_centrada'], cmap='gray')
+        
+        titulo = f"{res['angulo']}°\nScore: {res['score']:.3f}"
+        if res['angulo'] == angulo_optimo:
+            titulo = "✓ " + titulo
+            ax.set_title(titulo, fontweight='bold', color='green', fontsize=9)
+            ax.spines['bottom'].set_color('green')
+            ax.spines['top'].set_color('green')
+            ax.spines['left'].set_color('green')
+            ax.spines['right'].set_color('green')
+            ax.spines['bottom'].set_linewidth(3)
+            ax.spines['top'].set_linewidth(3)
+            ax.spines['left'].set_linewidth(3)
+            ax.spines['right'].set_linewidth(3)
         else:
-            final_score = (shape_score * 0.7) + (area_score * 0.3)
-        if final_score > best_score:
-            best_score = final_score
-            best_idx = j
-    if best_score > 60:
-        matches_data.append({'ia': i, 'ib': best_idx, 'score': best_score})
+            ax.set_title(titulo, fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    # Fila 3: Análisis detallado de la mejor rotación
+    mejor_res = [r for r in resultados if r['angulo'] == angulo_optimo][0]
+    
+    # Overlay RGB
+    ax11 = plt.subplot(3, 5, 11)
+    overlay = np.zeros((*imagen_b_centrada.shape, 3))
+    overlay[:,:,0] = imagen_b_centrada  # Rojo: B
+    overlay[:,:,1] = mejor_res['imagen_centrada']  # Verde: A rotada
+    overlay[:,:,2] = 0
+    ax11.imshow(overlay)
+    ax11.set_title('Overlay\n(Rojo=B, Verde=A)', fontweight='bold', fontsize=10)
+    ax11.axis('off')
+    
+    # Diferencia
+    ax12 = plt.subplot(3, 5, 12)
+    diferencia = np.abs(imagen_b_centrada - mejor_res['imagen_centrada'])
+    ax12.imshow(diferencia, cmap='hot')
+    ax12.set_title(f'Diferencia\n(negro=igual)', fontsize=10)
+    ax12.axis('off')
+    
+    # XOR (muestra píxeles que no coinciden)
+    ax13 = plt.subplot(3, 5, 13)
+    xor = np.logical_xor(imagen_b_centrada > 0.5, mejor_res['imagen_centrada'] > 0.5)
+    ax13.imshow(xor, cmap='gray')
+    ax13.set_title('XOR\n(blanco=diferente)', fontsize=10)
+    ax13.axis('off')
+    
+    # Gráfico de barras de scores
+    ax14 = plt.subplot(3, 5, 14)
+    angulos = [r['angulo'] for r in resultados]
+    scores = [r['score'] for r in resultados]
+    colores = ['green' if a == angulo_optimo else 'steelblue' for a in angulos]
+    ax14.bar(angulos, scores, color=colores, alpha=0.7)
+    ax14.set_xlabel('Rotación (°)', fontsize=9)
+    ax14.set_ylabel('Score', fontsize=9)
+    ax14.set_title('Comparación de Scores', fontweight='bold', fontsize=10)
+    ax14.set_xticks(angulos)
+    ax14.grid(True, alpha=0.3, axis='y')
+    ax14.set_ylim([0, 1])
+    
+    # Gráfico de radar de métricas
+    ax15 = plt.subplot(3, 5, 15, projection='polar')
+    categorias = ['IoU', 'Correlación', 'Contorno', 'Píxel']
+    valores = [mejor_res['iou'], mejor_res['correlacion'], 
+               mejor_res['similitud_contorno'], mejor_res['similitud_pixel']]
+    
+    angulos_radar = np.linspace(0, 2 * np.pi, len(categorias), endpoint=False).tolist()
+    valores += valores[:1]
+    angulos_radar += angulos_radar[:1]
+    
+    ax15.plot(angulos_radar, valores, 'o-', linewidth=2, color='green')
+    ax15.fill(angulos_radar, valores, alpha=0.25, color='green')
+    ax15.set_xticks(angulos_radar[:-1])
+    ax15.set_xticklabels(categorias, fontsize=8)
+    ax15.set_ylim(0, 1)
+    ax15.set_title('Métricas de\nla mejor rotación', fontweight='bold', fontsize=9, pad=20)
+    ax15.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
 
-max_h = max(h_A, h_B)
-canvas = np.zeros((max_h, w_A + w_B, 3), dtype=np.uint8)
-canvas[:h_A, :w_A] = viewA
-canvas[:h_B, w_A:] = viewB
-colors = [(0, 255, 255), (255, 0, 255), (0, 255, 0), (255, 255, 0), (255, 128, 0), (0, 128, 255)]
+# ============================================
+# EJEMPLO DE USO
+# ============================================
 
-for idx, m in enumerate(matches_data):
-    oa = objsA[m['ia']]
-    ob = objsB[m['ib']]
-    color = colors[idx % len(colors)]
-    x,y,w,h = oa['bbox']
-    cv2.rectangle(canvas, (x,y), (x+w,y+h), color, 2)
-    x,y,w,h = ob['bbox']
-    cv2.rectangle(canvas, (x+w_A,y), (x+w+w_A,y+h), color, 2)
-    pt1 = oa['center']
-    pt2 = (ob['center'][0] + w_A, ob['center'][1])
-    cv2.line(canvas, pt1, pt2, color, 1)
-    mid = (int((pt1[0]+pt2[0])/2), int((pt1[1]+pt2[1])/2))
-    cv2.circle(canvas, mid, 12, (0,0,0), -1)
-    cv2.putText(canvas, str(idx+1), (mid[0]-5, mid[1]+5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+if __name__ == "__main__":
+    # Opción 1: Cargar tus imágenes
+    imagen_a = io.imread(r'D:\Alex\Trabajo\obj1.png', as_gray=True)
+    imagen_b = io.imread(r'D:\Alex\Trabajo\obj2.png', as_gray=True)
 
-is_success, buffer = cv2.imencode(".png", canvas)
-io.BytesIO(buffer).getvalue()
-                `;
-
-                const pyResult = await pyodide.runPythonAsync(pythonCode);
-                const blob = new Blob([pyResult.toJs()], { type: 'image/png' });
-                const url = URL.createObjectURL(blob);
-
-                const img = new Image();
-                img.onload = () => {
-                    const canvas = document.getElementById('resultCanvas');
-                    container.style.display = 'block';
-                    canvas.width = img.width;
-                    canvas.height = img.height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0);
-                    
-                    statusText.textContent = `Análisis completado exitosamente.`;
-                    document.getElementById('status').className = "status-bar success";
-                    btn.disabled = false;
-                    btnSpinner.style.display = 'none';
-                    document.getElementById('downloadBtn').style.display = 'inline-flex';
-                    URL.revokeObjectURL(url);
-                };
-                img.src = url;
-
-            } catch (error) {
-                console.error(error);
-                statusText.textContent = `Error: ${error.message}`;
-                document.getElementById('status').className = "status-bar error";
-                btn.disabled = false;
-                btnSpinner.style.display = 'none';
-            }
-        });
-
-        document.getElementById('downloadBtn').addEventListener('click', () => {
-            const link = document.createElement('a');
-            link.download = 'resultado_match.png';
-            link.href = document.getElementById('resultCanvas').toDataURL();
-            link.click();
-        });
-
-        initSystem();
-    </script>
-</body>
-</html>
+    # Opción 2: Ejemplo con objetos DESALINEADOS y DIFERENTES TAMAÑOS
+    # print("Creando imágenes de ejemplo con diferentes tamaños y desalineadas...\n")
+    
+    # # Crear imagen A con forma L (100x100)
+    # imagen_a = np.zeros((100, 100))
+    # imagen_a[20:70, 30:40] = 1   # Barra vertical
+    # imagen_a[50:70, 30:70] = 1   # Barra horizontal
+    
+    # # Crear imagen B: rotar 90° con tamaño diferente (150x120)
+    # imagen_b = np.zeros((150, 120))
+    # temp = ndimage.rotate(imagen_a, 90, reshape=False, order=0)
+    # # Colocar en posición diferente dentro del canvas más grande
+    # h_start, w_start = 25, 10
+    # h_end = h_start + temp.shape[0]
+    # w_end = w_start + temp.shape[1]
+    # imagen_b[h_start:h_end, w_start:w_end] = temp
+    
+    # Agregar ruido ligero
+    imagen_b = imagen_b + np.random.random(imagen_b.shape) * 0.05
+    imagen_b = np.clip(imagen_b, 0, 1)
+    
+    print(f"Tamaño Imagen A: {imagen_a.shape}")
+    print(f"Tamaño Imagen B: {imagen_b.shape} (¡DIFERENTE!)")
+    print(f"Centro de masa A: {center_of_mass(normalizar_imagen(imagen_a))}")
+    print(f"Centro de masa B: {center_of_mass(normalizar_imagen(imagen_b))}")
+    print("→ Los objetos tienen diferentes tamaños y NO están alineados!\n")
+    
+    # Encontrar rotación óptima
+    angulo, mejor, todos, img_b_centrada = encontrar_rotacion_optima_con_alineacion(
+        imagen_a, imagen_b, verbose=True
+    )
+    
+    # Visualizar
+    print("\nGenerando visualización completa...")
+    visualizar_resultados_con_alineacion(imagen_a, imagen_b, angulo, todos, img_b_centrada)
+    
+    print("\n" + "="*75)
+    print("PARA USAR CON TUS IMÁGENES:")
+    print("="*75)
+    print("1. Descomenta 'Opción 1' y pon las rutas de tus imágenes")
+    print("2. Comenta/elimina 'Opción 2'")
+    print("3. pip install numpy scipy scikit-image matplotlib")
+    print("="*75)
