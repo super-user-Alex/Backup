@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
-from collections import defaultdict
+from sklearn.cluster import KMeans
+from collections import Counter
 
 def calcular_luminancia_relativa(color):
     """
@@ -8,6 +9,7 @@ def calcular_luminancia_relativa(color):
     """
     r, g, b = color / 255.0
     
+    # Convertir a valores lineales
     def convertir_canal(canal):
         if canal <= 0.03928:
             return canal / 12.92
@@ -17,6 +19,7 @@ def calcular_luminancia_relativa(color):
     g_lin = convertir_canal(g)
     b_lin = convertir_canal(b)
     
+    # Calcular luminancia relativa
     return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
 
 def calcular_contraste(color1, color2):
@@ -26,102 +29,57 @@ def calcular_contraste(color1, color2):
     lum1 = calcular_luminancia_relativa(color1)
     lum2 = calcular_luminancia_relativa(color2)
     
+    # El color más claro debe estar en el numerador
     if lum1 > lum2:
         return (lum1 + 0.05) / (lum2 + 0.05)
     return (lum2 + 0.05) / (lum1 + 0.05)
 
-def distancia_color(color1, color2):
+def determinar_num_colores_optimo(pixeles, rango_min=2, rango_max=10):
     """
-    Calcula la distancia euclidiana entre dos colores en espacio RGB
+    Determina automáticamente el número óptimo de colores usando el método del codo.
+    
+    Args:
+        pixeles: Array de píxeles (N x 3)
+        rango_min: Mínimo número de clusters a probar
+        rango_max: Máximo número de clusters a probar
+    
+    Returns:
+        Número óptimo de colores
     """
-    return np.sqrt(np.sum((color1 - color2) ** 2))
+    inercias = []
+    rango_k = range(rango_min, rango_max + 1)
+    
+    # Calcular inercia para diferentes valores de k
+    for k in rango_k:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(pixeles)
+        inercias.append(kmeans.inertia_)
+    
+    # Encontrar el "codo" calculando la segunda derivada
+    if len(inercias) < 3:
+        return rango_min
+    
+    # Calcular las diferencias
+    diferencias = np.diff(inercias)
+    diferencias_segunda = np.diff(diferencias)
+    
+    # Encontrar el punto donde la mejora se reduce significativamente
+    # Usamos el punto de máxima curvatura (segunda derivada)
+    if len(diferencias_segunda) > 0:
+        idx_codo = np.argmax(diferencias_segunda) + 2  # +2 por los dos diff
+        return min(idx_codo, rango_max)
+    
+    return rango_min + 2  # Valor por defecto razonable
 
-def cuantizar_color(color, precision=32):
+def obtener_colores_predominantes(ruta_imagen, num_colores=None, tolerancia=20):
     """
-    Cuantiza un color para reducir la variación de colores similares
-    """
-    return (color // precision) * precision
-
-def agrupar_colores_similares(colores_dict, umbral_similitud=30):
-    """
-    Agrupa colores similares usando clustering jerárquico simple
-    """
-    colores = list(colores_dict.keys())
-    conteos = list(colores_dict.values())
-    
-    if len(colores) == 0:
-        return {}
-    
-    # Convertir a numpy array
-    colores_array = np.array(colores)
-    conteos_array = np.array(conteos)
-    
-    # Lista de clusters (cada uno es una lista de índices)
-    clusters = [[i] for i in range(len(colores))]
-    
-    # Clustering jerárquico aglomerativo
-    while True:
-        min_dist = float('inf')
-        merge_i, merge_j = -1, -1
-        
-        # Encontrar los dos clusters más cercanos
-        for i in range(len(clusters)):
-            for j in range(i + 1, len(clusters)):
-                # Calcular distancia promedio entre clusters
-                distancias = []
-                for idx_i in clusters[i]:
-                    for idx_j in clusters[j]:
-                        dist = distancia_color(colores_array[idx_i], colores_array[idx_j])
-                        distancias.append(dist)
-                
-                dist_promedio = np.mean(distancias)
-                
-                if dist_promedio < min_dist:
-                    min_dist = dist_promedio
-                    merge_i, merge_j = i, j
-        
-        # Si la distancia mínima es mayor al umbral, terminamos
-        if min_dist > umbral_similitud:
-            break
-        
-        # Fusionar los clusters más cercanos
-        clusters[merge_i].extend(clusters[merge_j])
-        clusters.pop(merge_j)
-        
-        # Si solo queda un cluster, terminamos
-        if len(clusters) == 1:
-            break
-    
-    # Crear el diccionario de colores agrupados
-    colores_agrupados = {}
-    for cluster in clusters:
-        # Calcular el color promedio ponderado por frecuencia
-        indices = np.array(cluster)
-        pesos = conteos_array[indices]
-        color_promedio = np.average(colores_array[indices], axis=0, weights=pesos).astype(int)
-        conteo_total = np.sum(pesos)
-        
-        colores_agrupados[tuple(color_promedio)] = conteo_total
-    
-    return colores_agrupados
-
-def obtener_colores_predominantes_histograma(ruta_imagen, umbral_similitud=30, 
-                                             porcentaje_minimo=1.0, precision_cuantizacion=16):
-    """
-    Identifica colores predominantes usando histogramas y clustering jerárquico.
-    
-    Enfoque alternativo sin K-means:
-    1. Cuantiza los colores para reducir variaciones mínimas
-    2. Crea un histograma de frecuencias de colores
-    3. Agrupa colores similares usando clustering jerárquico
-    4. Filtra colores poco frecuentes
+    Identifica los colores predominantes de una imagen.
     
     Args:
         ruta_imagen: Path de la imagen a analizar
-        umbral_similitud: Distancia máxima para considerar colores similares (0-255)
-        porcentaje_minimo: Porcentaje mínimo para incluir un color (0-100)
-        precision_cuantizacion: Factor de cuantización (8, 16, 32, etc.)
-                               Valores menores = más precisión pero más colores
+        num_colores: Número de colores predominantes a extraer. 
+                     Si es None, se detecta automáticamente.
+        tolerancia: Umbral de similitud para agrupar colores similares (0-255)
     
     Returns:
         Diccionario con colores predominantes y su información de contraste
@@ -134,7 +92,7 @@ def obtener_colores_predominantes_histograma(ruta_imagen, umbral_similitud=30,
     # Convertir de BGR a RGB
     imagen_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
     
-    # Redimensionar para procesamiento más rápido
+    # Redimensionar la imagen para procesamiento más rápido (opcional)
     altura, ancho = imagen_rgb.shape[:2]
     max_dimension = 800
     if max(altura, ancho) > max_dimension:
@@ -143,40 +101,25 @@ def obtener_colores_predominantes_histograma(ruta_imagen, umbral_similitud=30,
         nuevo_ancho = int(ancho * escala)
         imagen_rgb = cv2.resize(imagen_rgb, (nuevo_ancho, nueva_altura))
     
-    # Convertir a array de píxeles
+    # Convertir la imagen a un array de píxeles
     pixeles = imagen_rgb.reshape(-1, 3)
-    total_pixeles = len(pixeles)
     
-    print(f"Analizando {total_pixeles} píxeles...")
+    # Determinar número óptimo de colores si no se especifica
+    if num_colores is None:
+        print("Detectando número óptimo de colores...")
+        num_colores = determinar_num_colores_optimo(pixeles, rango_min=2, rango_max=10)
+        print(f"Número óptimo detectado: {num_colores} colores")
     
-    # Paso 1: Cuantización de colores
-    print(f"Cuantizando colores (precisión: {precision_cuantizacion})...")
-    pixeles_cuantizados = (pixeles // precision_cuantizacion) * precision_cuantizacion
+    # Aplicar K-means clustering
+    kmeans = KMeans(n_clusters=num_colores, random_state=42, n_init=10)
+    kmeans.fit(pixeles)
     
-    # Paso 2: Crear histograma de frecuencias
-    print("Creando histograma de colores...")
-    histograma = defaultdict(int)
-    for pixel in pixeles_cuantizados:
-        color_tuple = tuple(pixel)
-        histograma[color_tuple] += 1
+    # Obtener los colores centroides
+    colores = kmeans.cluster_centers_.astype(int)
     
-    print(f"Colores únicos encontrados: {len(histograma)}")
-    
-    # Paso 3: Filtrar colores muy poco frecuentes (antes de agrupar)
-    umbral_minimo = (porcentaje_minimo / 100.0) * total_pixeles
-    histograma_filtrado = {
-        color: conteo 
-        for color, conteo in histograma.items() 
-        if conteo >= umbral_minimo
-    }
-    
-    print(f"Colores después de filtrar por frecuencia: {len(histograma_filtrado)}")
-    
-    # Paso 4: Agrupar colores similares
-    print(f"Agrupando colores similares (umbral: {umbral_similitud})...")
-    colores_agrupados = agrupar_colores_similares(histograma_filtrado, umbral_similitud)
-    
-    print(f"Colores después de agrupar: {len(colores_agrupados)}")
+    # Contar cuántos píxeles pertenecen a cada cluster
+    etiquetas = kmeans.labels_
+    conteo = Counter(etiquetas)
     
     # Preparar los colores negro y blanco para comparación
     negro = np.array([0, 0, 0])
@@ -184,113 +127,20 @@ def obtener_colores_predominantes_histograma(ruta_imagen, umbral_similitud=30,
     
     # Crear el diccionario de resultados
     resultado = {}
+    total_pixeles = len(pixeles)
     
-    for color, conteo in colores_agrupados.items():
-        color_array = np.array(color)
-        porcentaje = (conteo / total_pixeles) * 100
+    for idx, color in enumerate(colores):
+        # Calcular porcentaje de presencia
+        porcentaje = (conteo[idx] / total_pixeles) * 100
         
         # Calcular contraste con negro y blanco
-        contraste_negro = calcular_contraste(color_array, negro)
-        contraste_blanco = calcular_contraste(color_array, blanco)
+        contraste_negro = calcular_contraste(color, negro)
+        contraste_blanco = calcular_contraste(color, blanco)
         
         # Determinar mejor contraste
         mejor_contraste = "blanco" if contraste_blanco > contraste_negro else "negro"
         
         # Crear clave del color en formato RGB
-        color_key = f"rgb({color[0]}, {color[1]}, {color[2]})"
-        
-        resultado[color_key] = {
-            "rgb": color,
-            "hex": f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
-            "porcentaje": round(porcentaje, 2),
-            "mejor_contraste": mejor_contraste,
-            "contraste_con_negro": round(contraste_negro, 2),
-            "contraste_con_blanco": round(contraste_blanco, 2),
-            "num_pixeles": conteo
-        }
-    
-    # Ordenar por porcentaje (descendente)
-    resultado = dict(sorted(
-        resultado.items(), 
-        key=lambda x: x[1]["porcentaje"], 
-        reverse=True
-    ))
-    
-    return resultado
-
-def obtener_colores_predominantes_mediana_cut(ruta_imagen, max_colores=8):
-    """
-    Implementa el algoritmo Median Cut para extracción de paleta de colores.
-    Este es el algoritmo clásico usado en reducción de colores y GIFs.
-    
-    Args:
-        ruta_imagen: Path de la imagen a analizar
-        max_colores: Número máximo de colores a extraer (potencia de 2 recomendada)
-    
-    Returns:
-        Diccionario con colores predominantes y su información de contraste
-    """
-    # Leer y procesar imagen
-    imagen = cv2.imread(ruta_imagen)
-    if imagen is None:
-        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
-    
-    imagen_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
-    
-    # Redimensionar
-    altura, ancho = imagen_rgb.shape[:2]
-    max_dimension = 800
-    if max(altura, ancho) > max_dimension:
-        escala = max_dimension / max(altura, ancho)
-        imagen_rgb = cv2.resize(imagen_rgb, (int(ancho * escala), int(altura * escala)))
-    
-    pixeles = imagen_rgb.reshape(-1, 3)
-    total_pixeles = len(pixeles)
-    
-    print(f"Aplicando Median Cut para {max_colores} colores...")
-    
-    def median_cut(pixeles, profundidad):
-        """Recursivamente divide el espacio de color"""
-        if profundidad == 0 or len(pixeles) == 0:
-            # Retornar el color promedio de este bucket
-            return [np.mean(pixeles, axis=0).astype(int)]
-        
-        # Encontrar el canal con mayor rango
-        rangos = np.max(pixeles, axis=0) - np.min(pixeles, axis=0)
-        canal = np.argmax(rangos)
-        
-        # Ordenar por ese canal y dividir por la mediana
-        pixeles_ordenados = pixeles[pixeles[:, canal].argsort()]
-        mediana = len(pixeles_ordenados) // 2
-        
-        # Dividir recursivamente
-        return (median_cut(pixeles_ordenados[:mediana], profundidad - 1) +
-                median_cut(pixeles_ordenados[mediana:], profundidad - 1))
-    
-    # Calcular profundidad necesaria (log2 de max_colores)
-    profundidad = int(np.log2(max_colores))
-    colores = median_cut(pixeles, profundidad)
-    
-    # Calcular frecuencias de cada color
-    resultado = {}
-    negro = np.array([0, 0, 0])
-    blanco = np.array([255, 255, 255])
-    
-    for color in colores:
-        # Contar cuántos píxeles están más cerca de este color
-        distancias = np.sqrt(np.sum((pixeles - color) ** 2, axis=1))
-        conteo = np.sum(distancias < 50)  # Umbral de proximidad
-        
-        if conteo == 0:
-            continue
-            
-        porcentaje = (conteo / total_pixeles) * 100
-        
-        color_array = np.array(color)
-        contraste_negro = calcular_contraste(color_array, negro)
-        contraste_blanco = calcular_contraste(color_array, blanco)
-        mejor_contraste = "blanco" if contraste_blanco > contraste_negro else "negro"
-        
         color_key = f"rgb({color[0]}, {color[1]}, {color[2]})"
         
         resultado[color_key] = {
@@ -302,37 +152,46 @@ def obtener_colores_predominantes_mediana_cut(ruta_imagen, max_colores=8):
             "contraste_con_blanco": round(contraste_blanco, 2)
         }
     
-    return dict(sorted(resultado.items(), key=lambda x: x[1]["porcentaje"], reverse=True))
+    # Ordenar por porcentaje (descendente)
+    resultado = dict(sorted(
+        resultado.items(), 
+        key=lambda x: x[1]["porcentaje"], 
+        reverse=True
+    ))
+    
+    return resultado
 
 # Ejemplo de uso
 if __name__ == "__main__":
+    # Ejemplo 1: Detección automática de número de colores
     try:
-        print("=== MÉTODO 1: Histograma + Clustering Jerárquico ===\n")
-        colores1 = obtener_colores_predominantes_histograma(
-            "imagen.jpg",
-            umbral_similitud=40,      # Colores con distancia < 40 se agrupan
-            porcentaje_minimo=2.0,    # Solo colores que ocupan > 2%
-            precision_cuantizacion=16 # Reduce ruido de color
+        print("=== Ejemplo 1: Detección automática ===")
+        colores = obtener_colores_predominantes(
+            "imagen.jpg",  # Cambia esto por tu ruta de imagen
+            num_colores=None,  # None = detección automática
+            tolerancia=20
         )
         
-        print("\nColores encontrados:")
-        for color_rgb, info in colores1.items():
-            print(f"{color_rgb} ({info['hex']})")
-            print(f"  → {info['porcentaje']}% | Contrasta con: {info['mejor_contraste']}")
-            print(f"  → Contraste negro: {info['contraste_con_negro']} | blanco: {info['contraste_con_blanco']}")
+        print("\nColores predominantes encontrados:\n")
+        for color_rgb, info in colores.items():
+            print(f"Color: {color_rgb}")
+            print(f"  Hex: {info['hex']}")
+            print(f"  Porcentaje: {info['porcentaje']}%")
+            print(f"  Mejor contraste con: {info['mejor_contraste']}")
+            print(f"  Contraste con negro: {info['contraste_con_negro']}")
+            print(f"  Contraste con blanco: {info['contraste_con_blanco']}")
+            print()
         
-        print("\n" + "="*60)
-        print("=== MÉTODO 2: Median Cut (Algoritmo clásico) ===\n")
-        colores2 = obtener_colores_predominantes_mediana_cut(
+        # Ejemplo 2: Especificando número de colores
+        print("\n=== Ejemplo 2: 3 colores específicos ===")
+        colores_3 = obtener_colores_predominantes(
             "imagen.jpg",
-            max_colores=8  # Potencias de 2 funcionan mejor (4, 8, 16, 32)
+            num_colores=3
         )
         
-        print("\nColores encontrados:")
-        for color_rgb, info in colores2.items():
-            print(f"{color_rgb} ({info['hex']}) - {info['porcentaje']}%")
-            print(f"  → Mejor contraste: {info['mejor_contraste']}")
-        
+        for color_rgb, info in colores_3.items():
+            print(f"{color_rgb} - {info['porcentaje']}% - Contrasta con {info['mejor_contraste']}")
+            
     except Exception as e:
         print(f"Error: {e}")
         print("\nAsegúrate de tener una imagen llamada 'imagen.jpg' en el directorio")
