@@ -1,400 +1,338 @@
+import cv2
 import numpy as np
-from scipy import ndimage
-from scipy.ndimage import center_of_mass
-from skimage import io
-from skimage.measure import moments, moments_central, moments_hu
-import matplotlib.pyplot as plt
+from collections import defaultdict
 
-def normalizar_imagen(img):
-    """Normaliza la imagen a valores binarios 0 y 1"""
-    return (img > 0.5).astype(float)
+def calcular_luminancia_relativa(color):
+    """
+    Calcula la luminancia relativa según WCAG 2.0
+    """
+    r, g, b = color / 255.0
+    
+    def convertir_canal(canal):
+        if canal <= 0.03928:
+            return canal / 12.92
+        return ((canal + 0.055) / 1.055) ** 2.4
+    
+    r_lin = convertir_canal(r)
+    g_lin = convertir_canal(g)
+    b_lin = convertir_canal(b)
+    
+    return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
 
-def redimensionar_a_canvas_comun(img1, img2):
+def calcular_contraste(color1, color2):
     """
-    Redimensiona ambas imágenes a un canvas común del tamaño del más grande.
+    Calcula la relación de contraste entre dos colores según WCAG
     """
-    h1, w1 = img1.shape
-    h2, w2 = img2.shape
+    lum1 = calcular_luminancia_relativa(color1)
+    lum2 = calcular_luminancia_relativa(color2)
     
-    # Tamaño del canvas común (el máximo de ambas dimensiones)
-    max_h = max(h1, h2)
-    max_w = max(w1, w2)
-    
-    # Crear canvas para img1
-    canvas1 = np.zeros((max_h, max_w))
-    start_h1 = (max_h - h1) // 2
-    start_w1 = (max_w - w1) // 2
-    canvas1[start_h1:start_h1+h1, start_w1:start_w1+w1] = img1
-    
-    # Crear canvas para img2
-    canvas2 = np.zeros((max_h, max_w))
-    start_h2 = (max_h - h2) // 2
-    start_w2 = (max_w - w2) // 2
-    canvas2[start_h2:start_h2+h2, start_w2:start_w2+w2] = img2
-    
-    return canvas1, canvas2
+    if lum1 > lum2:
+        return (lum1 + 0.05) / (lum2 + 0.05)
+    return (lum2 + 0.05) / (lum1 + 0.05)
 
-def centrar_objeto(img):
+def distancia_color(color1, color2):
     """
-    Centra el objeto en la imagen moviendo su centro de masa al centro.
+    Calcula la distancia euclidiana entre dos colores en espacio RGB
     """
-    img_bin = normalizar_imagen(img)
-    
-    # Calcular centro de masa
-    cy, cx = center_of_mass(img_bin)
-    
-    if np.isnan(cy) or np.isnan(cx):
-        return img_bin
-    
-    # Calcular desplazamiento necesario
-    center_y, center_x = np.array(img.shape) / 2
-    shift_y = center_y - cy
-    shift_x = center_x - cx
-    
-    # Desplazar imagen
-    img_centrada = ndimage.shift(img_bin, [shift_y, shift_x], order=0, mode='constant', cval=0)
-    
-    return img_centrada
+    return np.sqrt(np.sum((color1 - color2) ** 2))
 
-def calcular_momentos_hu_invariantes(img):
+def cuantizar_color(color, precision=32):
     """
-    Calcula momentos de Hu que son invariantes a traslación, escala y rotación.
-    Útiles para comparar formas sin importar su posición.
+    Cuantiza un color para reducir la variación de colores similares
     """
-    img_bin = normalizar_imagen(img)
-    
-    # Los momentos de Hu son invariantes
-    hu_moments = moments_hu(moments(img_bin))
-    
-    return hu_moments
+    return (color // precision) * precision
 
-def calcular_iou(img1, img2):
-    """Calcula Intersection over Union"""
-    img1_bin = img1 > 0.5
-    img2_bin = img2 > 0.5
-    
-    interseccion = np.sum(img1_bin & img2_bin)
-    union = np.sum(img1_bin | img2_bin)
-    
-    if union == 0:
-        return 0
-    
-    return interseccion / union
-
-def calcular_correlacion_normalizada(img1, img2):
-    """Correlación cruzada normalizada"""
-    img1_flat = img1.flatten()
-    img2_flat = img2.flatten()
-    
-    # Normalizar
-    img1_norm = (img1_flat - np.mean(img1_flat)) / (np.std(img1_flat) + 1e-8)
-    img2_norm = (img2_flat - np.mean(img2_flat)) / (np.std(img2_flat) + 1e-8)
-    
-    # Correlación
-    correlacion = np.dot(img1_norm, img2_norm) / len(img1_flat)
-    
-    return max(0, correlacion)
-
-def calcular_diferencia_contornos(img1, img2):
+def agrupar_colores_similares(colores_dict, umbral_similitud=30):
     """
-    Compara los contornos de las imágenes usando distancia de Hausdorff aproximada.
+    Agrupa colores similares usando clustering jerárquico simple
     """
-    # Obtener bordes
-    borde1 = img1 - ndimage.binary_erosion(img1)
-    borde2 = img2 - ndimage.binary_erosion(img2)
+    colores = list(colores_dict.keys())
+    conteos = list(colores_dict.values())
     
-    # Contar píxeles de borde que coinciden
-    coincidencias = np.sum(borde1 * borde2)
-    total_borde = np.sum(borde1) + np.sum(borde2)
+    if len(colores) == 0:
+        return {}
     
-    if total_borde == 0:
-        return 0
+    # Convertir a numpy array
+    colores_array = np.array(colores)
+    conteos_array = np.array(conteos)
     
-    return 2 * coincidencias / total_borde
-
-def calcular_similitud_combinada(img1, img2):
-    """
-    Combina múltiples métricas después de centrar los objetos.
-    """
-    # Redimensionar a canvas común primero
-    img1_canvas, img2_canvas = redimensionar_a_canvas_comun(img1, img2)
+    # Lista de clusters (cada uno es una lista de índices)
+    clusters = [[i] for i in range(len(colores))]
     
-    # Centrar ambas imágenes
-    img1_centrada = centrar_objeto(img1_canvas)
-    img2_centrada = centrar_objeto(img2_canvas)
-    
-    # Calcular métricas
-    iou = calcular_iou(img1_centrada, img2_centrada)
-    correlacion = calcular_correlacion_normalizada(img1_centrada, img2_centrada)
-    similitud_contorno = calcular_diferencia_contornos(img1_centrada, img2_centrada)
-    
-    # Similitud píxel a píxel
-    similitud_pixel = np.sum(img1_centrada == img2_centrada) / img1_centrada.size
-    
-    # Score combinado con pesos ajustados
-    score = 0.35 * iou + 0.30 * correlacion + 0.20 * similitud_contorno + 0.15 * similitud_pixel
-    
-    return score, iou, correlacion, similitud_contorno, similitud_pixel, img1_centrada, img2_centrada
-
-def encontrar_rotacion_optima_con_alineacion(imagen_a, imagen_b, verbose=True):
-    """
-    Encuentra la rotación óptima alineando los centros de masa primero.
-    Maneja imágenes de diferentes tamaños.
-    """
-    angulos = [0, 90, 180, 270]
-    resultados = []
-    
-    # Normalizar imágenes
-    imagen_a_norm = normalizar_imagen(imagen_a)
-    imagen_b_norm = normalizar_imagen(imagen_b)
-    
-    if verbose:
-        print(f"Tamaño Imagen A: {imagen_a_norm.shape}")
-        print(f"Tamaño Imagen B: {imagen_b_norm.shape}")
-        print("\nAnalizando rotaciones con alineación de centros de masa...")
-        print("=" * 75)
-    
-    # Redimensionar B a canvas común para visualización final
-    max_dim = max(imagen_a_norm.shape[0], imagen_a_norm.shape[1], 
-                  imagen_b_norm.shape[0], imagen_b_norm.shape[1])
-    canvas_b = np.zeros((max_dim, max_dim))
-    start_h = (max_dim - imagen_b_norm.shape[0]) // 2
-    start_w = (max_dim - imagen_b_norm.shape[1]) // 2
-    canvas_b[start_h:start_h+imagen_b_norm.shape[0], 
-             start_w:start_w+imagen_b_norm.shape[1]] = imagen_b_norm
-    imagen_b_centrada = centrar_objeto(canvas_b)
-    
-    for angulo in angulos:
-        # Rotar imagen A
-        img_rotada = ndimage.rotate(imagen_a_norm, angulo, reshape=False, order=0)
+    # Clustering jerárquico aglomerativo
+    while True:
+        min_dist = float('inf')
+        merge_i, merge_j = -1, -1
         
-        # Calcular similitudes (la función maneja diferentes tamaños)
-        score, iou, corr, sim_contorno, sim_pixel, img_rot_centrada, _ = calcular_similitud_combinada(
-            img_rotada, imagen_b_norm
+        # Encontrar los dos clusters más cercanos
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                # Calcular distancia promedio entre clusters
+                distancias = []
+                for idx_i in clusters[i]:
+                    for idx_j in clusters[j]:
+                        dist = distancia_color(colores_array[idx_i], colores_array[idx_j])
+                        distancias.append(dist)
+                
+                dist_promedio = np.mean(distancias)
+                
+                if dist_promedio < min_dist:
+                    min_dist = dist_promedio
+                    merge_i, merge_j = i, j
+        
+        # Si la distancia mínima es mayor al umbral, terminamos
+        if min_dist > umbral_similitud:
+            break
+        
+        # Fusionar los clusters más cercanos
+        clusters[merge_i].extend(clusters[merge_j])
+        clusters.pop(merge_j)
+        
+        # Si solo queda un cluster, terminamos
+        if len(clusters) == 1:
+            break
+    
+    # Crear el diccionario de colores agrupados
+    colores_agrupados = {}
+    for cluster in clusters:
+        # Calcular el color promedio ponderado por frecuencia
+        indices = np.array(cluster)
+        pesos = conteos_array[indices]
+        color_promedio = np.average(colores_array[indices], axis=0, weights=pesos).astype(int)
+        conteo_total = np.sum(pesos)
+        
+        colores_agrupados[tuple(color_promedio)] = conteo_total
+    
+    return colores_agrupados
+
+def obtener_colores_predominantes_histograma(ruta_imagen, umbral_similitud=30, 
+                                             porcentaje_minimo=1.0, precision_cuantizacion=16):
+    """
+    Identifica colores predominantes usando histogramas y clustering jerárquico.
+    
+    Enfoque alternativo sin K-means:
+    1. Cuantiza los colores para reducir variaciones mínimas
+    2. Crea un histograma de frecuencias de colores
+    3. Agrupa colores similares usando clustering jerárquico
+    4. Filtra colores poco frecuentes
+    
+    Args:
+        ruta_imagen: Path de la imagen a analizar
+        umbral_similitud: Distancia máxima para considerar colores similares (0-255)
+        porcentaje_minimo: Porcentaje mínimo para incluir un color (0-100)
+        precision_cuantizacion: Factor de cuantización (8, 16, 32, etc.)
+                               Valores menores = más precisión pero más colores
+    
+    Returns:
+        Diccionario con colores predominantes y su información de contraste
+    """
+    # Leer la imagen
+    imagen = cv2.imread(ruta_imagen)
+    if imagen is None:
+        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
+    
+    # Convertir de BGR a RGB
+    imagen_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
+    
+    # Redimensionar para procesamiento más rápido
+    altura, ancho = imagen_rgb.shape[:2]
+    max_dimension = 800
+    if max(altura, ancho) > max_dimension:
+        escala = max_dimension / max(altura, ancho)
+        nueva_altura = int(altura * escala)
+        nuevo_ancho = int(ancho * escala)
+        imagen_rgb = cv2.resize(imagen_rgb, (nuevo_ancho, nueva_altura))
+    
+    # Convertir a array de píxeles
+    pixeles = imagen_rgb.reshape(-1, 3)
+    total_pixeles = len(pixeles)
+    
+    print(f"Analizando {total_pixeles} píxeles...")
+    
+    # Paso 1: Cuantización de colores
+    print(f"Cuantizando colores (precisión: {precision_cuantizacion})...")
+    pixeles_cuantizados = (pixeles // precision_cuantizacion) * precision_cuantizacion
+    
+    # Paso 2: Crear histograma de frecuencias
+    print("Creando histograma de colores...")
+    histograma = defaultdict(int)
+    for pixel in pixeles_cuantizados:
+        color_tuple = tuple(pixel)
+        histograma[color_tuple] += 1
+    
+    print(f"Colores únicos encontrados: {len(histograma)}")
+    
+    # Paso 3: Filtrar colores muy poco frecuentes (antes de agrupar)
+    umbral_minimo = (porcentaje_minimo / 100.0) * total_pixeles
+    histograma_filtrado = {
+        color: conteo 
+        for color, conteo in histograma.items() 
+        if conteo >= umbral_minimo
+    }
+    
+    print(f"Colores después de filtrar por frecuencia: {len(histograma_filtrado)}")
+    
+    # Paso 4: Agrupar colores similares
+    print(f"Agrupando colores similares (umbral: {umbral_similitud})...")
+    colores_agrupados = agrupar_colores_similares(histograma_filtrado, umbral_similitud)
+    
+    print(f"Colores después de agrupar: {len(colores_agrupados)}")
+    
+    # Preparar los colores negro y blanco para comparación
+    negro = np.array([0, 0, 0])
+    blanco = np.array([255, 255, 255])
+    
+    # Crear el diccionario de resultados
+    resultado = {}
+    
+    for color, conteo in colores_agrupados.items():
+        color_array = np.array(color)
+        porcentaje = (conteo / total_pixeles) * 100
+        
+        # Calcular contraste con negro y blanco
+        contraste_negro = calcular_contraste(color_array, negro)
+        contraste_blanco = calcular_contraste(color_array, blanco)
+        
+        # Determinar mejor contraste
+        mejor_contraste = "blanco" if contraste_blanco > contraste_negro else "negro"
+        
+        # Crear clave del color en formato RGB
+        color_key = f"rgb({color[0]}, {color[1]}, {color[2]})"
+        
+        resultado[color_key] = {
+            "rgb": color,
+            "hex": f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
+            "porcentaje": round(porcentaje, 2),
+            "mejor_contraste": mejor_contraste,
+            "contraste_con_negro": round(contraste_negro, 2),
+            "contraste_con_blanco": round(contraste_blanco, 2),
+            "num_pixeles": conteo
+        }
+    
+    # Ordenar por porcentaje (descendente)
+    resultado = dict(sorted(
+        resultado.items(), 
+        key=lambda x: x[1]["porcentaje"], 
+        reverse=True
+    ))
+    
+    return resultado
+
+def obtener_colores_predominantes_mediana_cut(ruta_imagen, max_colores=8):
+    """
+    Implementa el algoritmo Median Cut para extracción de paleta de colores.
+    Este es el algoritmo clásico usado en reducción de colores y GIFs.
+    
+    Args:
+        ruta_imagen: Path de la imagen a analizar
+        max_colores: Número máximo de colores a extraer (potencia de 2 recomendada)
+    
+    Returns:
+        Diccionario con colores predominantes y su información de contraste
+    """
+    # Leer y procesar imagen
+    imagen = cv2.imread(ruta_imagen)
+    if imagen is None:
+        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
+    
+    imagen_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
+    
+    # Redimensionar
+    altura, ancho = imagen_rgb.shape[:2]
+    max_dimension = 800
+    if max(altura, ancho) > max_dimension:
+        escala = max_dimension / max(altura, ancho)
+        imagen_rgb = cv2.resize(imagen_rgb, (int(ancho * escala), int(altura * escala)))
+    
+    pixeles = imagen_rgb.reshape(-1, 3)
+    total_pixeles = len(pixeles)
+    
+    print(f"Aplicando Median Cut para {max_colores} colores...")
+    
+    def median_cut(pixeles, profundidad):
+        """Recursivamente divide el espacio de color"""
+        if profundidad == 0 or len(pixeles) == 0:
+            # Retornar el color promedio de este bucket
+            return [np.mean(pixeles, axis=0).astype(int)]
+        
+        # Encontrar el canal con mayor rango
+        rangos = np.max(pixeles, axis=0) - np.min(pixeles, axis=0)
+        canal = np.argmax(rangos)
+        
+        # Ordenar por ese canal y dividir por la mediana
+        pixeles_ordenados = pixeles[pixeles[:, canal].argsort()]
+        mediana = len(pixeles_ordenados) // 2
+        
+        # Dividir recursivamente
+        return (median_cut(pixeles_ordenados[:mediana], profundidad - 1) +
+                median_cut(pixeles_ordenados[mediana:], profundidad - 1))
+    
+    # Calcular profundidad necesaria (log2 de max_colores)
+    profundidad = int(np.log2(max_colores))
+    colores = median_cut(pixeles, profundidad)
+    
+    # Calcular frecuencias de cada color
+    resultado = {}
+    negro = np.array([0, 0, 0])
+    blanco = np.array([255, 255, 255])
+    
+    for color in colores:
+        # Contar cuántos píxeles están más cerca de este color
+        distancias = np.sqrt(np.sum((pixeles - color) ** 2, axis=1))
+        conteo = np.sum(distancias < 50)  # Umbral de proximidad
+        
+        if conteo == 0:
+            continue
+            
+        porcentaje = (conteo / total_pixeles) * 100
+        
+        color_array = np.array(color)
+        contraste_negro = calcular_contraste(color_array, negro)
+        contraste_blanco = calcular_contraste(color_array, blanco)
+        mejor_contraste = "blanco" if contraste_blanco > contraste_negro else "negro"
+        
+        color_key = f"rgb({color[0]}, {color[1]}, {color[2]})"
+        
+        resultado[color_key] = {
+            "rgb": tuple(color.tolist()),
+            "hex": f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
+            "porcentaje": round(porcentaje, 2),
+            "mejor_contraste": mejor_contraste,
+            "contraste_con_negro": round(contraste_negro, 2),
+            "contraste_con_blanco": round(contraste_blanco, 2)
+        }
+    
+    return dict(sorted(resultado.items(), key=lambda x: x[1]["porcentaje"], reverse=True))
+
+# Ejemplo de uso
+if __name__ == "__main__":
+    try:
+        print("=== MÉTODO 1: Histograma + Clustering Jerárquico ===\n")
+        colores1 = obtener_colores_predominantes_histograma(
+            "imagen.jpg",
+            umbral_similitud=40,      # Colores con distancia < 40 se agrupan
+            porcentaje_minimo=2.0,    # Solo colores que ocupan > 2%
+            precision_cuantizacion=16 # Reduce ruido de color
         )
         
-        resultados.append({
-            'angulo': angulo,
-            'score': score,
-            'iou': iou,
-            'correlacion': corr,
-            'similitud_contorno': sim_contorno,
-            'similitud_pixel': sim_pixel,
-            'imagen_centrada': img_rot_centrada
-        })
+        print("\nColores encontrados:")
+        for color_rgb, info in colores1.items():
+            print(f"{color_rgb} ({info['hex']})")
+            print(f"  → {info['porcentaje']}% | Contrasta con: {info['mejor_contraste']}")
+            print(f"  → Contraste negro: {info['contraste_con_negro']} | blanco: {info['contraste_con_blanco']}")
         
-        if verbose:
-            print(f"Rotación {angulo:3d}°:")
-            print(f"  Score combinado:     {score:.4f}")
-            print(f"  IoU:                 {iou:.4f}")
-            print(f"  Correlación:         {corr:.4f}")
-            print(f"  Similitud contorno:  {sim_contorno:.4f}")
-            print(f"  Similitud píxel:     {sim_pixel:.4f}")
-            print("-" * 75)
-    
-    # Encontrar mejor resultado
-    mejor = max(resultados, key=lambda x: x['score'])
-    
-    if verbose:
-        print("\n✓ RESULTADO FINAL:")
-        print(f"  Rotación óptima: {mejor['angulo']}°")
-        print(f"  Score: {mejor['score']:.4f}")
+        print("\n" + "="*60)
+        print("=== MÉTODO 2: Median Cut (Algoritmo clásico) ===\n")
+        colores2 = obtener_colores_predominantes_mediana_cut(
+            "imagen.jpg",
+            max_colores=8  # Potencias de 2 funcionan mejor (4, 8, 16, 32)
+        )
         
-        # Verificación adicional con momentos de Hu
-        img_a_rot_opt = ndimage.rotate(imagen_a_norm, mejor['angulo'], 
-                                        reshape=False, order=0)
-        hu_a = calcular_momentos_hu_invariantes(img_a_rot_opt)
-        hu_b = calcular_momentos_hu_invariantes(imagen_b_norm)
-        diferencia_hu = np.sum(np.abs(np.log(np.abs(hu_a) + 1e-10) - 
-                                       np.log(np.abs(hu_b) + 1e-10)))
-        print(f"  Diferencia momentos Hu: {diferencia_hu:.4f} (menor es mejor)")
-        print("=" * 75)
-    
-    return mejor['angulo'], mejor, resultados, imagen_b_centrada
-
-def visualizar_resultados_con_alineacion(imagen_a, imagen_b, angulo_optimo, resultados, imagen_b_centrada):
-    """
-    Visualización completa mostrando el proceso de alineación.
-    """
-    fig = plt.figure(figsize=(18, 12))
-    
-    # Asegurar que todas las imágenes centradas tengan el mismo tamaño
-    # Encontrar el tamaño máximo
-    max_h = imagen_b_centrada.shape[0]
-    max_w = imagen_b_centrada.shape[1]
-    
-    # Redimensionar todas las imágenes de resultados al mismo tamaño
-    for res in resultados:
-        if res['imagen_centrada'].shape != (max_h, max_w):
-            h, w = res['imagen_centrada'].shape
-            canvas = np.zeros((max_h, max_w))
-            h_start = (max_h - h) // 2
-            w_start = (max_w - w) // 2
-            canvas[h_start:h_start+h, w_start:w_start+w] = res['imagen_centrada']
-            res['imagen_centrada'] = canvas
-    
-    # Fila 1: Imágenes originales y sus centros
-    ax1 = plt.subplot(3, 5, 1)
-    img_a_display = normalizar_imagen(imagen_a)
-    cy_a, cx_a = center_of_mass(img_a_display)
-    ax1.imshow(img_a_display, cmap='gray')
-    ax1.plot(cx_a, cy_a, 'r+', markersize=15, markeredgewidth=2)
-    ax1.set_title('Imagen A Original\n(+ = centro de masa)', fontweight='bold', fontsize=10)
-    ax1.axis('off')
-    
-    ax2 = plt.subplot(3, 5, 2)
-    img_b_display = normalizar_imagen(imagen_b)
-    cy_b, cx_b = center_of_mass(img_b_display)
-    ax2.imshow(img_b_display, cmap='gray')
-    ax2.plot(cx_b, cy_b, 'b+', markersize=15, markeredgewidth=2)
-    ax2.set_title('Imagen B Original\n(+ = centro de masa)', fontweight='bold', fontsize=10)
-    ax2.axis('off')
-    
-    # Imagen A centrada
-    ax3 = plt.subplot(3, 5, 3)
-    img_a_centrada = centrar_objeto(imagen_a)
-    ax3.imshow(img_a_centrada, cmap='gray')
-    ax3.set_title('Imagen A Centrada', fontsize=10)
-    ax3.axis('off')
-    
-    # Imagen B centrada
-    ax4 = plt.subplot(3, 5, 4)
-    ax4.imshow(imagen_b_centrada, cmap='gray')
-    ax4.set_title('Imagen B Centrada', fontsize=10)
-    ax4.axis('off')
-    
-    # Fila 2: Todas las rotaciones centradas con scores
-    for i, res in enumerate(resultados):
-        ax = plt.subplot(3, 5, 6 + i)
-        ax.imshow(res['imagen_centrada'], cmap='gray')
+        print("\nColores encontrados:")
+        for color_rgb, info in colores2.items():
+            print(f"{color_rgb} ({info['hex']}) - {info['porcentaje']}%")
+            print(f"  → Mejor contraste: {info['mejor_contraste']}")
         
-        titulo = f"{res['angulo']}°\nScore: {res['score']:.3f}"
-        if res['angulo'] == angulo_optimo:
-            titulo = "✓ " + titulo
-            ax.set_title(titulo, fontweight='bold', color='green', fontsize=9)
-            ax.spines['bottom'].set_color('green')
-            ax.spines['top'].set_color('green')
-            ax.spines['left'].set_color('green')
-            ax.spines['right'].set_color('green')
-            ax.spines['bottom'].set_linewidth(3)
-            ax.spines['top'].set_linewidth(3)
-            ax.spines['left'].set_linewidth(3)
-            ax.spines['right'].set_linewidth(3)
-        else:
-            ax.set_title(titulo, fontsize=9)
-        ax.set_xticks([])
-        ax.set_yticks([])
-    
-    # Fila 3: Análisis detallado de la mejor rotación
-    mejor_res = [r for r in resultados if r['angulo'] == angulo_optimo][0]
-    
-    # Overlay RGB
-    ax11 = plt.subplot(3, 5, 11)
-    overlay = np.zeros((*imagen_b_centrada.shape, 3))
-    overlay[:,:,0] = imagen_b_centrada  # Rojo: B
-    overlay[:,:,1] = mejor_res['imagen_centrada']  # Verde: A rotada
-    overlay[:,:,2] = 0
-    ax11.imshow(overlay)
-    ax11.set_title('Overlay\n(Rojo=B, Verde=A)', fontweight='bold', fontsize=10)
-    ax11.axis('off')
-    
-    # Diferencia
-    ax12 = plt.subplot(3, 5, 12)
-    diferencia = np.abs(imagen_b_centrada - mejor_res['imagen_centrada'])
-    ax12.imshow(diferencia, cmap='hot')
-    ax12.set_title(f'Diferencia\n(negro=igual)', fontsize=10)
-    ax12.axis('off')
-    
-    # XOR (muestra píxeles que no coinciden)
-    ax13 = plt.subplot(3, 5, 13)
-    xor = np.logical_xor(imagen_b_centrada > 0.5, mejor_res['imagen_centrada'] > 0.5)
-    ax13.imshow(xor, cmap='gray')
-    ax13.set_title('XOR\n(blanco=diferente)', fontsize=10)
-    ax13.axis('off')
-    
-    # Gráfico de barras de scores
-    ax14 = plt.subplot(3, 5, 14)
-    angulos = [r['angulo'] for r in resultados]
-    scores = [r['score'] for r in resultados]
-    colores = ['green' if a == angulo_optimo else 'steelblue' for a in angulos]
-    ax14.bar(angulos, scores, color=colores, alpha=0.7)
-    ax14.set_xlabel('Rotación (°)', fontsize=9)
-    ax14.set_ylabel('Score', fontsize=9)
-    ax14.set_title('Comparación de Scores', fontweight='bold', fontsize=10)
-    ax14.set_xticks(angulos)
-    ax14.grid(True, alpha=0.3, axis='y')
-    ax14.set_ylim([0, 1])
-    
-    # Gráfico de radar de métricas
-    ax15 = plt.subplot(3, 5, 15, projection='polar')
-    categorias = ['IoU', 'Correlación', 'Contorno', 'Píxel']
-    valores = [mejor_res['iou'], mejor_res['correlacion'], 
-               mejor_res['similitud_contorno'], mejor_res['similitud_pixel']]
-    
-    angulos_radar = np.linspace(0, 2 * np.pi, len(categorias), endpoint=False).tolist()
-    valores += valores[:1]
-    angulos_radar += angulos_radar[:1]
-    
-    ax15.plot(angulos_radar, valores, 'o-', linewidth=2, color='green')
-    ax15.fill(angulos_radar, valores, alpha=0.25, color='green')
-    ax15.set_xticks(angulos_radar[:-1])
-    ax15.set_xticklabels(categorias, fontsize=8)
-    ax15.set_ylim(0, 1)
-    ax15.set_title('Métricas de\nla mejor rotación', fontweight='bold', fontsize=9, pad=20)
-    ax15.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-
-# ============================================
-# EJEMPLO DE USO
-# ============================================
-
-if __name__ == "__main__":
-    # Opción 1: Cargar tus imágenes
-    imagen_a = io.imread(r'D:\Alex\Trabajo\obj1.png', as_gray=True)
-    imagen_b = io.imread(r'D:\Alex\Trabajo\obj2.png', as_gray=True)
-
-    # Opción 2: Ejemplo con objetos DESALINEADOS y DIFERENTES TAMAÑOS
-    # print("Creando imágenes de ejemplo con diferentes tamaños y desalineadas...\n")
-    
-    # # Crear imagen A con forma L (100x100)
-    # imagen_a = np.zeros((100, 100))
-    # imagen_a[20:70, 30:40] = 1   # Barra vertical
-    # imagen_a[50:70, 30:70] = 1   # Barra horizontal
-    
-    # # Crear imagen B: rotar 90° con tamaño diferente (150x120)
-    # imagen_b = np.zeros((150, 120))
-    # temp = ndimage.rotate(imagen_a, 90, reshape=False, order=0)
-    # # Colocar en posición diferente dentro del canvas más grande
-    # h_start, w_start = 25, 10
-    # h_end = h_start + temp.shape[0]
-    # w_end = w_start + temp.shape[1]
-    # imagen_b[h_start:h_end, w_start:w_end] = temp
-    
-    # Agregar ruido ligero
-    imagen_b = imagen_b + np.random.random(imagen_b.shape) * 0.05
-    imagen_b = np.clip(imagen_b, 0, 1)
-    
-    print(f"Tamaño Imagen A: {imagen_a.shape}")
-    print(f"Tamaño Imagen B: {imagen_b.shape} (¡DIFERENTE!)")
-    print(f"Centro de masa A: {center_of_mass(normalizar_imagen(imagen_a))}")
-    print(f"Centro de masa B: {center_of_mass(normalizar_imagen(imagen_b))}")
-    print("→ Los objetos tienen diferentes tamaños y NO están alineados!\n")
-    
-    # Encontrar rotación óptima
-    angulo, mejor, todos, img_b_centrada = encontrar_rotacion_optima_con_alineacion(
-        imagen_a, imagen_b, verbose=True
-    )
-    
-    # Visualizar
-    print("\nGenerando visualización completa...")
-    visualizar_resultados_con_alineacion(imagen_a, imagen_b, angulo, todos, img_b_centrada)
-    
-    print("\n" + "="*75)
-    print("PARA USAR CON TUS IMÁGENES:")
-    print("="*75)
-    print("1. Descomenta 'Opción 1' y pon las rutas de tus imágenes")
-    print("2. Comenta/elimina 'Opción 2'")
-    print("3. pip install numpy scipy scikit-image matplotlib")
-    print("="*75)
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nAsegúrate de tener una imagen llamada 'imagen.jpg' en el directorio")
