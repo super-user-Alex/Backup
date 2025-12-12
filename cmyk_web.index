@@ -1,197 +1,146 @@
-import cv2
 import numpy as np
+from PIL import Image
 from sklearn.cluster import KMeans
-from collections import Counter
+from skimage import color
+import colorsys
 
-def calcular_luminancia_relativa(color):
-    """
-    Calcula la luminancia relativa según WCAG 2.0
-    """
-    r, g, b = color / 255.0
-    
-    # Convertir a valores lineales
-    def convertir_canal(canal):
-        if canal <= 0.03928:
-            return canal / 12.92
-        return ((canal + 0.055) / 1.055) ** 2.4
-    
-    r_lin = convertir_canal(r)
-    g_lin = convertir_canal(g)
-    b_lin = convertir_canal(b)
-    
-    # Calcular luminancia relativa
-    return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
+class ColorAnalyzer:
+    def __init__(self, image_path, num_clusters=5):
+        """
+        Initializes the analyzer.
+        :param image_path: Path to the input image.
+        :param num_clusters: The number of colors to group pixels into (k in K-Means).
+        """
+        self.image_path = image_path
+        self.num_clusters = num_clusters
+        self.img_rgb = None
+        self.results = []
 
-def calcular_contraste(color1, color2):
-    """
-    Calcula la relación de contraste entre dos colores según WCAG
-    """
-    lum1 = calcular_luminancia_relativa(color1)
-    lum2 = calcular_luminancia_relativa(color2)
-    
-    # El color más claro debe estar en el numerador
-    if lum1 > lum2:
-        return (lum1 + 0.05) / (lum2 + 0.05)
-    return (lum2 + 0.05) / (lum1 + 0.05)
+    def load_and_preprocess(self):
+        """
+        Loads the image, resizes for performance, and converts to LAB space.
+        """
+        try:
+            with Image.open(self.image_path) as img:
+                img = img.convert('RGB')
+                # Resize to speed up processing (K-Means is slow on large images)
+                # 128x128 provides enough data for color dominance without the overhead
+                img.thumbnail((128, 128))
+                self.img_rgb = np.array(img)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Could not find image at {self.image_path}")
 
-def determinar_num_colores_optimo(pixeles, rango_min=2, rango_max=10):
-    """
-    Determina automáticamente el número óptimo de colores usando el método del codo.
-    
-    Args:
-        pixeles: Array de píxeles (N x 3)
-        rango_min: Mínimo número de clusters a probar
-        rango_max: Máximo número de clusters a probar
-    
-    Returns:
-        Número óptimo de colores
-    """
-    inercias = []
-    rango_k = range(rango_min, rango_max + 1)
-    
-    # Calcular inercia para diferentes valores de k
-    for k in rango_k:
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(pixeles)
-        inercias.append(kmeans.inertia_)
-    
-    # Encontrar el "codo" calculando la segunda derivada
-    if len(inercias) < 3:
-        return rango_min
-    
-    # Calcular las diferencias
-    diferencias = np.diff(inercias)
-    diferencias_segunda = np.diff(diferencias)
-    
-    # Encontrar el punto donde la mejora se reduce significativamente
-    # Usamos el punto de máxima curvatura (segunda derivada)
-    if len(diferencias_segunda) > 0:
-        idx_codo = np.argmax(diferencias_segunda) + 2  # +2 por los dos diff
-        return min(idx_codo, rango_max)
-    
-    return rango_min + 2  # Valor por defecto razonable
+    def get_contrast_color(self, rgb):
+        """
+        Determines the best contrast color (Black or White) based on luminance.
+        Uses the standard luminance formula: L = 0.299R + 0.587G + 0.114B
+        """
+        r, g, b = rgb
+        # Calculate luminance (0 to 255 scale)
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b)
+        
+        # If dark, return White; if bright, return Black
+        return (255, 255, 255) if luminance < 128 else (0, 0, 0)
 
-def obtener_colores_predominantes(ruta_imagen, num_colores=None, tolerancia=20):
-    """
-    Identifica los colores predominantes de una imagen.
-    
-    Args:
-        ruta_imagen: Path de la imagen a analizar
-        num_colores: Número de colores predominantes a extraer. 
-                     Si es None, se detecta automáticamente.
-        tolerancia: Umbral de similitud para agrupar colores similares (0-255)
-    
-    Returns:
-        Diccionario con colores predominantes y su información de contraste
-    """
-    # Leer la imagen
-    imagen = cv2.imread(ruta_imagen)
-    if imagen is None:
-        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
-    
-    # Convertir de BGR a RGB
-    imagen_rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
-    
-    # Redimensionar la imagen para procesamiento más rápido (opcional)
-    altura, ancho = imagen_rgb.shape[:2]
-    max_dimension = 800
-    if max(altura, ancho) > max_dimension:
-        escala = max_dimension / max(altura, ancho)
-        nueva_altura = int(altura * escala)
-        nuevo_ancho = int(ancho * escala)
-        imagen_rgb = cv2.resize(imagen_rgb, (nuevo_ancho, nueva_altura))
-    
-    # Convertir la imagen a un array de píxeles
-    pixeles = imagen_rgb.reshape(-1, 3)
-    
-    # Determinar número óptimo de colores si no se especifica
-    if num_colores is None:
-        print("Detectando número óptimo de colores...")
-        num_colores = determinar_num_colores_optimo(pixeles, rango_min=2, rango_max=10)
-        print(f"Número óptimo detectado: {num_colores} colores")
-    
-    # Aplicar K-means clustering
-    kmeans = KMeans(n_clusters=num_colores, random_state=42, n_init=10)
-    kmeans.fit(pixeles)
-    
-    # Obtener los colores centroides
-    colores = kmeans.cluster_centers_.astype(int)
-    
-    # Contar cuántos píxeles pertenecen a cada cluster
-    etiquetas = kmeans.labels_
-    conteo = Counter(etiquetas)
-    
-    # Preparar los colores negro y blanco para comparación
-    negro = np.array([0, 0, 0])
-    blanco = np.array([255, 255, 255])
-    
-    # Crear el diccionario de resultados
-    resultado = {}
-    total_pixeles = len(pixeles)
-    
-    for idx, color in enumerate(colores):
-        # Calcular porcentaje de presencia
-        porcentaje = (conteo[idx] / total_pixeles) * 100
+    def get_complementary_color(self, rgb):
+        """
+        Calculates the complementary color by shifting Hue by 180 degrees.
+        """
+        r, g, b = [x / 255.0 for x in rgb] # Normalize to 0-1
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
         
-        # Calcular contraste con negro y blanco
-        contraste_negro = calcular_contraste(color, negro)
-        contraste_blanco = calcular_contraste(color, blanco)
+        # Shift hue by 0.5 (180 degrees)
+        h = (h + 0.5) % 1.0
         
-        # Determinar mejor contraste
-        mejor_contraste = "blanco" if contraste_blanco > contraste_negro else "negro"
-        
-        # Crear clave del color en formato RGB
-        color_key = f"rgb({color[0]}, {color[1]}, {color[2]})"
-        
-        resultado[color_key] = {
-            "rgb": tuple(color.tolist()),
-            "hex": f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
-            "porcentaje": round(porcentaje, 2),
-            "mejor_contraste": mejor_contraste,
-            "contraste_con_negro": round(contraste_negro, 2),
-            "contraste_con_blanco": round(contraste_blanco, 2)
-        }
-    
-    # Ordenar por porcentaje (descendente)
-    resultado = dict(sorted(
-        resultado.items(), 
-        key=lambda x: x[1]["porcentaje"], 
-        reverse=True
-    ))
-    
-    return resultado
+        new_r, new_g, new_b = colorsys.hls_to_rgb(h, l, s)
+        return (int(new_r * 255), int(new_g * 255), int(new_b * 255))
 
-# Ejemplo de uso
-if __name__ == "__main__":
-    # Ejemplo 1: Detección automática de número de colores
-    try:
-        print("=== Ejemplo 1: Detección automática ===")
-        colores = obtener_colores_predominantes(
-            "imagen.jpg",  # Cambia esto por tu ruta de imagen
-            num_colores=None,  # None = detección automática
-            tolerancia=20
-        )
+    def analyze(self):
+        """
+        Performs the K-Means clustering in LAB space and calculates metrics.
+        """
+        self.load_and_preprocess()
+
+        # 1. Convert to LAB Space for perceptually uniform clustering
+        # Normalize to 0-1 for skimage conversion
+        img_normalized = self.img_rgb / 255.0
+        img_lab = color.rgb2lab(img_normalized)
         
-        print("\nColores predominantes encontrados:\n")
-        for color_rgb, info in colores.items():
-            print(f"Color: {color_rgb}")
-            print(f"  Hex: {info['hex']}")
-            print(f"  Porcentaje: {info['porcentaje']}%")
-            print(f"  Mejor contraste con: {info['mejor_contraste']}")
-            print(f"  Contraste con negro: {info['contraste_con_negro']}")
-            print(f"  Contraste con blanco: {info['contraste_con_blanco']}")
-            print()
+        # Flatten the image into a list of pixels for the clustering algorithm
+        w, h, d = img_lab.shape
+        pixel_array_lab = img_lab.reshape((w * h, d))
+
+        # 2. Perform K-Means Clustering
+        clt = KMeans(n_clusters=self.num_clusters, random_state=42, n_init=10)
+        labels = clt.fit_predict(pixel_array_lab)
         
-        # Ejemplo 2: Especificando número de colores
-        print("\n=== Ejemplo 2: 3 colores específicos ===")
-        colores_3 = obtener_colores_predominantes(
-            "imagen.jpg",
-            num_colores=3
-        )
+        # 3. Count labels to get percentages
+        label_counts = np.bincount(labels)
+        total_count = len(labels)
         
-        for color_rgb, info in colores_3.items():
-            print(f"{color_rgb} - {info['porcentaje']}% - Contrasta con {info['mejor_contraste']}")
+        # 4. Process each cluster center
+        centers_lab = clt.cluster_centers_
+        
+        # Reshape to 1xNx3 for conversion back to RGB
+        centers_lab_reshaped = centers_lab.reshape((1, self.num_clusters, 3))
+        centers_rgb = color.lab2rgb(centers_lab_reshaped)[0] * 255
+
+        # Sort results by percentage (most dominant first)
+        sorted_indices = np.argsort(label_counts)[::-1]
+
+        print(f"--- Analysis for: {self.image_path} ---")
+        print(f"{'Predominant (RGB)':<25} {'Percentage':<12} {'Contrast (RGB)':<20} {'Complementary (RGB)':<20}")
+        print("-" * 80)
+
+        for i in sorted_indices:
+            # Main Color
+            rgb_raw = centers_rgb[i]
+            predominant_rgb = tuple(map(int, rgb_raw))
             
-    except Exception as e:
-        print(f"Error: {e}")
-        print("\nAsegúrate de tener una imagen llamada 'imagen.jpg' en el directorio")
+            # Percentage
+            percentage = (label_counts[i] / total_count) * 100
+            
+            # Contrast
+            contrast_rgb = self.get_contrast_color(predominant_rgb)
+            contrast_name = "White" if contrast_rgb == (255, 255, 255) else "Black"
+            
+            # Complementary
+            comp_rgb = self.get_complementary_color(predominant_rgb)
+            
+            # Store structured data
+            self.results.append({
+                "predominant": predominant_rgb,
+                "percentage": round(percentage, 2),
+                "contrast": contrast_rgb,
+                "complementary": comp_rgb
+            })
+
+            print(f"{str(predominant_rgb):<25} {percentage:>6.2f}%      {str(contrast_rgb) + ' (' + contrast_name + ')':<20} {str(comp_rgb):<20}")
+
+        return self.results
+
+# --- Usage Example ---
+if __name__ == "__main__":
+    # Ensure you have an image named 'test_image.jpg' in the directory
+    # or change this path to your specific file.
+    # Create a dummy image for demonstration if file doesn't exist
+    
+    import os
+    
+    input_image = "input.jpg"
+    
+    # If image doesn't exist, create a gradient image for testing
+    if not os.path.exists(input_image):
+        print("Image not found. Creating a test gradient image...")
+        w, h = 512, 512
+        arr = np.zeros((h, w, 3), dtype=np.uint8)
+        for y in range(h):
+            for x in range(w):
+                # Simple gradient: Blue to Pink
+                arr[y, x] = [x % 255, 0, y % 255]
+        img = Image.fromarray(arr)
+        img.save(input_image)
+        print(f"Created {input_image}")
+
+    analyzer = ColorAnalyzer(input_image, num_clusters=5)
+    data = analyzer.analyze()
