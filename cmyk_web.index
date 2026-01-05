@@ -1,146 +1,157 @@
 import numpy as np
-from PIL import Image
-from sklearn.cluster import KMeans
-from skimage import color
-import colorsys
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+from shapely.geometry import Polygon, Point
+from shapely.affinity import translate
 
-class ColorAnalyzer:
-    def __init__(self, image_path, num_clusters=5):
-        """
-        Initializes the analyzer.
-        :param image_path: Path to the input image.
-        :param num_clusters: The number of colors to group pixels into (k in K-Means).
-        """
-        self.image_path = image_path
-        self.num_clusters = num_clusters
-        self.img_rgb = None
-        self.results = []
+def get_bottom_left_point(polygon):
+    """Obtiene el punto más bajo y a la izquierda del polígono"""
+    coords = list(polygon.exterior.coords[:-1])
+    bottom_left = min(coords, key=lambda p: (p[1], p[0]))
+    return bottom_left
 
-    def load_and_preprocess(self):
-        """
-        Loads the image, resizes for performance, and converts to LAB space.
-        """
-        try:
-            with Image.open(self.image_path) as img:
-                img = img.convert('RGB')
-                # Resize to speed up processing (K-Means is slow on large images)
-                # 128x128 provides enough data for color dominance without the overhead
-                img.thumbnail((128, 128))
-                self.img_rgb = np.array(img)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Could not find image at {self.image_path}")
+def get_bottom_right_point(polygon):
+    """Obtiene el punto más bajo y a la derecha del polígono"""
+    coords = list(polygon.exterior.coords[:-1])
+    bottom_right = min(coords, key=lambda p: (p[1], -p[0]))
+    return bottom_right
 
-    def get_contrast_color(self, rgb):
-        """
-        Determines the best contrast color (Black or White) based on luminance.
-        Uses the standard luminance formula: L = 0.299R + 0.587G + 0.114B
-        """
-        r, g, b = rgb
-        # Calculate luminance (0 to 255 scale)
-        luminance = (0.299 * r + 0.587 * g + 0.114 * b)
+def minkowski_sum_edge(polygon, edge_start, edge_end):
+    """Calcula la suma de Minkowski de un polígono con un segmento de línea"""
+    edge_vector = np.array(edge_end) - np.array(edge_start)
+    translated_points = []
+    
+    for point in polygon.exterior.coords[:-1]:
+        new_point = np.array(point) + edge_vector
+        translated_points.append(tuple(new_point))
+    
+    return translated_points
+
+def calculate_nfp(fixed_poly, moving_poly):
+    """
+    Calcula el No-Fit Polygon usando el método de suma de Minkowski
+    fixed_poly: polígono fijo
+    moving_poly: polígono móvil (se refleja respecto al origen)
+    """
+    # Reflejar el polígono móvil respecto al origen
+    moving_coords = list(moving_poly.exterior.coords[:-1])
+    reflected_coords = [(-x, -y) for x, y in moving_coords]
+    reflected_poly = Polygon(reflected_coords)
+    
+    # Obtener los vértices del polígono fijo
+    fixed_coords = list(fixed_poly.exterior.coords[:-1])
+    
+    # Calcular la suma de Minkowski
+    nfp_points = []
+    
+    # Para cada arista del polígono fijo
+    for i in range(len(fixed_coords)):
+        start = fixed_coords[i]
+        end = fixed_coords[(i + 1) % len(fixed_coords)]
         
-        # If dark, return White; if bright, return Black
-        return (255, 255, 255) if luminance < 128 else (0, 0, 0)
+        # Sumar todos los vértices del polígono reflejado
+        edge_points = minkowski_sum_edge(reflected_poly, (0, 0), start)
+        nfp_points.extend(edge_points)
+    
+    # Añadir los vértices del polígono reflejado trasladado a cada vértice del fijo
+    for vertex in fixed_coords:
+        for ref_vertex in reflected_coords:
+            point = (vertex[0] + ref_vertex[0], vertex[1] + ref_vertex[1])
+            nfp_points.append(point)
+    
+    # Crear el NFP usando el convex hull de todos los puntos
+    if nfp_points:
+        nfp = Polygon(nfp_points).convex_hull
+        return nfp
+    
+    return None
 
-    def get_complementary_color(self, rgb):
-        """
-        Calculates the complementary color by shifting Hue by 180 degrees.
-        """
-        r, g, b = [x / 255.0 for x in rgb] # Normalize to 0-1
-        h, l, s = colorsys.rgb_to_hls(r, g, b)
+def visualize_nfp(fixed_poly, moving_poly, nfp):
+    """Visualiza los polígonos y el NFP"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Gráfico 1: Polígonos originales con punto de contacto
+    ax1.set_aspect('equal')
+    ax1.set_title('Polígonos Originales\n(Punto de contacto: inferior izquierda del móvil)')
+    
+    # Dibujar polígono fijo
+    fixed_coords = list(fixed_poly.exterior.coords)
+    fixed_patch = MplPolygon(fixed_coords, fill=True, alpha=0.3, 
+                             color='blue', edgecolor='blue', linewidth=2)
+    ax1.add_patch(fixed_patch)
+    
+    # Obtener punto inferior izquierdo del polígono móvil
+    contact_point = get_bottom_left_point(moving_poly)
+    
+    # Dibujar polígono móvil
+    moving_coords = list(moving_poly.exterior.coords)
+    moving_patch = MplPolygon(moving_coords, fill=True, alpha=0.3, 
+                              color='red', edgecolor='red', linewidth=2)
+    ax1.add_patch(moving_patch)
+    
+    # Marcar punto de contacto
+    ax1.plot(contact_point[0], contact_point[1], 'go', markersize=10, 
+             label='Punto de contacto')
+    
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    
+    # Gráfico 2: NFP con punto de referencia
+    ax2.set_aspect('equal')
+    ax2.set_title('No-Fit Polygon (NFP)\n(Referencia: inferior derecha)')
+    
+    # Dibujar polígono fijo
+    fixed_patch2 = MplPolygon(fixed_coords, fill=True, alpha=0.3, 
+                              color='blue', edgecolor='blue', linewidth=2, 
+                              label='Polígono fijo')
+    ax2.add_patch(fixed_patch2)
+    
+    # Dibujar NFP
+    if nfp:
+        nfp_coords = list(nfp.exterior.coords)
+        nfp_patch = MplPolygon(nfp_coords, fill=False, alpha=0.5, 
+                               edgecolor='green', linewidth=2, 
+                               linestyle='--', label='NFP')
+        ax2.add_patch(nfp_patch)
         
-        # Shift hue by 0.5 (180 degrees)
-        h = (h + 0.5) % 1.0
-        
-        new_r, new_g, new_b = colorsys.hls_to_rgb(h, l, s)
-        return (int(new_r * 255), int(new_g * 255), int(new_b * 255))
+        # Marcar punto inferior derecho del NFP
+        ref_point = get_bottom_right_point(nfp)
+        ax2.plot(ref_point[0], ref_point[1], 'mo', markersize=10, 
+                 label='Punto inferior derecho NFP')
+    
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+    
+    plt.tight_layout()
+    plt.show()
 
-    def analyze(self):
-        """
-        Performs the K-Means clustering in LAB space and calculates metrics.
-        """
-        self.load_and_preprocess()
-
-        # 1. Convert to LAB Space for perceptually uniform clustering
-        # Normalize to 0-1 for skimage conversion
-        img_normalized = self.img_rgb / 255.0
-        img_lab = color.rgb2lab(img_normalized)
-        
-        # Flatten the image into a list of pixels for the clustering algorithm
-        w, h, d = img_lab.shape
-        pixel_array_lab = img_lab.reshape((w * h, d))
-
-        # 2. Perform K-Means Clustering
-        clt = KMeans(n_clusters=self.num_clusters, random_state=42, n_init=10)
-        labels = clt.fit_predict(pixel_array_lab)
-        
-        # 3. Count labels to get percentages
-        label_counts = np.bincount(labels)
-        total_count = len(labels)
-        
-        # 4. Process each cluster center
-        centers_lab = clt.cluster_centers_
-        
-        # Reshape to 1xNx3 for conversion back to RGB
-        centers_lab_reshaped = centers_lab.reshape((1, self.num_clusters, 3))
-        centers_rgb = color.lab2rgb(centers_lab_reshaped)[0] * 255
-
-        # Sort results by percentage (most dominant first)
-        sorted_indices = np.argsort(label_counts)[::-1]
-
-        print(f"--- Analysis for: {self.image_path} ---")
-        print(f"{'Predominant (RGB)':<25} {'Percentage':<12} {'Contrast (RGB)':<20} {'Complementary (RGB)':<20}")
-        print("-" * 80)
-
-        for i in sorted_indices:
-            # Main Color
-            rgb_raw = centers_rgb[i]
-            predominant_rgb = tuple(map(int, rgb_raw))
-            
-            # Percentage
-            percentage = (label_counts[i] / total_count) * 100
-            
-            # Contrast
-            contrast_rgb = self.get_contrast_color(predominant_rgb)
-            contrast_name = "White" if contrast_rgb == (255, 255, 255) else "Black"
-            
-            # Complementary
-            comp_rgb = self.get_complementary_color(predominant_rgb)
-            
-            # Store structured data
-            self.results.append({
-                "predominant": predominant_rgb,
-                "percentage": round(percentage, 2),
-                "contrast": contrast_rgb,
-                "complementary": comp_rgb
-            })
-
-            print(f"{str(predominant_rgb):<25} {percentage:>6.2f}%      {str(contrast_rgb) + ' (' + contrast_name + ')':<20} {str(comp_rgb):<20}")
-
-        return self.results
-
-# --- Usage Example ---
+# Ejemplo de uso
 if __name__ == "__main__":
-    # Ensure you have an image named 'test_image.jpg' in the directory
-    # or change this path to your specific file.
-    # Create a dummy image for demonstration if file doesn't exist
+    # Definir polígono fijo (un rectángulo)
+    fixed_coords = [(1, 1), (4, 1), (4, 3), (1, 3)]
+    fixed_polygon = Polygon(fixed_coords)
     
-    import os
+    # Definir polígono móvil (un triángulo)
+    moving_coords = [(6, 1), (8, 1), (7, 3)]
+    moving_polygon = Polygon(moving_coords)
     
-    input_image = "input.jpg"
+    print("Calculando No-Fit Polygon...")
     
-    # If image doesn't exist, create a gradient image for testing
-    if not os.path.exists(input_image):
-        print("Image not found. Creating a test gradient image...")
-        w, h = 512, 512
-        arr = np.zeros((h, w, 3), dtype=np.uint8)
-        for y in range(h):
-            for x in range(w):
-                # Simple gradient: Blue to Pink
-                arr[y, x] = [x % 255, 0, y % 255]
-        img = Image.fromarray(arr)
-        img.save(input_image)
-        print(f"Created {input_image}")
-
-    analyzer = ColorAnalyzer(input_image, num_clusters=5)
-    data = analyzer.analyze()
+    # Calcular NFP
+    nfp = calculate_nfp(fixed_polygon, moving_polygon)
+    
+    # Obtener puntos de referencia
+    contact_point = get_bottom_left_point(moving_polygon)
+    print(f"Punto de contacto (inferior izquierda del móvil): {contact_point}")
+    
+    if nfp:
+        ref_point = get_bottom_right_point(nfp)
+        print(f"Punto de referencia del NFP (inferior derecha): {ref_point}")
+        print(f"Área del NFP: {nfp.area:.2f}")
+    
+    # Visualizar
+    visualize_nfp(fixed_polygon, moving_polygon, nfp)
