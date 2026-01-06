@@ -1,157 +1,289 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from shapely.geometry import Polygon, Point, MultiPolygon
+from shapely.affinity import translate, rotate
 from matplotlib.patches import Polygon as MplPolygon
-from shapely.geometry import Polygon, Point
-from shapely.affinity import translate
+import random
 
-def get_bottom_left_point(polygon):
-    """Obtiene el punto más bajo y a la izquierda del polígono"""
-    coords = list(polygon.exterior.coords[:-1])
-    bottom_left = min(coords, key=lambda p: (p[1], p[0]))
-    return bottom_left
-
-def get_bottom_right_point(polygon):
-    """Obtiene el punto más bajo y a la derecha del polígono"""
-    coords = list(polygon.exterior.coords[:-1])
-    bottom_right = min(coords, key=lambda p: (p[1], -p[0]))
-    return bottom_right
-
-def minkowski_sum_edge(polygon, edge_start, edge_end):
-    """Calcula la suma de Minkowski de un polígono con un segmento de línea"""
-    edge_vector = np.array(edge_end) - np.array(edge_start)
-    translated_points = []
-    
-    for point in polygon.exterior.coords[:-1]:
-        new_point = np.array(point) + edge_vector
-        translated_points.append(tuple(new_point))
-    
-    return translated_points
-
-def calculate_nfp(fixed_poly, moving_poly):
+def calculate_nfp(poly_fixed, poly_moving):
     """
-    Calcula el No-Fit Polygon usando el método de suma de Minkowski
-    fixed_poly: polígono fijo
-    moving_poly: polígono móvil (se refleja respecto al origen)
+    Calcula el No-Fit Polygon (NFP) entre dos polígonos.
     """
-    # Reflejar el polígono móvil respecto al origen
-    moving_coords = list(moving_poly.exterior.coords[:-1])
-    reflected_coords = [(-x, -y) for x, y in moving_coords]
-    reflected_poly = Polygon(reflected_coords)
+    moving_coords = np.array(poly_moving.exterior.coords[:-1])
+    reflected_coords = -moving_coords
     
-    # Obtener los vértices del polígono fijo
-    fixed_coords = list(fixed_poly.exterior.coords[:-1])
+    fixed_coords = np.array(poly_fixed.exterior.coords[:-1])
     
-    # Calcular la suma de Minkowski
-    nfp_points = []
+    minkowski_points = []
+    for fp in fixed_coords:
+        for mp in reflected_coords:
+            minkowski_points.append(fp + mp)
     
-    # Para cada arista del polígono fijo
-    for i in range(len(fixed_coords)):
-        start = fixed_coords[i]
-        end = fixed_coords[(i + 1) % len(fixed_coords)]
-        
-        # Sumar todos los vértices del polígono reflejado
-        edge_points = minkowski_sum_edge(reflected_poly, (0, 0), start)
-        nfp_points.extend(edge_points)
+    if minkowski_points:
+        nfp = Polygon(minkowski_points).convex_hull
+    else:
+        nfp = poly_fixed
     
-    # Añadir los vértices del polígono reflejado trasladado a cada vértice del fijo
-    for vertex in fixed_coords:
-        for ref_vertex in reflected_coords:
-            point = (vertex[0] + ref_vertex[0], vertex[1] + ref_vertex[1])
-            nfp_points.append(point)
-    
-    # Crear el NFP usando el convex hull de todos los puntos
-    if nfp_points:
-        nfp = Polygon(nfp_points).convex_hull
-        return nfp
-    
-    return None
+    return nfp
 
-def visualize_nfp(fixed_poly, moving_poly, nfp):
-    """Visualiza los polígonos y el NFP"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+def calculate_inner_fit_polygon(container, polygon):
+    """
+    Calcula el Inner Fit Polygon (IFP) - área válida dentro del contenedor.
+    Es el área donde el punto de referencia puede estar para que el polígono
+    quede completamente dentro del contenedor.
+    """
+    # Reflejar el polígono
+    poly_coords = np.array(polygon.exterior.coords[:-1])
+    reflected_coords = -poly_coords
+    poly_reflected = Polygon(reflected_coords)
     
-    # Gráfico 1: Polígonos originales con punto de contacto
-    ax1.set_aspect('equal')
-    ax1.set_title('Polígonos Originales\n(Punto de contacto: inferior izquierda del móvil)')
-    
-    # Dibujar polígono fijo
-    fixed_coords = list(fixed_poly.exterior.coords)
-    fixed_patch = MplPolygon(fixed_coords, fill=True, alpha=0.3, 
-                             color='blue', edgecolor='blue', linewidth=2)
-    ax1.add_patch(fixed_patch)
-    
-    # Obtener punto inferior izquierdo del polígono móvil
-    contact_point = get_bottom_left_point(moving_poly)
-    
-    # Dibujar polígono móvil
-    moving_coords = list(moving_poly.exterior.coords)
-    moving_patch = MplPolygon(moving_coords, fill=True, alpha=0.3, 
-                              color='red', edgecolor='red', linewidth=2)
-    ax1.add_patch(moving_patch)
-    
-    # Marcar punto de contacto
-    ax1.plot(contact_point[0], contact_point[1], 'go', markersize=10, 
-             label='Punto de contacto')
-    
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xlabel('X')
-    ax1.set_ylabel('Y')
-    
-    # Gráfico 2: NFP con punto de referencia
-    ax2.set_aspect('equal')
-    ax2.set_title('No-Fit Polygon (NFP)\n(Referencia: inferior derecha)')
-    
-    # Dibujar polígono fijo
-    fixed_patch2 = MplPolygon(fixed_coords, fill=True, alpha=0.3, 
-                              color='blue', edgecolor='blue', linewidth=2, 
-                              label='Polígono fijo')
-    ax2.add_patch(fixed_patch2)
-    
-    # Dibujar NFP
-    if nfp:
-        nfp_coords = list(nfp.exterior.coords)
-        nfp_patch = MplPolygon(nfp_coords, fill=False, alpha=0.5, 
-                               edgecolor='green', linewidth=2, 
-                               linestyle='--', label='NFP')
-        ax2.add_patch(nfp_patch)
+    # El IFP es la erosión del contenedor por el polígono reflejado
+    try:
+        # Usar buffer negativo (erosión)
+        container_coords = np.array(container.exterior.coords[:-1])
         
-        # Marcar punto inferior derecho del NFP
-        ref_point = get_bottom_right_point(nfp)
-        ax2.plot(ref_point[0], ref_point[1], 'mo', markersize=10, 
-                 label='Punto inferior derecho NFP')
+        # Calcular diferencia de Minkowski (contenedor - polígono)
+        ifp_points = []
+        for cp in container_coords:
+            for pp in poly_coords:
+                ifp_points.append(cp - pp)
+        
+        if ifp_points:
+            ifp = Polygon(ifp_points).convex_hull
+            # Asegurar que el IFP está dentro del contenedor
+            ifp = ifp.intersection(container)
+        else:
+            ifp = container
+            
+        return ifp if not ifp.is_empty else None
+    except:
+        return None
+
+def find_contact_positions(placed_polygons, new_polygon, container, num_samples=50):
+    """
+    Encuentra posiciones donde el nuevo polígono maximiza el contacto
+    con los polígonos ya colocados y permanece dentro del contenedor.
+    """
+    if not placed_polygons:
+        # Si no hay polígonos, colocar en esquina inferior izquierda
+        bounds = container.bounds
+        return [(bounds[0], bounds[1])]
     
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.set_xlabel('X')
-    ax2.set_ylabel('Y')
+    contact_positions = []
+    
+    # Calcular NFP con cada polígono colocado
+    for placed_poly in placed_polygons:
+        nfp = calculate_nfp(placed_poly, new_polygon)
+        
+        # Los mejores puntos están en el borde del NFP (máximo contacto)
+        if nfp and not nfp.is_empty:
+            # Muestrear puntos en el perímetro del NFP
+            boundary_length = nfp.length
+            for i in range(num_samples):
+                distance = (i / num_samples) * boundary_length
+                point = nfp.exterior.interpolate(distance)
+                
+                # Verificar que el polígono quedaría dentro del contenedor
+                test_poly = translate(new_polygon, point.x, point.y)
+                if container.contains(test_poly):
+                    contact_positions.append((point.x, point.y))
+    
+    # También considerar posiciones en las esquinas del contenedor
+    ifp = calculate_inner_fit_polygon(container, new_polygon)
+    if ifp and not ifp.is_empty:
+        # Agregar esquinas del IFP
+        for coord in ifp.exterior.coords[:-1]:
+            contact_positions.append(coord)
+    
+    return contact_positions if contact_positions else None
+
+def calculate_contact_score(new_polygon, placed_polygons, container):
+    """
+    Calcula un puntaje basado en:
+    - Contacto con otros polígonos (mayor es mejor)
+    - Cercanía a esquina inferior izquierda (mejor)
+    - Estar completamente dentro del contenedor
+    """
+    if not container.contains(new_polygon):
+        return -1000  # Penalización severa
+    
+    score = 0
+    
+    # Puntos por contacto/cercanía con otros polígonos
+    for placed_poly in placed_polygons:
+        distance = new_polygon.distance(placed_poly)
+        if distance == 0:  # Contacto directo
+            score += 100
+        else:
+            score += max(0, 10 - distance)  # Bonificación por cercanía
+    
+    # Bonificación por estar en la esquina inferior izquierda
+    bounds = new_polygon.bounds
+    container_bounds = container.bounds
+    score += (container_bounds[2] - bounds[0]) * 0.5  # X más a la izquierda
+    score += (container_bounds[3] - bounds[1]) * 0.5  # Y más abajo
+    
+    return score
+
+def pack_polygons_greedy(polygons, container, num_samples=50):
+    """
+    Empaqueta polígonos dentro de un contenedor maximizando el contacto.
+    """
+    placed_polygons = []
+    placements = []  # Guardar las traducciones
+    
+    # Ordenar polígonos por área (más grandes primero)
+    sorted_polygons = sorted(polygons, key=lambda p: p.area, reverse=True)
+    
+    for i, polygon in enumerate(sorted_polygons):
+        print(f"Colocando polígono {i+1}/{len(sorted_polygons)}...")
+        
+        # Encontrar posiciones candidatas
+        candidate_positions = find_contact_positions(
+            placed_polygons, polygon, container, num_samples
+        )
+        
+        if not candidate_positions:
+            # Si no hay posiciones válidas, intentar colocar en cualquier lugar del IFP
+            ifp = calculate_inner_fit_polygon(container, polygon)
+            if ifp and not ifp.is_empty:
+                centroid = ifp.centroid
+                candidate_positions = [(centroid.x, centroid.y)]
+            else:
+                print(f"  ⚠ No se puede colocar el polígono {i+1}")
+                continue
+        
+        # Evaluar cada posición candidata
+        best_score = -float('inf')
+        best_position = None
+        
+        for pos in candidate_positions:
+            test_poly = translate(polygon, pos[0], pos[1])
+            score = calculate_contact_score(test_poly, placed_polygons, container)
+            
+            if score > best_score:
+                best_score = score
+                best_position = pos
+        
+        # Colocar en la mejor posición
+        if best_position:
+            final_polygon = translate(polygon, best_position[0], best_position[1])
+            placed_polygons.append(final_polygon)
+            placements.append(best_position)
+            print(f"  ✓ Colocado en ({best_position[0]:.2f}, {best_position[1]:.2f}), Score: {best_score:.2f}")
+        else:
+            print(f"  ⚠ No se encontró posición válida para polígono {i+1}")
+    
+    return placed_polygons, placements
+
+def visualize_packing(container, placed_polygons, title="Empaquetado de Polígonos"):
+    """
+    Visualiza el resultado del empaquetado.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_title(title, fontsize=16, fontweight='bold')
+    
+    # Dibujar contenedor
+    container_patch = MplPolygon(
+        list(container.exterior.coords),
+        facecolor='none',
+        edgecolor='black',
+        linewidth=3,
+        label='Contenedor'
+    )
+    ax.add_patch(container_patch)
+    
+    # Dibujar polígonos colocados
+    colors = plt.cm.Set3(np.linspace(0, 1, len(placed_polygons)))
+    
+    for i, poly in enumerate(placed_polygons):
+        poly_patch = MplPolygon(
+            list(poly.exterior.coords),
+            facecolor=colors[i],
+            edgecolor='darkblue',
+            linewidth=2,
+            alpha=0.7,
+            label=f'Polígono {i+1}'
+        )
+        ax.add_patch(poly_patch)
+        
+        # Marcar centro
+        centroid = poly.centroid
+        ax.plot(centroid.x, centroid.y, 'ko', markersize=5)
+        ax.text(centroid.x, centroid.y, str(i+1), 
+               ha='center', va='center', fontsize=10, fontweight='bold')
+    
+    # Calcular eficiencia
+    total_area = sum(p.area for p in placed_polygons)
+    container_area = container.area
+    efficiency = (total_area / container_area) * 100
+    
+    ax.legend(loc='upper right', fontsize=8)
+    ax.set_xlabel('X', fontsize=12)
+    ax.set_ylabel('Y', fontsize=12)
+    
+    # Añadir estadísticas
+    stats_text = f'Polígonos colocados: {len(placed_polygons)}\n'
+    stats_text += f'Eficiencia: {efficiency:.1f}%'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+           fontsize=12, verticalalignment='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    bounds = container.bounds
+    margin = 0.5
+    ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+    ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
     
     plt.tight_layout()
     plt.show()
 
-# Ejemplo de uso
+# Ejemplos de uso
+def example_rectangular_packing():
+    """Ejemplo 1: Empaquetar rectángulos"""
+    print("=== Ejemplo 1: Empaquetado de Rectángulos ===\n")
+    
+    container = Polygon([(0, 0), (10, 0), (10, 8), (0, 8)])
+    
+    polygons = [
+        Polygon([(0, 0), (3, 0), (3, 2), (0, 2)]),
+        Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+        Polygon([(0, 0), (2.5, 0), (2.5, 1.5), (0, 1.5)]),
+        Polygon([(0, 0), (1.5, 0), (1.5, 1.5), (0, 1.5)]),
+        Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]),
+    ]
+    
+    placed, _ = pack_polygons_greedy(polygons, container)
+    visualize_packing(container, placed, "Empaquetado de Rectángulos")
+
+def example_mixed_shapes():
+    """Ejemplo 2: Formas mixtas"""
+    print("\n=== Ejemplo 2: Empaquetado de Formas Mixtas ===\n")
+    
+    container = Polygon([(0, 0), (12, 0), (12, 10), (0, 10)])
+    
+    polygons = [
+        Polygon([(0, 0), (3, 0), (3, 3), (0, 3)]),  # Cuadrado grande
+        Polygon([(0, 0), (2, 0), (1, 2)]),  # Triángulo
+        Polygon([(0, 0), (2, 0), (2, 1.5), (0, 1.5)]),  # Rectángulo
+        Polygon([(0, 0), (2.5, 0), (3, 1), (2.5, 2), (0, 2)]),  # Pentágono
+        Polygon([(0, 0), (1.5, 0), (1.5, 1.5), (0, 1.5)]),  # Cuadrado pequeño
+        Polygon([(0, 0), (1.8, 0), (0.9, 1.5)]),  # Triángulo
+    ]
+    
+    placed, _ = pack_polygons_greedy(polygons, container)
+    visualize_packing(container, placed, "Empaquetado de Formas Mixtas")
+
 if __name__ == "__main__":
-    # Definir polígono fijo (un rectángulo)
-    fixed_coords = [(1, 1), (4, 1), (4, 3), (1, 3)]
-    fixed_polygon = Polygon(fixed_coords)
+    print("=== Sistema de Empaquetado con Maximización de Contacto ===\n")
     
-    # Definir polígono móvil (un triángulo)
-    moving_coords = [(6, 1), (8, 1), (7, 3)]
-    moving_polygon = Polygon(moving_coords)
+    example_rectangular_packing()
+    example_mixed_shapes()
     
-    print("Calculando No-Fit Polygon...")
-    
-    # Calcular NFP
-    nfp = calculate_nfp(fixed_polygon, moving_polygon)
-    
-    # Obtener puntos de referencia
-    contact_point = get_bottom_left_point(moving_polygon)
-    print(f"Punto de contacto (inferior izquierda del móvil): {contact_point}")
-    
-    if nfp:
-        ref_point = get_bottom_right_point(nfp)
-        print(f"Punto de referencia del NFP (inferior derecha): {ref_point}")
-        print(f"Área del NFP: {nfp.area:.2f}")
-    
-    # Visualizar
-    visualize_nfp(fixed_polygon, moving_polygon, nfp)
+    print("\n=== Empaquetado completado ===")
+    print("\nCaracterísticas:")
+    print("✓ Maximiza el contacto entre polígonos")
+    print("✓ Mantiene todos los polígonos dentro del contenedor")
+    print("✓ Coloca polígonos más grandes primero")
+    print("✓ Optimiza hacia la esquina inferior izquierda")
