@@ -151,39 +151,28 @@ def calculate_placement_score(new_polygon, placed_polygons, container):
     """
     Calcula un puntaje para una colocación.
     Mayor puntaje = mejor posición.
+    Prioridad: contacto > posición abajo-izquierda
     """
-    score = 0
-    
     # Verificar validez
     if not is_valid_placement(new_polygon, placed_polygons, container):
-        return -100000
+        return -100000, 0, 0
     
-    # Bonificación por contacto (tocar sin superponerse)
+    # Contar contactos reales
+    contact_count = 0
     for placed_poly in placed_polygons:
         distance = new_polygon.distance(placed_poly)
-        
-        if distance < 0.01:  # Están tocando o muy cerca
-            score += 100
-        elif distance < 0.5:
-            score += 50 / (distance + 0.1)
+        if distance < 0.01:  # Están tocando
+            contact_count += 1
     
-    # Bonificación por estar abajo y a la izquierda
+    # Obtener punto de referencia (esquina inferior izquierda del polígono)
     bounds = new_polygon.bounds
-    container_bounds = container.bounds
+    x_position = bounds[0]  # Coordenada X más a la izquierda
+    y_position = bounds[1]  # Coordenada Y más abajo
     
-    # Más cerca del borde izquierdo = mejor
-    left_distance = bounds[0] - container_bounds[0]
-    score -= left_distance * 2
-    
-    # Más cerca del borde inferior = mejor
-    bottom_distance = bounds[1] - container_bounds[1]
-    score -= bottom_distance * 2
-    
-    # Penalizar si está muy cerca del borde derecho o superior
-    right_distance = container_bounds[2] - bounds[2]
-    top_distance = container_bounds[3] - bounds[3]
-    
-    return score
+    # Retornar tupla: (contactos, -y, -x)
+    # Usamos negativos para que menor Y y menor X sean mejores
+    # Python compara tuplas elemento por elemento
+    return (contact_count, -y_position, -x_position)
 
 def pack_polygons_greedy(polygons, container, num_samples=100):
     """
@@ -213,7 +202,7 @@ def pack_polygons_greedy(polygons, container, num_samples=100):
             continue
         
         # Evaluar cada posición
-        best_score = -float('inf')
+        best_score = (-1, float('inf'), float('inf'))  # (contactos, -y, -x)
         best_position = None
         best_polygon = None
         
@@ -225,6 +214,7 @@ def pack_polygons_greedy(polygons, container, num_samples=100):
                 valid_count += 1
                 score = calculate_placement_score(test_poly, placed_polygons, container)
                 
+                # Comparar tuplas: primero por contacto, luego por Y, luego por X
                 if score > best_score:
                     best_score = score
                     best_position = pos
@@ -235,7 +225,9 @@ def pack_polygons_greedy(polygons, container, num_samples=100):
         if best_polygon:
             placed_polygons.append(best_polygon)
             placements.append(best_position)
-            print(f"  ✓ Colocado en ({best_position[0]:.2f}, {best_position[1]:.2f}), Score: {best_score:.2f}")
+            contacts = best_score[0]
+            print(f"  ✓ Colocado en ({best_position[0]:.2f}, {best_position[1]:.2f})")
+            print(f"    Contactos: {contacts}, Posición (Y={-best_score[1]:.2f}, X={-best_score[2]:.2f})")
         else:
             print(f"  ✗ No se encontró posición válida")
             failed_polygons.append(idx)
