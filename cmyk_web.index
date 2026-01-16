@@ -1,356 +1,207 @@
+# Ejemplo didáctico: Leftmost + GA para packing irregular con Shapely
+# - Piezas: polígonos irregulares
+# - Se permiten rotaciones discretas
+# - Factibilidad: intersección geométrica (Shapely)
+#
+# NOTA: este ejemplo prioriza claridad conceptual sobre eficiencia.
+# Para problemas grandes se usan NFPs, caching y estructuras espaciales.
+
+import random
+import math
 import numpy as np
 import matplotlib.pyplot as plt
-from shapely.geometry import Polygon, Point, MultiPolygon, LineString
-from shapely.affinity import translate, rotate
-from matplotlib.patches import Polygon as MplPolygon
-from shapely.ops import unary_union
+from shapely.geometry import Polygon
+from shapely.affinity import rotate, translate
 
-def calculate_nfp_correct(poly_fixed, poly_moving):
-    """
-    Calcula el No-Fit Polygon (NFP) correctamente.
-    El NFP es el área donde NO se puede colocar el punto de referencia
-    del polígono móvil para evitar superposición.
-    """
-    # Obtener vértices
-    fixed_coords = list(poly_fixed.exterior.coords[:-1])
-    moving_coords = list(poly_moving.exterior.coords[:-1])
-    
-    # Calcular suma de Minkowski
-    minkowski_sum = []
-    for f_point in fixed_coords:
-        for m_point in moving_coords:
-            # Para NFP: sumamos el fijo con el negativo del móvil
-            minkowski_sum.append((
-                f_point[0] - m_point[0],
-                f_point[1] - m_point[1]
-            ))
-    
-    # Crear el polígono convex hull
-    if len(minkowski_sum) >= 3:
-        nfp = Polygon(minkowski_sum).convex_hull
-        return nfp
-    return None
-
-def calculate_inner_fit_polygon(container, polygon):
-    """
-    Calcula el Inner Fit Polygon (IFP) - área válida dentro del contenedor.
-    """
-    container_coords = list(container.exterior.coords[:-1])
-    poly_coords = list(polygon.exterior.coords[:-1])
-    
-    # IFP: área donde el punto de referencia puede estar
-    ifp_points = []
-    for c_point in container_coords:
-        for p_point in poly_coords:
-            ifp_points.append((
-                c_point[0] - p_point[0],
-                c_point[1] - p_point[1]
-            ))
-    
-    if len(ifp_points) >= 3:
-        ifp = Polygon(ifp_points).convex_hull
-        # El IFP debe estar dentro del contenedor
-        ifp = ifp.intersection(container)
-        return ifp if not ifp.is_empty else None
-    return None
-
-def is_valid_placement(new_polygon, placed_polygons, container, tolerance=0.001):
-    """
-    Verifica si una colocación es válida (sin superposiciones).
-    """
-    # Verificar que está dentro del contenedor
-    if not container.contains(new_polygon):
-        # Verificar si al menos está casi completamente dentro
-        if not container.buffer(tolerance).contains(new_polygon):
+# -----------------------------
+# Utilidades geométricas
+# -----------------------------
+def polygon_fits(poly, container, placed_polys):
+    """Chequea si poly está dentro del contenedor y no intersecta otras piezas"""
+    if not container.contains(poly):
+        return False
+    for p in placed_polys:
+        if poly.intersects(p):
             return False
-    
-    # Verificar que no se superpone con ningún polígono colocado
-    for placed_poly in placed_polygons:
-        if new_polygon.intersects(placed_poly):
-            # Verificar si la intersección es significativa (no solo toca en un punto)
-            intersection = new_polygon.intersection(placed_poly)
-            if intersection.area > tolerance:
-                return False
-    
     return True
 
-def find_contact_positions(placed_polygons, new_polygon, container, num_samples=100):
+# -----------------------------
+# Heurística Leftmost (irregular)
+# -----------------------------
+def leftmost_place_polygon(base_poly, container, placed_polys,
+                           rotations, step=1.0):
     """
-    Encuentra posiciones válidas donde el nuevo polígono puede colocarse.
-    Prioriza posiciones con contacto (pero sin superposición).
+    Para cada rotación:
+      - rota la pieza
+      - escanea posiciones (x,y) en orden leftmost
+    Devuelve (poly_colocado, rot, x, y) o None
     """
-    contact_positions = []
-    
-    if not placed_polygons:
-        # Primera pieza: colocar en esquina inferior izquierda
-        bounds = container.bounds
-        # Mover el polígono para que su esquina inferior izquierda esté en la esquina del contenedor
-        poly_bounds = new_polygon.bounds
-        offset_x = bounds[0] - poly_bounds[0]
-        offset_y = bounds[1] - poly_bounds[1]
-        return [(offset_x, offset_y)]
-    
-    # Calcular IFP (área válida dentro del contenedor)
-    ifp = calculate_inner_fit_polygon(container, new_polygon)
-    if not ifp or ifp.is_empty:
-        return None
-    
-    # Para cada polígono colocado, calcular NFP
-    for placed_poly in placed_polygons:
-        nfp = calculate_nfp_correct(placed_poly, new_polygon)
-        
-        if nfp and not nfp.is_empty:
-            # Queremos posiciones FUERA del NFP pero CERCA de su borde
-            # Muestrear puntos alrededor del perímetro del NFP
-            boundary = nfp.exterior
-            
-            for i in range(num_samples):
-                # Punto en el borde del NFP
-                distance_along = (i / num_samples) * boundary.length
-                point_on_boundary = boundary.interpolate(distance_along)
-                
-                # Calcular normal hacia afuera
-                # Tomar un pequeño segmento antes y después del punto
-                if distance_along > 0.1:
-                    prev_point = boundary.interpolate(distance_along - 0.1)
-                    # Vector tangente
-                    tx = point_on_boundary.x - prev_point.x
-                    ty = point_on_boundary.y - prev_point.y
-                    # Normal (perpendicular hacia afuera)
-                    length = np.sqrt(tx**2 + ty**2)
-                    if length > 0:
-                        nx = -ty / length
-                        ny = tx / length
-                        
-                        # Probar varios puntos alejándose del NFP
-                        for offset_dist in [0.01, 0.05, 0.1, 0.2, 0.5]:
-                            test_x = point_on_boundary.x + nx * offset_dist
-                            test_y = point_on_boundary.y + ny * offset_dist
-                            
-                            # Verificar si está dentro del IFP
-                            test_point = Point(test_x, test_y)
-                            if ifp.contains(test_point):
-                                contact_positions.append((test_x, test_y))
-    
-    # Agregar algunos puntos aleatorios dentro del IFP
-    bounds = ifp.bounds
-    for _ in range(num_samples // 4):
-        x = np.random.uniform(bounds[0], bounds[2])
-        y = np.random.uniform(bounds[1], bounds[3])
-        if ifp.contains(Point(x, y)):
-            contact_positions.append((x, y))
-    
-    # Si no encontramos posiciones, usar el centroide del IFP
-    if not contact_positions and ifp:
-        centroid = ifp.centroid
-        contact_positions.append((centroid.x, centroid.y))
-    
-    return contact_positions if contact_positions else None
+    minx, miny, maxx, maxy = container.bounds
+    best = None
 
-def calculate_placement_score(new_polygon, placed_polygons, container):
-    """
-    Calcula un puntaje para una colocación.
-    Mayor puntaje = mejor posición.
-    Prioridad: contacto > posición abajo-izquierda
-    """
-    # Verificar validez
-    if not is_valid_placement(new_polygon, placed_polygons, container):
-        return -100000, 0, 0
-    
-    # Contar contactos reales
-    contact_count = 0
-    for placed_poly in placed_polygons:
-        distance = new_polygon.distance(placed_poly)
-        if distance < 0.01:  # Están tocando
-            contact_count += 1
-    
-    # Obtener punto de referencia (esquina inferior izquierda del polígono)
-    bounds = new_polygon.bounds
-    x_position = bounds[0]  # Coordenada X más a la izquierda
-    y_position = bounds[1]  # Coordenada Y más abajo
-    
-    # Retornar tupla: (contactos, -y, -x)
-    # Usamos negativos para que menor Y y menor X sean mejores
-    # Python compara tuplas elemento por elemento
-    return (contact_count, -y_position, -x_position)
+    for angle in rotations:
+        poly_r = rotate(base_poly, angle, origin=(0, 0), use_radians=False)
+        bx0, by0, bx1, by1 = poly_r.bounds
+        w, h = bx1 - bx0, by1 - by0
 
-def pack_polygons_greedy(polygons, container, num_samples=100):
-    """
-    Empaqueta polígonos sin superposiciones.
-    """
-    placed_polygons = []
-    placements = []
-    failed_polygons = []
-    
-    # Ordenar por área (más grandes primero)
-    sorted_indices = sorted(range(len(polygons)), 
-                          key=lambda i: polygons[i].area, 
-                          reverse=True)
-    
-    for idx in sorted_indices:
-        polygon = polygons[idx]
-        print(f"Colocando polígono {idx+1}/{len(polygons)} (área: {polygon.area:.2f})...")
-        
-        # Encontrar posiciones candidatas
-        candidate_positions = find_contact_positions(
-            placed_polygons, polygon, container, num_samples
+        x = minx
+        while x + w <= maxx:
+            y = miny
+            while y + h <= maxy:
+                poly_t = translate(poly_r, x - bx0, y - by0)
+                if polygon_fits(poly_t, container, placed_polys):
+                    if best is None or x < best[2] or (x == best[2] and y < best[3]):
+                        best = (poly_t, angle, x, y)
+                    break  # mínima y para este x
+                y += step
+            if best is not None and best[2] == minx:
+                break
+            x += step
+
+    return best
+
+# -----------------------------
+# Evaluación de un individuo
+# -----------------------------
+def place_sequence(polys, container, order, rot_idx, rotations, step=1.0):
+    placed = []
+    area = 0.0
+
+    for i in order:
+        poly = polys[i]
+        res = leftmost_place_polygon(
+            poly,
+            container,
+            placed,
+            [rotations[rot_idx[i]]],
+            step=step
         )
-        
-        if not candidate_positions:
-            print(f"  ⚠ No se encontraron posiciones candidatas")
-            failed_polygons.append(idx)
-            continue
-        
-        # Evaluar cada posición
-        best_score = (-1, float('inf'), float('inf'))  # (contactos, -y, -x)
-        best_position = None
-        best_polygon = None
-        
-        valid_count = 0
-        for pos in candidate_positions:
-            test_poly = translate(polygon, pos[0], pos[1])
-            
-            if is_valid_placement(test_poly, placed_polygons, container):
-                valid_count += 1
-                score = calculate_placement_score(test_poly, placed_polygons, container)
-                
-                # Comparar tuplas: primero por contacto, luego por Y, luego por X
-                if score > best_score:
-                    best_score = score
-                    best_position = pos
-                    best_polygon = test_poly
-        
-        print(f"  Posiciones válidas evaluadas: {valid_count}/{len(candidate_positions)}")
-        
-        if best_polygon:
-            placed_polygons.append(best_polygon)
-            placements.append(best_position)
-            contacts = best_score[0]
-            print(f"  ✓ Colocado en ({best_position[0]:.2f}, {best_position[1]:.2f})")
-            print(f"    Contactos: {contacts}, Posición (Y={-best_score[1]:.2f}, X={-best_score[2]:.2f})")
-        else:
-            print(f"  ✗ No se encontró posición válida")
-            failed_polygons.append(idx)
-    
-    if failed_polygons:
-        print(f"\n⚠ {len(failed_polygons)} polígonos no pudieron ser colocados: {[i+1 for i in failed_polygons]}")
-    
-    return placed_polygons, placements
+        if res is not None:
+            poly_t, angle, x, y = res
+            placed.append(poly_t)
+            area += poly_t.area
 
-def visualize_packing(container, placed_polygons, title="Empaquetado de Polígonos"):
-    """
-    Visualiza el resultado del empaquetado.
-    """
-    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.set_title(title, fontsize=16, fontweight='bold')
-    
-    # Dibujar contenedor
-    container_patch = MplPolygon(
-        list(container.exterior.coords),
-        facecolor='lightgray',
-        edgecolor='black',
-        linewidth=3,
-        alpha=0.3,
-        label='Contenedor'
-    )
-    ax.add_patch(container_patch)
-    
-    # Dibujar polígonos colocados
-    colors = plt.cm.Set3(np.linspace(0, 1, max(len(placed_polygons), 1)))
-    
-    for i, poly in enumerate(placed_polygons):
-        poly_patch = MplPolygon(
-            list(poly.exterior.coords),
-            facecolor=colors[i],
-            edgecolor='darkblue',
-            linewidth=2,
-            alpha=0.8,
-            label=f'Polígono {i+1}'
-        )
-        ax.add_patch(poly_patch)
-        
-        # Marcar centro
-        centroid = poly.centroid
-        ax.plot(centroid.x, centroid.y, 'ko', markersize=6)
-        ax.text(centroid.x, centroid.y, str(i+1), 
-               ha='center', va='center', fontsize=11, 
-               fontweight='bold', color='white',
-               bbox=dict(boxstyle='circle', facecolor='black', alpha=0.7))
-    
-    # Calcular eficiencia
-    if placed_polygons:
-        total_area = sum(p.area for p in placed_polygons)
-        container_area = container.area
-        efficiency = (total_area / container_area) * 100
-    else:
-        efficiency = 0
-    
-    if len(placed_polygons) <= 10:
-        ax.legend(loc='upper right', fontsize=9)
-    
-    ax.set_xlabel('X', fontsize=12)
-    ax.set_ylabel('Y', fontsize=12)
-    
-    # Estadísticas
-    stats_text = f'Polígonos colocados: {len(placed_polygons)}\n'
-    stats_text += f'Eficiencia: {efficiency:.1f}%'
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-           fontsize=12, verticalalignment='top',
-           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9))
-    
-    bounds = container.bounds
-    margin = 0.5
-    ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
-    ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
-    
-    plt.tight_layout()
-    plt.show()
+    return placed, area
 
-def example_rectangular_packing():
-    """Ejemplo 1: Empaquetar rectángulos"""
-    print("=== Ejemplo 1: Empaquetado de Rectángulos ===\n")
-    
-    container = Polygon([(0, 0), (10, 0), (10, 8), (0, 8)])
-    
-    polygons = [
-        Polygon([(0, 0), (3, 0), (3, 2), (0, 2)]),
-        Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
-        Polygon([(0, 0), (2.5, 0), (2.5, 1.5), (0, 1.5)]),
-        Polygon([(0, 0), (1.5, 0), (1.5, 1.5), (0, 1.5)]),
-        Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]),
-    ]
-    
-    placed, _ = pack_polygons_greedy(polygons, container, num_samples=150)
-    visualize_packing(container, placed, "Empaquetado de Rectángulos (Sin Superposición)")
+# -----------------------------
+# GA
+# -----------------------------
+def random_individual(n, n_rot):
+    perm = list(range(n))
+    random.shuffle(perm)
+    rots = [random.randrange(n_rot) for _ in range(n)]
+    return perm, rots
 
-def example_mixed_shapes():
-    """Ejemplo 2: Formas mixtas"""
-    print("\n=== Ejemplo 2: Empaquetado de Formas Mixtas ===\n")
-    
-    container = Polygon([(0, 0), (12, 0), (12, 10), (0, 10)])
-    
-    polygons = [
-        Polygon([(0, 0), (3, 0), (3, 3), (0, 3)]),
-        Polygon([(0, 0), (2, 0), (1, 2)]),
-        Polygon([(0, 0), (2, 0), (2, 1.5), (0, 1.5)]),
-        Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]),
-        Polygon([(0, 0), (1.5, 0), (1.5, 1.5), (0, 1.5)]),
-    ]
-    
-    placed, _ = pack_polygons_greedy(polygons, container, num_samples=150)
-    visualize_packing(container, placed, "Empaquetado de Formas Mixtas (Sin Superposición)")
+def order_crossover(p1, p2):
+    a, b = sorted(random.sample(range(len(p1)), 2))
+    c = [-1]*len(p1)
+    c[a:b+1] = p1[a:b+1]
+    idx = 0
+    for g in p2:
+        if g not in c:
+            while c[idx] != -1:
+                idx += 1
+            c[idx] = g
+    return c
 
-if __name__ == "__main__":
-    print("=== Sistema de Empaquetado SIN Superposiciones ===\n")
-    
-    example_rectangular_packing()
-    example_mixed_shapes()
-    
-    print("\n=== Empaquetado completado ===")
-    print("\nCaracterísticas:")
-    print("✓ NO permite superposiciones")
-    print("✓ Maximiza contacto entre polígonos")
-    print("✓ Mantiene todo dentro del contenedor")
-    print("✓ Optimiza hacia esquina inferior izquierda")
+def mutate_perm(p, prob=0.2):
+    if random.random() < prob:
+        i, j = random.sample(range(len(p)), 2)
+        p[i], p[j] = p[j], p[i]
+
+def mutate_rot(r, n_rot, prob=0.2):
+    for i in range(len(r)):
+        if random.random() < prob:
+            r[i] = random.randrange(n_rot)
+
+def tournament(pop, fit, k=3):
+    ids = random.sample(range(len(pop)), k)
+    best = max(ids, key=lambda i: fit[i])
+    return pop[best]
+
+def genetic_packing(polys, container, rotations,
+                    pop_size=30, generations=60, step=1.0, elite=2):
+    n = len(polys)
+    pop = [random_individual(n, len(rotations)) for _ in range(pop_size)]
+    best_sol = None
+    best_fit = -1
+    history = []
+
+    for g in range(generations):
+        fits = []
+        sols = []
+        for ind in pop:
+            placed, area = place_sequence(
+                polys, container, ind[0], ind[1], rotations, step
+            )
+            fits.append(area)
+            sols.append((placed, area))
+            if area > best_fit:
+                best_fit = area
+                best_sol = (ind, placed, area)
+        history.append(best_fit)
+
+        new_pop = []
+        elite_ids = sorted(range(len(pop)), key=lambda i: fits[i], reverse=True)[:elite]
+        for i in elite_ids:
+            new_pop.append((pop[i][0][:], pop[i][1][:]))
+
+        while len(new_pop) < pop_size:
+            pA = tournament(pop, fits)
+            pB = tournament(pop, fits)
+            child_perm = order_crossover(pA[0], pB[0])
+            child_rot = pA[1][:]
+            mutate_perm(child_perm)
+            mutate_rot(child_rot, len(rotations))
+            new_pop.append((child_perm, child_rot))
+        pop = new_pop
+
+    return best_sol, history
+
+# -----------------------------
+# DEMO
+# -----------------------------
+random.seed(1)
+
+# Contenedor
+container = Polygon([(0,0), (120,0), (120,60), (0,60)])
+
+# Polígonos irregulares
+polys = [
+    Polygon([(0,0),(30,0),(20,15),(0,10)]),
+    Polygon([(0,0),(25,0),(25,20),(10,30),(0,20)]),
+    Polygon([(0,0),(20,0),(20,10),(10,20),(0,10)]),
+    Polygon([(0,0),(40,0),(30,15),(10,15)]),
+    Polygon([(0,0),(15,0),(20,20),(0,15)])
+]
+
+rotations = [0, 90, 180, 270]
+
+best, history = genetic_packing(
+    polys, container, rotations,
+    pop_size=25, generations=50, step=1.0
+)
+
+(ind, placed, area) = best
+print(f"Área total colocada: {area:.2f}")
+
+# Visualización
+fig, ax = plt.subplots(figsize=(10,5))
+x,y = container.exterior.xy
+ax.plot(x,y)
+
+for p in placed:
+    x,y = p.exterior.xy
+    ax.fill(x,y, alpha=0.6)
+
+ax.set_aspect("equal")
+ax.set_title("Packing irregular con Leftmost + GA (Shapely)")
+plt.show()
+
+plt.figure(figsize=(6,3))
+plt.plot(history)
+plt.title("Convergencia del GA")
+plt.xlabel("Generación")
+plt.ylabel("Mejor área")
+plt.grid(True)
+plt.show()
