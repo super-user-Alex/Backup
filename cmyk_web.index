@@ -1,4 +1,3 @@
-Excelente idea! Usar la altura mínima del empaquetamiento como métrica principal hará que el algoritmo busque soluciones más compactas verticalmente. Aquí está el código modificado:
 import random
 import math
 import numpy as np
@@ -12,11 +11,9 @@ from copy import deepcopy
 # -----------------------------
 def polygon_fits(poly, container, placed_polys, tolerance=0.1):
     """Chequea si poly está dentro del contenedor y no intersecta otras piezas"""
-    # Verificar que esté dentro del contenedor
     if not container.contains(poly.buffer(-tolerance)):
         return False
     
-    # Verificar que no intersecte con otras piezas
     for p in placed_polys:
         if poly.buffer(-tolerance).intersects(p.buffer(-tolerance)):
             return False
@@ -32,36 +29,31 @@ def bottom_left_placement(base_poly, container, placed_polys, rotation_angle):
     """
     minx, miny, maxx, maxy = container.bounds
     
-    # Rotar la pieza
+    # IMPORTANTE: Rotar la pieza según el ángulo especificado
     poly_r = rotate(base_poly, rotation_angle, origin='centroid', use_radians=False)
     bx0, by0, bx1, by1 = poly_r.bounds
     w, h = bx1 - bx0, by1 - by0
     
-    # Ajustar paso según tamaño del contenedor
     step_x = min(2.0, w / 3)
     step_y = min(2.0, h / 3)
     
     best_pos = None
     best_score = float('inf')
     
-    # Primero intentar posiciones clave (esquinas y bordes de piezas ya colocadas)
-    candidate_points = [(minx, miny)]  # Esquina inferior izquierda
+    # Puntos candidatos prioritarios
+    candidate_points = [(minx, miny)]
     
     for p in placed_polys:
         px0, py0, px1, py1 = p.bounds
-        # Puntos alrededor de cada pieza colocada
         candidate_points.extend([
-            (px1, py0),  # Derecha-abajo
-            (px0, py1),  # Izquierda-arriba
-            (px1, py1),  # Derecha-arriba
-            (px0, py0),  # Izquierda-abajo
+            (px1, py0), (px0, py1), (px1, py1), (px0, py0),
         ])
     
     # Probar puntos candidatos
     for cx, cy in candidate_points:
         poly_t = translate(poly_r, cx - bx0, cy - by0)
         if polygon_fits(poly_t, container, placed_polys):
-            score = cy * 1000 + cx  # Priorizar abajo, luego izquierda
+            score = cy * 1000 + cx
             if score < best_score:
                 best_score = score
                 best_pos = (poly_t, cx, cy)
@@ -69,10 +61,10 @@ def bottom_left_placement(base_poly, container, placed_polys, rotation_angle):
     if best_pos:
         return best_pos
     
-    # Si no encontró en puntos clave, hacer barrido más fino
+    # Barrido fino
     y = miny
     attempts = 0
-    max_attempts = 500  # Límite para evitar búsquedas infinitas
+    max_attempts = 500
     
     while y <= maxy - h and attempts < max_attempts:
         x = minx
@@ -85,7 +77,7 @@ def bottom_left_placement(base_poly, container, placed_polys, rotation_angle):
                 if score < best_score:
                     best_score = score
                     best_pos = (poly_t, x, y)
-                    return best_pos  # Retornar inmediatamente la primera posición válida
+                    return best_pos
             
             x += step_x
         y += step_y
@@ -98,14 +90,15 @@ def bottom_left_placement(base_poly, container, placed_polys, rotation_angle):
 def evaluate_individual(polys, container, order, rot_idx, rotations):
     """
     Coloca las piezas según el orden y rotaciones del individuo.
-    Nueva métrica: minimizar altura máxima alcanzada.
+    Minimizar altura máxima alcanzada.
     """
     placed = []
     total_area = 0.0
-    max_height = 0.0  # Nueva métrica
+    max_height = 0.0
     
     for idx, i in enumerate(order):
         poly = polys[i]
+        # CORRECCIÓN: Usar el índice de rotación para obtener el ángulo correcto
         rotation = rotations[rot_idx[i]]
         
         res = bottom_left_placement(poly, container, placed, rotation)
@@ -115,31 +108,19 @@ def evaluate_individual(polys, container, order, rot_idx, rotations):
             placed.append(poly_t)
             total_area += poly_t.area
             
-            # Actualizar altura máxima
             _, _, _, piece_max_y = poly_t.bounds
             max_height = max(max_height, piece_max_y)
-        else:
-            # Si no puede colocar esta pieza, continuar con las siguientes
-            pass
     
     num_placed = len(placed)
-    
-    # NUEVA FUNCIÓN FITNESS:
-    # - Prioridad 1: Maximizar piezas colocadas (peso muy alto)
-    # - Prioridad 2: Minimizar altura (invertir el valor)
-    # - Prioridad 3: Maximizar área (bonus menor)
     
     if num_placed == 0:
         fitness = 0
     else:
-        # Entre menos altura, mejor fitness
         height_penalty = max_height
-        
-        # Fitness combinado
         fitness = (
-            num_placed * 10000 +           # Prioridad máxima: colocar todas las piezas
-            (1000 / (height_penalty + 1)) + # Minimizar altura
-            total_area * 5                  # Bonus por área cubierta
+            num_placed * 10000 +
+            (1000 / (height_penalty + 1)) +
+            total_area * 5
         )
     
     return placed, total_area, num_placed, max_height, fitness
@@ -173,13 +154,13 @@ def order_crossover(p1, p2):
     return child
 
 def mutate_swap(perm, prob=0.2):
-    """Mutación por intercambio - MODIFICA in-place"""
+    """Mutación por intercambio"""
     if random.random() < prob:
         i, j = random.sample(range(len(perm)), 2)
         perm[i], perm[j] = perm[j], perm[i]
 
 def mutate_rotation(rots, n_rot, prob=0.25):
-    """Mutación de rotaciones - MODIFICA in-place"""
+    """Mutación de rotaciones"""
     for i in range(len(rots)):
         if random.random() < prob:
             rots[i] = random.randrange(n_rot)
@@ -201,19 +182,20 @@ def genetic_packing(polys, container, rotations,
     n = len(polys)
     n_rot = len(rotations)
     
-    # Población inicial
     population = [random_individual(n, n_rot) for _ in range(pop_size)]
     
     best_solution = None
     best_fitness = -float('inf')
+    
+    # NUEVO: Guardar mejor, peor y promedio
     fitness_history = []
-    height_history = []  # Nueva: historia de alturas
+    height_history = []
     
     print("Iniciando optimización...")
-    print(f"Polígonos: {n}, Población: {pop_size}, Generaciones: {generations}\n")
+    print(f"Polígonos: {n}, Población: {pop_size}, Generaciones: {generations}")
+    print(f"Rotaciones disponibles: {rotations}\n")
     
     for gen in range(generations):
-        # Evaluar población
         fitness_list = []
         solutions = []
         
@@ -230,29 +212,31 @@ def genetic_packing(polys, container, rotations,
                 best_fitness = fitness
                 best_solution = (deepcopy(ind), placed, area, num_placed, max_height)
         
-        # Estadísticas
-        avg_fitness = np.mean(fitness_list)
+        # Estadísticas: mejor, peor y promedio
         max_fitness = max(fitness_list)
+        min_fitness = min(fitness_list)
+        avg_fitness = np.mean(fitness_list)
         
-        # Obtener altura del mejor individuo de esta generación
         best_gen_idx = fitness_list.index(max_fitness)
-        best_gen_height = solutions[best_gen_idx][3]
+        worst_gen_idx = fitness_list.index(min_fitness)
         
-        fitness_history.append((max_fitness, avg_fitness))
-        height_history.append(best_gen_height)
+        best_gen_height = solutions[best_gen_idx][3]
+        worst_gen_height = solutions[worst_gen_idx][3]
+        
+        # Guardar estadísticas
+        fitness_history.append((max_fitness, min_fitness, avg_fitness))
+        height_history.append((best_gen_height, worst_gen_height))
         
         _, _, best_area, best_num, best_height = best_solution
         
         if (gen + 1) % 5 == 0:
-            print(f"Gen {gen+1:3d}: Fitness={max_fitness:8.1f}, "
-                  f"Altura={best_height:5.1f}, "
-                  f"Piezas={best_num}/{n}, "
-                  f"Área={best_area:6.1f}")
+            print(f"Gen {gen+1:3d}: Fitness=[{min_fitness:7.1f} | {avg_fitness:8.1f} | {max_fitness:8.1f}], "
+                  f"Altura={best_height:5.1f}, Piezas={best_num}/{n}")
         
         # Nueva población
         new_population = []
         
-        # Elitismo: copiar los mejores
+        # Elitismo
         elite_indices = sorted(range(len(fitness_list)), 
                               key=lambda i: fitness_list[i], 
                               reverse=True)[:elite_size]
@@ -261,15 +245,13 @@ def genetic_packing(polys, container, rotations,
         
         # Generar descendencia
         while len(new_population) < pop_size:
-            # Selección
             parent1 = tournament_selection(population, fitness_list, k=3)
             parent2 = tournament_selection(population, fitness_list, k=3)
             
-            # Crear copias para no modificar padres
             child_order = parent1[0][:]
             child_rots = parent1[1][:]
             
-            # Cruce
+            # Cruce de orden
             if random.random() < 0.85:
                 child_order = order_crossover(parent1[0], parent2[0])
             
@@ -282,7 +264,7 @@ def genetic_packing(polys, container, rotations,
                     temp_rots.append(parent2[1][i])
             child_rots = temp_rots
             
-            # Mutación (modifica in-place)
+            # Mutación
             mutate_swap(child_order, prob=0.15)
             mutate_rotation(child_rots, n_rot, prob=0.2)
             
@@ -303,23 +285,20 @@ if __name__ == "__main__":
     random.seed(123)
     np.random.seed(123)
     
-    # Contenedor
     container = Polygon([(0,0), (100,0), (100,80), (0,80)])
     
-    # Polígonos irregulares más simples
     polys = [
-        Polygon([(0,0), (25,0), (25,20), (0,20)]),  # Rectángulo
-        Polygon([(0,0), (20,0), (20,15), (0,15)]),  # Rectángulo
-        Polygon([(0,0), (30,0), (25,18), (5,18)]),  # Trapezoide
-        Polygon([(0,0), (22,0), (22,22), (0,22)]),  # Cuadrado
-        Polygon([(0,0), (18,0), (18,25), (0,25)]),  # Rectángulo alto
-        Polygon([(0,0), (28,0), (28,12), (0,12)]),  # Rectángulo ancho
-        Polygon([(0,0), (15,0), (20,20), (0,15)]),  # Irregular
+        Polygon([(0,0), (25,0), (25,20), (0,20)]),
+        Polygon([(0,0), (20,0), (20,15), (0,15)]),
+        Polygon([(0,0), (30,0), (25,18), (5,18)]),
+        Polygon([(0,0), (22,0), (22,22), (0,22)]),
+        Polygon([(0,0), (18,0), (18,25), (0,25)]),
+        Polygon([(0,0), (28,0), (28,12), (0,12)]),
+        Polygon([(0,0), (15,0), (20,20), (0,15)]),
     ]
     
     rotations = [0, 90, 180, 270]
     
-    # Ejecutar GA
     result, fit_history, height_history = genetic_packing(
         polys, container, rotations,
         pop_size=50, generations=60, elite_size=5
@@ -327,84 +306,100 @@ if __name__ == "__main__":
     
     (ind, placed, area, num_placed, max_height) = result
     
-    print(f"Piezas colocadas: {num_placed}/{len(polys)}")
-    print(f"Altura máxima: {max_height:.2f}")
-    print(f"Área total: {area:.2f}")
-    print(f"Área contenedor: {container.area:.2f}")
-    print(f"Utilización: {(area/container.area)*100:.1f}%")
+    print(f"\n📦 RESULTADOS FINALES:")
+    print(f"   Piezas colocadas: {num_placed}/{len(polys)}")
+    print(f"   Altura mínima alcanzada: {max_height:.2f}")
+    print(f"   Área total: {area:.2f}")
+    print(f"   Utilización: {(area/container.area)*100:.1f}%")
+    
+    # Mostrar rotaciones usadas
+    order, rot_idx = ind
+    print(f"\n🔄 ROTACIONES APLICADAS:")
+    for i, piece_idx in enumerate(order):
+        if i < len(placed):
+            rot_angle = rotations[rot_idx[piece_idx]]
+            print(f"   Pieza {piece_idx+1}: {rot_angle}°")
+    
     print(f"{'='*60}\n")
     
-    # Visualización mejorada
-    fig = plt.figure(figsize=(18, 6))
+    # Visualización mejorada con 4 subplots
+    fig = plt.figure(figsize=(20, 10))
     
     # Subplot 1: Resultado del packing
-    ax1 = plt.subplot(1, 3, 1)
+    ax1 = plt.subplot(2, 2, 1)
     x, y = container.exterior.xy
     ax1.plot(x, y, 'k-', linewidth=3, label='Contenedor')
     ax1.fill(x, y, alpha=0.1, color='gray')
     
-    # Línea de altura máxima
     ax1.axhline(y=max_height, color='red', linestyle='--', linewidth=2, 
-                label=f'Altura máx: {max_height:.1f}', alpha=0.7)
+                label=f'Altura: {max_height:.1f}', alpha=0.7)
     
     colors = plt.cm.tab10(np.linspace(0, 1, len(polys)))
     for i, p in enumerate(placed):
         px, py = p.exterior.xy
         ax1.fill(px, py, alpha=0.7, color=colors[i % len(colors)], 
                 edgecolor='black', linewidth=2)
-        # Etiqueta en el centro
         centroid = p.centroid
-        ax1.text(centroid.x, centroid.y, str(i+1), 
-                ha='center', va='center', fontweight='bold', fontsize=10)
+        ax1.text(centroid.x, centroid.y, str(order[i]+1), 
+                ha='center', va='center', fontweight='bold', fontsize=11, color='white',
+                bbox=dict(boxstyle='circle', facecolor='black', alpha=0.6))
     
     ax1.set_aspect("equal")
-    ax1.set_title(f"Resultado: {num_placed}/{len(polys)} piezas | "
+    ax1.set_title(f"✅ Mejor Solución: {num_placed}/{len(polys)} piezas | "
                   f"Altura: {max_height:.1f} | Uso: {(area/container.area)*100:.1f}%", 
-                  fontsize=12, fontweight='bold')
+                  fontsize=13, fontweight='bold')
     ax1.grid(True, alpha=0.3, linestyle='--')
     ax1.set_xlabel('X', fontsize=11)
     ax1.set_ylabel('Y', fontsize=11)
-    ax1.legend(fontsize=9)
+    ax1.legend(fontsize=10)
     
-    # Subplot 2: Convergencia del fitness
-    ax2 = plt.subplot(1, 3, 2)
+    # Subplot 2: Convergencia del fitness (mejor, peor, promedio)
+    ax2 = plt.subplot(2, 2, 2)
     best_fits = [f[0] for f in fit_history]
-    avg_fits = [f[1] for f in fit_history]
+    worst_fits = [f[1] for f in fit_history]
+    avg_fits = [f[2] for f in fit_history]
     generations = range(1, len(fit_history) + 1)
     
-    ax2.plot(generations, best_fits, 'b-', linewidth=2.5, label='Mejor', marker='o', markersize=4)
-    ax2.plot(generations, avg_fits, 'r--', linewidth=2, label='Promedio', alpha=0.7)
-    ax2.fill_between(generations, avg_fits, best_fits, alpha=0.2, color='blue')
+    ax2.plot(generations, best_fits, 'g-', linewidth=2.5, label='Mejor', marker='o', markersize=4)
+    ax2.plot(generations, avg_fits, 'b--', linewidth=2, label='Promedio', alpha=0.7)
+    ax2.plot(generations, worst_fits, 'r:', linewidth=2, label='Peor', alpha=0.6)
+    ax2.fill_between(generations, worst_fits, best_fits, alpha=0.15, color='blue')
     
-    ax2.set_title("Convergencia del Fitness", fontsize=12, fontweight='bold')
+    ax2.set_title("📈 Convergencia del Fitness", fontsize=13, fontweight='bold')
     ax2.set_xlabel("Generación", fontsize=11)
     ax2.set_ylabel("Fitness", fontsize=11)
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.legend(fontsize=10, loc='lower right')
     
-    # Subplot 3: Evolución de la altura (NUEVO)
-    ax3 = plt.subplot(1, 3, 3)
-    ax3.plot(generations, height_history, 'g-', linewidth=2.5, 
-             label='Altura máxima', marker='s', markersize=4)
-    ax3.fill_between(generations, height_history, alpha=0.3, color='green')
+    # Subplot 3: Evolución de la altura (mejor y peor)
+    ax3 = plt.subplot(2, 2, 3)
+    best_heights = [h[0] for h in height_history]
+    worst_heights = [h[1] for h in height_history]
     
-    ax3.set_title("Minimización de Altura", fontsize=12, fontweight='bold')
+    ax3.plot(generations, best_heights, 'g-', linewidth=2.5, 
+             label='Mejor (menor altura)', marker='s', markersize=4)
+    ax3.plot(generations, worst_heights, 'r-', linewidth=2, 
+             label='Peor (mayor altura)', marker='^', markersize=4, alpha=0.6)
+    ax3.fill_between(generations, best_heights, worst_heights, alpha=0.2, color='orange')
+    
+    ax3.set_title("📉 Minimización de Altura", fontsize=13, fontweight='bold')
     ax3.set_xlabel("Generación", fontsize=11)
     ax3.set_ylabel("Altura Máxima", fontsize=11)
     ax3.grid(True, alpha=0.3, linestyle='--')
     ax3.legend(fontsize=10, loc='upper right')
-    ax3.invert_yaxis()  # Invertir eje Y para mostrar que menor es mejor
+    ax3.invert_yaxis()
+    
+    # Subplot 4: Diversidad de la población (rango fitness)
+    ax4 = plt.subplot(2, 2, 4)
+    fitness_range = [f[0] - f[1] for f in fit_history]
+    
+    ax4.plot(generations, fitness_range, 'purple', linewidth=2.5, marker='D', markersize=4)
+    ax4.fill_between(generations, fitness_range, alpha=0.3, color='purple')
+    
+    ax4.set_title("🎯 Diversidad de Población (Rango Fitness)", fontsize=13, fontweight='bold')
+    ax4.set_xlabel("Generación", fontsize=11)
+    ax4.set_ylabel("Rango (Mejor - Peor)", fontsize=11)
+    ax4.grid(True, alpha=0.3, linestyle='--')
     
     plt.tight_layout()
     plt.show()
-Cambios principales:
-Nueva métrica de fitness: Ahora el fitness prioriza:
-Número de piezas colocadas (peso 10,000)
-Altura mínima (1000 / altura) - entre menor altura, mayor fitness
-Área cubierta (peso 5)
-Tracking de altura: Se registra max_height para cada solución y se guarda en height_history
-Visualización mejorada:
-Línea roja que muestra la altura máxima alcanzada
-Tercer gráfico que muestra la evolución de la altura (invertido para mostrar que menor es mejor)
-Métricas de altura en el título y salida de consola
-Esto debería eliminar la repetición en el fitness y forzar al algoritmo a buscar soluciones más compactas verticalmente.
