@@ -135,6 +135,40 @@ def random_individual(n, n_rot):
     rots = [random.randrange(n_rot) for _ in range(n)]
     return (perm, rots)
 
+def individual_to_key(ind):
+    """Convierte un individuo a una clave hasheable para detectar duplicados"""
+    order, rots = ind
+    return (tuple(order), tuple(rots))
+
+def create_unique_population(n, n_rot, pop_size, max_attempts=10000):
+    """
+    Crea una población inicial sin duplicados.
+    Para problemas pequeños, esto evita desperdiciar evaluaciones.
+    """
+    population = []
+    seen = set()
+    attempts = 0
+    
+    while len(population) < pop_size and attempts < max_attempts:
+        ind = random_individual(n, n_rot)
+        key = individual_to_key(ind)
+        
+        if key not in seen:
+            seen.add(key)
+            population.append(ind)
+        
+        attempts += 1
+    
+    # Si no se pudo generar suficientes únicos, completar con duplicados
+    while len(population) < pop_size:
+        population.append(random_individual(n, n_rot))
+    
+    duplicates_avoided = attempts - len(population)
+    if duplicates_avoided > 0:
+        print(f"⚠️  Duplicados evitados en población inicial: {duplicates_avoided}")
+    
+    return population
+
 def order_crossover(p1, p2):
     """Cruce OX para permutaciones"""
     n = len(p1)
@@ -182,7 +216,32 @@ def genetic_packing(polys, container, rotations,
     n = len(polys)
     n_rot = len(rotations)
     
-    population = [random_individual(n, n_rot) for _ in range(pop_size)]
+    # Calcular espacio de búsqueda
+    import math
+    total_permutations = math.factorial(n)
+    total_rotations = n_rot ** n
+    search_space = total_permutations * total_rotations
+    
+    print("="*60)
+    print("🔍 ANÁLISIS DEL ESPACIO DE BÚSQUEDA")
+    print("="*60)
+    print(f"Polígonos: {n}")
+    print(f"Rotaciones disponibles: {rotations}")
+    print(f"Permutaciones posibles: {total_permutations:,}")
+    print(f"Combinaciones de rotación: {total_rotations:,}")
+    print(f"Espacio total: {search_space:,} soluciones únicas")
+    print(f"Población por generación: {pop_size}")
+    print(f"Total individuos a generar: ~{pop_size * generations:,}")
+    
+    # Advertencia si el espacio es pequeño
+    if search_space < pop_size * generations:
+        print(f"\n⚠️  ADVERTENCIA: El espacio de búsqueda ({search_space:,}) es menor")
+        print(f"   que el total de individuos a generar ({pop_size * generations:,})")
+        print(f"   Habrá muchos duplicados - considera reducir generaciones/población")
+    print("="*60 + "\n")
+    
+    # Población inicial SIN duplicados
+    population = create_unique_population(n, n_rot, pop_size)
     
     best_solution = None
     best_fitness = -float('inf')
@@ -190,14 +249,18 @@ def genetic_packing(polys, container, rotations,
     # NUEVO: Guardar mejor, peor y promedio
     fitness_history = []
     height_history = []
+    diversity_history = []  # Para tracking de duplicados
     
     print("Iniciando optimización...")
-    print(f"Polígonos: {n}, Población: {pop_size}, Generaciones: {generations}")
-    print(f"Rotaciones disponibles: {rotations}\n")
+    print(f"Población: {pop_size}, Generaciones: {generations}\n")
     
     for gen in range(generations):
         fitness_list = []
         solutions = []
+        
+        # Detectar duplicados en la población actual
+        seen_this_gen = set()
+        duplicates_count = 0
         
         for ind in population:
             order, rot_idx = ind
@@ -207,6 +270,13 @@ def genetic_packing(polys, container, rotations,
             
             fitness_list.append(fitness)
             solutions.append((placed, area, num_placed, max_height))
+            
+            # Contar duplicados
+            key = individual_to_key(ind)
+            if key in seen_this_gen:
+                duplicates_count += 1
+            else:
+                seen_this_gen.add(key)
             
             if fitness > best_fitness:
                 best_fitness = fitness
@@ -223,15 +293,21 @@ def genetic_packing(polys, container, rotations,
         best_gen_height = solutions[best_gen_idx][3]
         worst_gen_height = solutions[worst_gen_idx][3]
         
+        # Calcular diversidad real (individuos únicos)
+        unique_individuals = len(seen_this_gen)
+        diversity_pct = (unique_individuals / pop_size) * 100
+        
         # Guardar estadísticas
         fitness_history.append((max_fitness, min_fitness, avg_fitness))
         height_history.append((best_gen_height, worst_gen_height))
+        diversity_history.append(diversity_pct)
         
         _, _, best_area, best_num, best_height = best_solution
         
         if (gen + 1) % 5 == 0:
             print(f"Gen {gen+1:3d}: Fitness=[{min_fitness:7.1f} | {avg_fitness:8.1f} | {max_fitness:8.1f}], "
-                  f"Altura={best_height:5.1f}, Piezas={best_num}/{n}")
+                  f"Altura={best_height:5.1f}, Piezas={best_num}/{n}, "
+                  f"Únicos={unique_individuals}/{pop_size} ({diversity_pct:.0f}%)")
         
         # Nueva población
         new_population = []
@@ -276,7 +352,7 @@ def genetic_packing(polys, container, rotations,
     print(f"Optimización completada!")
     print(f"{'='*60}")
     
-    return best_solution, fitness_history, height_history
+    return best_solution, fitness_history, height_history, diversity_history
 
 # -----------------------------
 # DEMO
@@ -299,7 +375,7 @@ if __name__ == "__main__":
     
     rotations = [0, 90, 180, 270]
     
-    result, fit_history, height_history = genetic_packing(
+    result, fit_history, height_history, diversity_history = genetic_packing(
         polys, container, rotations,
         pop_size=50, generations=60, elite_size=5
     )
@@ -389,17 +465,20 @@ if __name__ == "__main__":
     ax3.legend(fontsize=10, loc='upper right')
     ax3.invert_yaxis()
     
-    # Subplot 4: Diversidad de la población (rango fitness)
+    # Subplot 4: Diversidad genética (% individuos únicos)
     ax4 = plt.subplot(2, 2, 4)
-    fitness_range = [f[0] - f[1] for f in fit_history]
     
-    ax4.plot(generations, fitness_range, 'purple', linewidth=2.5, marker='D', markersize=4)
-    ax4.fill_between(generations, fitness_range, alpha=0.3, color='purple')
+    ax4.plot(generations, diversity_history, 'orange', linewidth=2.5, marker='D', markersize=4)
+    ax4.fill_between(generations, diversity_history, alpha=0.3, color='orange')
+    ax4.axhline(y=100, color='green', linestyle='--', linewidth=1.5, alpha=0.5, label='100% únicos')
+    ax4.axhline(y=50, color='red', linestyle='--', linewidth=1.5, alpha=0.5, label='50% únicos')
     
-    ax4.set_title("🎯 Diversidad de Población (Rango Fitness)", fontsize=13, fontweight='bold')
+    ax4.set_title("🧬 Diversidad Genética (% Individuos Únicos)", fontsize=13, fontweight='bold')
     ax4.set_xlabel("Generación", fontsize=11)
-    ax4.set_ylabel("Rango (Mejor - Peor)", fontsize=11)
+    ax4.set_ylabel("% Individuos Únicos", fontsize=11)
+    ax4.set_ylim([0, 105])
     ax4.grid(True, alpha=0.3, linestyle='--')
+    ax4.legend(fontsize=9, loc='lower left')
     
     plt.tight_layout()
     plt.show()
