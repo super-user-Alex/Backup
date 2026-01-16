@@ -150,20 +150,16 @@ def order_crossover(p1, p2):
     return child
 
 def mutate_swap(perm, prob=0.2):
-    """Mutación por intercambio"""
-    perm_copy = perm[:]
+    """Mutación por intercambio - MODIFICA in-place"""
     if random.random() < prob:
-        i, j = random.sample(range(len(perm_copy)), 2)
-        perm_copy[i], perm_copy[j] = perm_copy[j], perm_copy[i]
-    return perm_copy
+        i, j = random.sample(range(len(perm)), 2)
+        perm[i], perm[j] = perm[j], perm[i]
 
 def mutate_rotation(rots, n_rot, prob=0.25):
-    """Mutación de rotaciones"""
-    rots_copy = rots[:]
-    for i in range(len(rots_copy)):
+    """Mutación de rotaciones - MODIFICA in-place"""
+    for i in range(len(rots)):
         if random.random() < prob:
-            rots_copy[i] = random.randrange(n_rot)
-    return rots_copy
+            rots[i] = random.randrange(n_rot)
 
 def tournament_selection(population, fitness, k=3):
     """Selección por torneo"""
@@ -237,23 +233,26 @@ def genetic_packing(polys, container, rotations,
             parent1 = tournament_selection(population, fitness_list, k=3)
             parent2 = tournament_selection(population, fitness_list, k=3)
             
+            # Crear copias para no modificar padres
+            child_order = parent1[0][:]
+            child_rots = parent1[1][:]
+            
             # Cruce
             if random.random() < 0.85:
                 child_order = order_crossover(parent1[0], parent2[0])
-            else:
-                child_order = parent1[0][:]
             
             # Cruce de rotaciones (uniforme)
-            child_rots = []
+            temp_rots = []
             for i in range(n):
                 if random.random() < 0.5:
-                    child_rots.append(parent1[1][i])
+                    temp_rots.append(parent1[1][i])
                 else:
-                    child_rots.append(parent2[1][i])
+                    temp_rots.append(parent2[1][i])
+            child_rots = temp_rots
             
-            # Mutación
-            child_order = mutate_swap(child_order, prob=0.15)
-            child_rots = mutate_rotation(child_rots, n_rot, prob=0.2)
+            # Mutación (modifica in-place)
+            mutate_swap(child_order, prob=0.15)
+            mutate_rotation(child_rots, n_rot, prob=0.2)
             
             new_population.append((child_order, child_rots))
         
