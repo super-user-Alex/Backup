@@ -1,11 +1,12 @@
 import random
+import numpy as np
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 
 
 # ============================================================================
-# 1. REPRESENTACIÓN DEL INDIVIDUO
+# CLASE INDIVIDUAL (sin cambios)
 # ============================================================================
 
 class Individual:
@@ -17,83 +18,252 @@ class Individual:
         self.fitness = float('inf')
         self.is_valid = False
         self.allowed_angles = allowed_angles
+        self.age = 0
     
     def copy(self):
-        """Crea una copia profunda del individuo"""
         new_ind = Individual(len(self.indices), self.allowed_angles)
         new_ind.indices = self.indices.copy()
         new_ind.angles = self.angles.copy()
         new_ind.fitness = self.fitness
         new_ind.is_valid = self.is_valid
+        new_ind.age = self.age
         return new_ind
+    
+    def get_signature(self):
+        return (tuple(self.indices), tuple(self.angles))
 
 
 # ============================================================================
-# 2. OPERADORES DE MUTACIÓN
+# OPERADORES DE MUTACIÓN CORREGIDOS
 # ============================================================================
 
-def mutate_indices(indices, mutation_rate=0.2):
+def mutate_indices_aggressive(indices, mutation_rate=0.2, force_change=False):
     """
-    Aplica mutación a la permutación de índices.
-    Usa tres operadores: swap, inversion y scramble.
+    Mutación más agresiva para índices.
+    CORREGIDO: maneja casos con n_items pequeños (≤3).
     """
     indices = indices.copy()
+    n = len(indices)
     
-    if random.random() < mutation_rate:
-        operator = random.choice(['swap', 'inversion', 'scramble'])
+    # Caso especial: muy pocos items
+    if n <= 1:
+        return indices
+    
+    if n == 2:
+        # Solo puede hacer swap
+        if force_change or random.random() < mutation_rate:
+            indices[0], indices[1] = indices[1], indices[0]
+        return indices
+    
+    # n >= 3: comportamiento normal
+    if force_change or random.random() < mutation_rate:
+        intensity = random.random()
+        
+        if intensity < 0.4:  # Mutación suave
+            operator = 'swap'
+        elif intensity < 0.7:  # Mutación media
+            operator = 'inversion'
+        else:  # Mutación fuerte
+            operator = 'scramble'
         
         if operator == 'swap':
-            # Intercambio simple de dos posiciones
-            i, j = random.sample(range(len(indices)), 2)
-            indices[i], indices[j] = indices[j], indices[i]
-            
+            # Múltiples swaps
+            n_swaps = random.randint(1, max(1, n // 10))
+            for _ in range(n_swaps):
+                i, j = random.sample(range(n), 2)
+                indices[i], indices[j] = indices[j], indices[i]
+                
         elif operator == 'inversion':
-            # Invierte un segmento [i:j]
-            i, j = sorted(random.sample(range(len(indices)), 2))
-            indices[i:j] = reversed(indices[i:j])
+            # Inversión de segmento
+            # CORREGIDO: asegurar que length sea válido
+            max_length = max(2, n // 3)
+            length = random.randint(2, min(max_length, n))
+            
+            if length < n:
+                i = random.randint(0, n - length)
+                indices[i:i+length] = reversed(indices[i:i+length])
+            else:
+                # Si length >= n, invertir todo
+                indices.reverse()
             
         elif operator == 'scramble':
-            # Mezcla aleatoria de un segmento
-            i, j = sorted(random.sample(range(len(indices)), 2))
-            segment = indices[i:j]
-            random.shuffle(segment)
-            indices[i:j] = segment
+            # Scramble de segmento
+            # CORREGIDO: asegurar que length sea válido
+            max_length = max(3, n // 2)
+            length = random.randint(3, min(max_length, n))
+            
+            if length < n:
+                # CORREGIDO: asegurar que i sea válido
+                max_i = max(0, n - length)
+                i = random.randint(0, max_i) if max_i > 0 else 0
+                segment = indices[i:i+length]
+                random.shuffle(segment)
+                indices[i:i+length] = segment
+            else:
+                # Si length >= n, mezclar todo
+                random.shuffle(indices)
     
     return indices
 
 
-def mutate_angles(angles, allowed_angles, mutation_rate=0.3):
+def mutate_angles_aggressive(angles, allowed_angles, mutation_rate=0.3, force_change=False):
     """
-    Mutación de ángulos respetando el conjunto discreto.
-    70% del tiempo cambia a ángulo adyacente.
-    30% del tiempo cambia a ángulo aleatorio.
+    Mutación más agresiva para ángulos.
+    Sin cambios necesarios - ya maneja bien todos los casos.
     """
     angles = angles.copy()
+    changed = False
     
     for i in range(len(angles)):
-        if random.random() < mutation_rate:
-            if random.random() < 0.7:
-                # Cambio a ángulo adyacente (circular)
+        should_mutate = force_change and not changed
+        should_mutate = should_mutate or random.random() < mutation_rate
+        
+        if should_mutate:
+            if random.random() < 0.5:
+                new_angle = random.choice(allowed_angles)
+                while force_change and new_angle == angles[i] and len(allowed_angles) > 1:
+                    new_angle = random.choice(allowed_angles)
+                angles[i] = new_angle
+            else:
                 current_idx = allowed_angles.index(angles[i])
                 delta = random.choice([-1, 1])
                 new_idx = (current_idx + delta) % len(allowed_angles)
                 angles[i] = allowed_angles[new_idx]
-            else:
-                # Cambio aleatorio completo
-                angles[i] = random.choice(allowed_angles)
+            
+            changed = True
     
     return angles
 
 
 # ============================================================================
-# 3. OPERADOR DE CRUZA (CROSSOVER)
+# MEDICIÓN DE DIVERSIDAD
+# ============================================================================
+
+def calculate_population_diversity(population):
+    """
+    Calcula la diversidad de la población.
+    Retorna el porcentaje de individuos únicos.
+    """
+    unique_signatures = set()
+    
+    for ind in population:
+        unique_signatures.add(ind.get_signature())
+    
+    diversity = len(unique_signatures) / len(population) if population else 0
+    return diversity, len(unique_signatures)
+
+
+def hamming_distance_indices(ind1, ind2):
+    """Distancia de Hamming entre dos permutaciones"""
+    if len(ind1.indices) == 0:
+        return 0
+    distance = sum(1 for i, j in zip(ind1.indices, ind2.indices) if i != j)
+    return distance / len(ind1.indices)
+
+
+def hamming_distance_angles(ind1, ind2):
+    """Distancia de Hamming entre dos vectores de ángulos"""
+    if len(ind1.angles) == 0:
+        return 0
+    distance = sum(1 for a1, a2 in zip(ind1.angles, ind2.angles) if a1 != a2)
+    return distance / len(ind1.angles)
+
+
+def population_diversity_metric(population):
+    """
+    Calcula diversidad promedio entre todos los pares.
+    """
+    if len(population) < 2:
+        return 1.0
+    
+    total_distance = 0
+    comparisons = 0
+    
+    sample_size = min(50, len(population))
+    sample = random.sample(population, sample_size)
+    
+    for i in range(len(sample)):
+        for j in range(i + 1, len(sample)):
+            dist_indices = hamming_distance_indices(sample[i], sample[j])
+            dist_angles = hamming_distance_angles(sample[i], sample[j])
+            total_distance += (dist_indices + dist_angles) / 2
+            comparisons += 1
+    
+    return total_distance / comparisons if comparisons > 0 else 0.0
+
+
+# ============================================================================
+# INYECCIÓN DE DIVERSIDAD Y ELIMINACIÓN DE DUPLICADOS
+# ============================================================================
+
+def inject_diversity(population, n_items, allowed_angles, injection_rate=0.2):
+    """
+    Reemplaza parte de la población con individuos nuevos aleatorios.
+    """
+    n_inject = int(len(population) * injection_rate)
+    
+    if n_inject == 0:
+        return population
+    
+    population.sort(key=lambda x: x.fitness)
+    
+    for i in range(len(population) - n_inject, len(population)):
+        new_ind = Individual(n_items, allowed_angles)
+        random.shuffle(new_ind.indices)
+        new_ind.angles = [random.choice(allowed_angles) for _ in range(n_items)]
+        population[i] = new_ind
+    
+    return population
+
+
+def remove_duplicates(population, n_items, allowed_angles):
+    """
+    Elimina individuos duplicados de la población.
+    """
+    seen_signatures = set()
+    unique_population = []
+    duplicates = []
+    
+    for ind in population:
+        sig = ind.get_signature()
+        if sig not in seen_signatures:
+            seen_signatures.add(sig)
+            unique_population.append(ind)
+        else:
+            duplicates.append(ind)
+    
+    for dup in duplicates:
+        if random.random() < 0.7:
+            new_ind = dup.copy()
+            new_ind.indices = mutate_indices_aggressive(
+                new_ind.indices, 
+                mutation_rate=1.0, 
+                force_change=True
+            )
+            new_ind.angles = mutate_angles_aggressive(
+                new_ind.angles, 
+                allowed_angles,
+                mutation_rate=1.0,
+                force_change=True
+            )
+            new_ind.fitness = float('inf')
+            unique_population.append(new_ind)
+        else:
+            new_ind = Individual(n_items, allowed_angles)
+            random.shuffle(new_ind.indices)
+            new_ind.angles = [random.choice(allowed_angles) for _ in range(n_items)]
+            unique_population.append(new_ind)
+    
+    return unique_population
+
+
+# ============================================================================
+# CROSSOVER
 # ============================================================================
 
 def crossover(parent1, parent2, crossover_rate=0.8):
     """
-    Crossover especializado:
-    - Order Crossover (OX) para permutaciones
-    - Crossover uniforme para ángulos
+    Crossover especializado con manejo de casos pequeños.
     """
     if random.random() > crossover_rate:
         return parent1.copy(), parent2.copy()
@@ -101,7 +271,18 @@ def crossover(parent1, parent2, crossover_rate=0.8):
     n = len(parent1.indices)
     allowed_angles = parent1.allowed_angles
     
-    # ===== CROSSOVER PARA ÍNDICES (Order Crossover - OX) =====
+    # Caso especial: n muy pequeño
+    if n <= 2:
+        # Para n pequeño, solo hacer crossover de ángulos
+        child1 = parent1.copy()
+        child2 = parent2.copy()
+        
+        child1.angles = [random.choice([a1, a2]) for a1, a2 in zip(parent1.angles, parent2.angles)]
+        child2.angles = [random.choice([a1, a2]) for a1, a2 in zip(parent2.angles, parent1.angles)]
+        
+        return child1, child2
+    
+    # n >= 3: Order Crossover normal
     def order_crossover(p1_indices, p2_indices):
         cx_point1, cx_point2 = sorted(random.sample(range(n), 2))
         
@@ -121,17 +302,12 @@ def crossover(parent1, parent2, crossover_rate=0.8):
     child1_indices = order_crossover(parent1.indices, parent2.indices)
     child2_indices = order_crossover(parent2.indices, parent1.indices)
     
-    # ===== CROSSOVER PARA ÁNGULOS (Uniforme) =====
     def angle_crossover(p1_angles, p2_angles):
-        child_angles = []
-        for a1, a2 in zip(p1_angles, p2_angles):
-            child_angles.append(random.choice([a1, a2]))
-        return child_angles
+        return [random.choice([a1, a2]) for a1, a2 in zip(p1_angles, p2_angles)]
     
     child1_angles = angle_crossover(parent1.angles, parent2.angles)
     child2_angles = angle_crossover(parent2.angles, parent1.angles)
     
-    # Crear individuos hijos
     child1 = Individual(n, allowed_angles)
     child1.indices = child1_indices
     child1.angles = child1_angles
@@ -144,78 +320,72 @@ def crossover(parent1, parent2, crossover_rate=0.8):
 
 
 # ============================================================================
-# 4. EVALUACIÓN Y MANEJO DE SOLUCIONES INVÁLIDAS
+# EVALUACIÓN
 # ============================================================================
 
 def evaluate_individual(individual, place_func, fitness_func):
     """
     Evalúa un individuo y maneja casos inválidos.
-    Soluciones inválidas reciben penalización fuerte.
+    CORREGIDO: convierte a numpy arrays para fitness_func.
     """
     try:
         placement_result = place_func(individual.indices, individual.angles)
         
-        # Verificar si la colocación es válida
         if placement_result is None:
             individual.fitness = 1e10
             individual.is_valid = False
         else:
-            individual.fitness = fitness_func(individual.indices, individual.angles)
+            # Convertir a numpy arrays para la función fitness
+            indices_array = np.array(individual.indices)
+            angles_array = np.array(individual.angles)
+            
+            individual.fitness = fitness_func(indices_array, angles_array)
             individual.is_valid = True
             
     except Exception as e:
         individual.fitness = 1e10
         individual.is_valid = False
+        # Opcional: descomentar para debug
+        # print(f"Error evaluando individuo: {e}")
     
     return individual
 
 
 # ============================================================================
-# 5. INICIALIZACIÓN DE POBLACIÓN
+# INICIALIZACIÓN
 # ============================================================================
 
 def initialize_population(pop_size, n_items, allowed_angles):
-    """
-    Inicializa población con diversidad.
-    Crea individuos aleatorios con permutaciones y ángulos variados.
-    """
+    """Inicialización básica"""
     population = []
-    
     for _ in range(pop_size):
         ind = Individual(n_items, allowed_angles)
         random.shuffle(ind.indices)
         ind.angles = [random.choice(allowed_angles) for _ in range(n_items)]
         population.append(ind)
-    
     return population
 
 
 def initialize_population_with_heuristics(pop_size, n_items, allowed_angles, 
                                          item_sizes=None, n_heuristic=10):
-    """
-    Inicialización mejorada con heurísticas constructivas.
-    Genera algunos individuos usando ordenamientos inteligentes.
-    """
+    """Inicialización con heurísticas"""
     population = []
     
-    # Individuos heurísticos (si se proporciona información de tamaños)
     if item_sizes is not None and n_heuristic > 0:
         heuristics = [
-            sorted(range(n_items), key=lambda i: -item_sizes[i]),  # Decreciente por tamaño
-            sorted(range(n_items), key=lambda i: item_sizes[i]),   # Creciente por tamaño
-            list(range(n_items)),  # Orden original
+            sorted(range(n_items), key=lambda i: -item_sizes[i]),
+            sorted(range(n_items), key=lambda i: item_sizes[i]),
+            list(range(n_items)),
         ]
         
         for h in heuristics[:n_heuristic]:
             ind = Individual(n_items, allowed_angles)
             ind.indices = h.copy()
-            ind.angles = [allowed_angles[0]] * n_items  # Sin rotación inicial
+            ind.angles = [allowed_angles[0]] * n_items
             population.append(ind)
-            
             if len(population) >= n_heuristic:
                 break
     
-    # Completar con individuos aleatorios
     while len(population) < pop_size:
         ind = Individual(n_items, allowed_angles)
         random.shuffle(ind.indices)
@@ -226,54 +396,50 @@ def initialize_population_with_heuristics(pop_size, n_items, allowed_angles,
 
 
 # ============================================================================
-# 6. SELECCIÓN
+# SELECCIÓN
 # ============================================================================
 
 def tournament_selection(population, tournament_size=5, n_parents=50):
-    """
-    Selección por torneo.
-    Selecciona n_parents mediante torneos de tamaño tournament_size.
-    """
+    """Selección por torneo"""
     parents = []
-    
     for _ in range(n_parents):
         tournament = random.sample(population, min(tournament_size, len(population)))
         winner = min(tournament, key=lambda x: x.fitness)
         parents.append(winner.copy())
-    
     return parents
 
 
 # ============================================================================
-# 7. BÚSQUEDA LOCAL (INTENSIFICACIÓN)
+# BÚSQUEDA LOCAL
 # ============================================================================
 
 def local_search(individual, place_func, fitness_func, max_iterations=20):
     """
-    Búsqueda local para refinar soluciones prometedoras.
-    Explora vecindad mediante pequeñas modificaciones.
+    Búsqueda local con manejo robusto de casos pequeños.
     """
     best = individual.copy()
     best_fitness = individual.fitness
+    n = len(individual.indices)
+    
+    # Caso especial: muy pocos items
+    if n <= 1:
+        return best
     
     for _ in range(max_iterations):
         neighbor = best.copy()
         
-        # Mutación ligera
-        if random.random() < 0.5:
+        if random.random() < 0.5 or n == 2:
             # Cambiar un ángulo
             idx = random.randint(0, len(neighbor.angles) - 1)
             neighbor.angles[idx] = random.choice(neighbor.allowed_angles)
         else:
-            # Swap de dos índices adyacentes o cercanos
-            idx = random.randint(0, len(neighbor.indices) - 2)
-            neighbor.indices[idx], neighbor.indices[idx+1] = \
-                neighbor.indices[idx+1], neighbor.indices[idx]
+            # Swap de dos índices
+            if n >= 2:
+                i, j = random.sample(range(n), 2)
+                neighbor.indices[i], neighbor.indices[j] = neighbor.indices[j], neighbor.indices[i]
         
-        # Evaluar
         evaluate_individual(neighbor, place_func, fitness_func)
         
-        # Aceptar si mejora (hill climbing estricto)
         if neighbor.fitness < best_fitness:
             best = neighbor.copy()
             best_fitness = neighbor.fitness
@@ -282,10 +448,42 @@ def local_search(individual, place_func, fitness_func, max_iterations=20):
 
 
 # ============================================================================
-# 8. ALGORITMO GENÉTICO PRINCIPAL
+# UTILIDADES
 # ============================================================================
 
-def genetic_algorithm_packing(
+def create_fitness_cache(fitness_func):
+    """Crea caché para fitness"""
+    cache = {}
+    
+    def cached_fitness(indices, angles):
+        key = (tuple(indices.tolist() if hasattr(indices, 'tolist') else indices), 
+               tuple(angles.tolist() if hasattr(angles, 'tolist') else angles))
+        
+        if key not in cache:
+            cache[key] = fitness_func(indices, angles)
+            cached_fitness.cache_misses += 1
+        else:
+            cached_fitness.cache_hits += 1
+        return cache[key]
+    
+    cached_fitness.cache = cache
+    cached_fitness.cache_hits = 0
+    cached_fitness.cache_misses = 0
+    
+    return cached_fitness
+
+
+def adaptive_mutation_rate(generation, max_generations, initial_rate=0.3, min_rate=0.05):
+    """Tasa de mutación adaptativa"""
+    decay = generation / max_generations
+    return initial_rate * (1 - decay) + min_rate
+
+
+# ============================================================================
+# ALGORITMO GENÉTICO PRINCIPAL
+# ============================================================================
+
+def genetic_algorithm_packing_diverse(
     n_items,
     allowed_angles,
     place_func,
@@ -293,61 +491,45 @@ def genetic_algorithm_packing(
     population_size=100,
     n_generations=500,
     elite_size=10,
-    mutation_rate_indices=0.2,
-    mutation_rate_angles=0.3,
+    mutation_rate_indices=0.3,
+    mutation_rate_angles=0.4,
     crossover_rate=0.8,
     tournament_size=5,
     early_stopping_patience=50,
     local_search_frequency=10,
     local_search_iterations=20,
+    diversity_threshold=0.3,
+    diversity_check_frequency=5,
+    injection_rate=0.2,
+    adaptive_mutation=True,
     verbose=True,
-    item_sizes=None
+    item_sizes=None,
+    use_cache=True
 ):
     """
-    Algoritmo Genético para Irregular Packing/Nesting.
-    
-    Parámetros:
-    -----------
-    n_items : int
-        Número de elementos a acomodar
-    allowed_angles : list
-        Lista de ángulos permitidos (ej: [0, 90, 180, 270])
-    place_func : callable
-        Función place(indices, angles) que acomoda elementos
-    fitness_func : callable
-        Función fitness(indices, angles) que evalúa la solución
-    population_size : int
-        Tamaño de la población
-    n_generations : int
-        Número máximo de generaciones
-    elite_size : int
-        Número de individuos elite a preservar
-    mutation_rate_indices : float
-        Probabilidad de mutación para índices
-    mutation_rate_angles : float
-        Probabilidad de mutación para ángulos
-    crossover_rate : float
-        Probabilidad de aplicar crossover
-    tournament_size : int
-        Tamaño del torneo para selección
-    early_stopping_patience : int
-        Generaciones sin mejora para detener
-    local_search_frequency : int
-        Cada cuántas generaciones aplicar búsqueda local
-    local_search_iterations : int
-        Iteraciones de búsqueda local
-    verbose : bool
-        Mostrar progreso
-    item_sizes : list, optional
-        Tamaños de items para inicialización heurística
-    
-    Retorna:
-    --------
-    Individual
-        Mejor solución encontrada
+    Algoritmo Genético con control de diversidad.
+    CORREGIDO: maneja casos con n_items pequeños.
     """
     
-    # ===== INICIALIZACIÓN =====
+    # Validación de parámetros
+    if n_items < 1:
+        raise ValueError("n_items debe ser al menos 1")
+    
+    if len(allowed_angles) < 1:
+        raise ValueError("allowed_angles debe tener al menos un ángulo")
+    
+    # Ajustar parámetros para n_items pequeños
+    if n_items <= 3:
+        population_size = min(population_size, 20)
+        elite_size = min(elite_size, max(1, population_size // 5))
+        if verbose:
+            print(f"⚠ n_items={n_items} es pequeño. Ajustando población a {population_size}")
+    
+    # Configuración de caché
+    if use_cache:
+        fitness_func = create_fitness_cache(fitness_func)
+    
+    # Inicialización
     if verbose:
         print(f"Inicializando población de {population_size} individuos...")
     
@@ -370,16 +552,70 @@ def genetic_algorithm_packing(
     best_fitness_history = deque(maxlen=early_stopping_patience)
     global_best = min(population, key=lambda x: x.fitness)
     generation_best_fitness = []
+    diversity_history = []
     
     if verbose:
+        diversity, n_unique = calculate_population_diversity(population)
         print(f"Fitness inicial mejor: {global_best.fitness:.6f}")
+        print(f"Diversidad inicial: {diversity*100:.1f}% ({n_unique} únicos)")
         print(f"\nIniciando evolución por {n_generations} generaciones...")
         print("=" * 70)
     
-    # ===== CICLO EVOLUTIVO =====
+    # Ciclo evolutivo
     for generation in range(n_generations):
         
-        # 1. SELECCIÓN (Tournament Selection)
+        # Incrementar edad
+        for ind in population:
+            ind.age += 1
+        
+        # Chequeo de diversidad
+        if generation % diversity_check_frequency == 0:
+            diversity, n_unique = calculate_population_diversity(population)
+            diversity_metric = population_diversity_metric(population)
+            diversity_history.append(diversity)
+            
+            if verbose and generation % 20 == 0:
+                print(f"Gen {generation:4d}: Diversidad={diversity*100:.1f}% "
+                      f"({n_unique} únicos), Métrica={diversity_metric:.3f}")
+            
+            # Inyección de diversidad
+            if diversity < diversity_threshold:
+                if verbose:
+                    print(f"Gen {generation:4d}: ⚠ Diversidad baja, inyectando individuos...")
+                
+                population = inject_diversity(
+                    population, n_items, allowed_angles, injection_rate
+                )
+                
+                for ind in population:
+                    if ind.fitness == float('inf'):
+                        evaluate_individual(ind, place_func, fitness_func)
+        
+        # Remover duplicados
+        if generation % (diversity_check_frequency * 2) == 0:
+            population = remove_duplicates(population, n_items, allowed_angles)
+            
+            for ind in population:
+                if ind.fitness == float('inf'):
+                    evaluate_individual(ind, place_func, fitness_func)
+        
+        # Mutación adaptativa
+        if adaptive_mutation:
+            current_mutation_indices = adaptive_mutation_rate(
+                generation, n_generations, 
+                initial_rate=mutation_rate_indices,
+                min_rate=0.1
+            )
+            current_mutation_angles = adaptive_mutation_rate(
+                generation, n_generations,
+                initial_rate=mutation_rate_angles,
+                min_rate=0.15
+            )
+        else:
+            current_mutation_indices = mutation_rate_indices
+            current_mutation_angles = mutation_rate_angles
+        
+        # Selección
         n_offspring = population_size - elite_size
         parents = tournament_selection(
             population, 
@@ -387,11 +623,11 @@ def genetic_algorithm_packing(
             n_parents=n_offspring
         )
         
-        # 2. ELITISMO: preservar mejores individuos
+        # Elitismo
         population.sort(key=lambda x: x.fitness)
         elite = [ind.copy() for ind in population[:elite_size]]
         
-        # 3. REPRODUCCIÓN (Crossover)
+        # Crossover
         offspring = []
         for i in range(0, len(parents), 2):
             if i + 1 < len(parents):
@@ -404,40 +640,36 @@ def genetic_algorithm_packing(
             else:
                 offspring.append(parents[i].copy())
         
-        # 4. MUTACIÓN
+        # Mutación
         for child in offspring:
-            child.indices = mutate_indices(
+            child.indices = mutate_indices_aggressive(
                 child.indices, 
-                mutation_rate_indices
+                current_mutation_indices
             )
-            child.angles = mutate_angles(
+            child.angles = mutate_angles_aggressive(
                 child.angles, 
                 allowed_angles,
-                mutation_rate_angles
+                current_mutation_angles
             )
         
-        # 5. EVALUACIÓN de offspring
+        # Evaluación
         for child in offspring:
             evaluate_individual(child, place_func, fitness_func)
         
-        # 6. REEMPLAZO: elite + mejores offspring
+        # Reemplazo
         population = elite + offspring[:population_size - elite_size]
         
-        # 7. ACTUALIZAR MEJOR SOLUCIÓN
+        # Actualizar mejor
         current_best = min(population, key=lambda x: x.fitness)
         generation_best_fitness.append(current_best.fitness)
         
         if current_best.fitness < global_best.fitness:
             global_best = current_best.copy()
             if verbose:
-                print(f"Gen {generation:4d}: ★ NUEVA MEJOR SOLUCIÓN = {global_best.fitness:.6f} "
-                      f"(válida: {global_best.is_valid})")
+                print(f"Gen {generation:4d}: ★ NUEVA MEJOR = {global_best.fitness:.6f}")
         
-        # 8. BÚSQUEDA LOCAL OCASIONAL
+        # Búsqueda local
         if generation > 0 and generation % local_search_frequency == 0:
-            if verbose:
-                print(f"Gen {generation:4d}: Aplicando búsqueda local al mejor individuo...")
-            
             improved_best = local_search(
                 global_best, 
                 place_func, 
@@ -448,31 +680,33 @@ def genetic_algorithm_packing(
             if improved_best.fitness < global_best.fitness:
                 global_best = improved_best.copy()
                 if verbose:
-                    print(f"Gen {generation:4d}: ✓ Búsqueda local mejoró a {global_best.fitness:.6f}")
+                    print(f"Gen {generation:4d}: ✓ Búsqueda local → {global_best.fitness:.6f}")
         
-        # 9. EARLY STOPPING
+        # Early stopping
         best_fitness_history.append(current_best.fitness)
         
         if len(best_fitness_history) == early_stopping_patience:
             fitness_range = max(best_fitness_history) - min(best_fitness_history)
-            if fitness_range < 1e-6:
+            recent_diversity = sum(diversity_history[-10:]) / len(diversity_history[-10:]) if len(diversity_history) >= 10 else diversity
+            
+            if fitness_range < 1e-6 and recent_diversity < 0.4:
                 if verbose:
                     print(f"\n{'='*70}")
-                    print(f"Convergencia detectada en generación {generation}")
-                    print(f"Sin mejora significativa en {early_stopping_patience} generaciones")
+                    print(f"Convergencia en generación {generation}")
+                    print(f"Diversidad final: {recent_diversity*100:.1f}%")
                 break
         
-        # 10. LOGGING PERIÓDICO
+        # Logging
         if verbose and generation % 50 == 0 and generation > 0:
             avg_fitness = sum(ind.fitness for ind in population) / len(population)
             valid_count = sum(1 for ind in population if ind.is_valid)
             print(f"Gen {generation:4d}: Mejor={current_best.fitness:.6f}, "
                   f"Promedio={avg_fitness:.6f}, Válidos={valid_count}/{population_size}")
     
-    # ===== BÚSQUEDA LOCAL FINAL INTENSIVA =====
+    # Búsqueda local final
     if verbose:
         print(f"\n{'='*70}")
-        print("Aplicando búsqueda local final intensiva...")
+        print("Búsqueda local final intensiva...")
     
     final_best = local_search(
         global_best, 
@@ -484,191 +718,370 @@ def genetic_algorithm_packing(
     if final_best.fitness < global_best.fitness:
         global_best = final_best.copy()
         if verbose:
-            print(f"✓ Búsqueda final mejoró a {global_best.fitness:.6f}")
+            print(f"✓ Mejora final → {global_best.fitness:.6f}")
     
-    # ===== RESULTADOS FINALES =====
+    # Estadísticas finales
     if verbose:
         print(f"\n{'='*70}")
         print("RESULTADOS FINALES:")
         print(f"{'='*70}")
-        print(f"Mejor fitness encontrado: {global_best.fitness:.6f}")
+        print(f"Mejor fitness: {global_best.fitness:.6f}")
         print(f"Solución válida: {global_best.is_valid}")
-        print(f"Generaciones ejecutadas: {generation + 1}")
-        print(f"Orden de colocación: {global_best.indices}")
-        print(f"Ángulos: {global_best.angles}")
+        print(f"Generaciones: {generation + 1}")
+        
+        if use_cache:
+            total_evals = fitness_func.cache_hits + fitness_func.cache_misses
+            if total_evals > 0:
+                print(f"\nEstadísticas de caché:")
+                print(f"  Evaluaciones totales: {total_evals}")
+                print(f"  Soluciones únicas: {len(fitness_func.cache)}")
+                print(f"  Cache hits: {fitness_func.cache_hits} ({fitness_func.cache_hits/total_evals*100:.1f}%)")
+                print(f"  Eficiencia: {100 - len(fitness_func.cache)/total_evals*100:.1f}% evaluaciones ahorradas")
+        
         print(f"{'='*70}")
     
-    return global_best, generation_best_fitness
+    return global_best, generation_best_fitness, diversity_history
 
 
 # ============================================================================
-# 9. UTILIDADES ADICIONALES
-# ============================================================================
-
-def create_fitness_cache(fitness_func):
-    """
-    Crea una versión cacheada de la función fitness.
-    Evita re-evaluar soluciones idénticas.
-    """
-    cache = {}
-    
-    def cached_fitness(indices, angles):
-        key = (tuple(indices), tuple(angles))
-        if key not in cache:
-            cache[key] = fitness_func(indices, angles)
-        return cache[key]
-    
-    cached_fitness.cache = cache
-    cached_fitness.cache_hits = 0
-    cached_fitness.cache_misses = 0
-    
-    original_cached = cached_fitness
-    
-    def cached_with_stats(indices, angles):
-        key = (tuple(indices), tuple(angles))
-        if key in cache:
-            cached_fitness.cache_hits += 1
-        else:
-            cached_fitness.cache_misses += 1
-        return original_cached(indices, angles)
-    
-    return cached_with_stats
-
-
-def adaptive_mutation_rate(generation, max_generations, initial_rate=0.3, min_rate=0.05):
-    """
-    Ajusta dinámicamente la tasa de mutación.
-    Comienza alta (exploración) y disminuye (explotación).
-    """
-    decay = generation / max_generations
-    return initial_rate * (1 - decay) + min_rate
-
-
-def evaluate_population_parallel(population, place_func, fitness_func, n_workers=4):
-    """
-    Evalúa población en paralelo usando multiprocessing.
-    Útil cuando las evaluaciones son costosas.
-    """
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = [
-            executor.submit(evaluate_individual, ind, place_func, fitness_func)
-            for ind in population
-        ]
-        results = [f.result() for f in futures]
-    return results
-
-
-# ============================================================================
-# 10. EJEMPLO DE USO
+# VERSIÓN COMPLETA CON ANÁLISIS DETALLADO
 # ============================================================================
 
 if __name__ == "__main__":
     
-    # ===== FUNCIONES DE EJEMPLO (REEMPLAZAR CON TUS FUNCIONES REALES) =====
-    
     def example_place_func(indices, angles):
-        """
-        Función de ejemplo para place.
-        En tu caso real, esta función debe:
-        1. Tomar los índices y ángulos
-        2. Intentar colocar los elementos en el contenedor
-        3. Retornar el resultado de la colocación o None si falla
-        """
-        # Simulación simple: siempre retorna True
+        """Función de colocación - siempre válida para pruebas"""
         return True
     
     def example_fitness_func(indices, angles):
         """
-        Función de ejemplo para fitness.
-        En tu caso real, esta función debe:
-        1. Calcular qué tan buena es la solución
-        2. Retornar un valor escalar (menor = mejor)
-        
-        Ejemplos de métricas:
-        - Área desperdiciada
-        - Altura del contenedor usado
-        - Número de contenedores necesarios
-        - Perímetro convexo
+        Función fitness de prueba que busca:
+        - indices en orden inverso: [n-1, n-2, ..., 1, 0]
+        - angles alternando 90 y 180
         """
-        # Simulación simple: penalizar por cambios de ángulo
-        fitness = 0.0
+        n = len(indices)
+        indices_ideal = np.array(list(range(n))[::-1])
+        angles_ideal = np.array([90 if i % 2 == 0 else 180 for i in range(n)])
         
-        # Penalizar rotaciones (prefiere 0 grados)
-        for angle in angles:
-            if angle != 0:
-                fitness += 0.1
+        dist = np.linalg.norm(indices - indices_ideal) + np.linalg.norm(angles - angles_ideal)
+        return dist
+    
+    # Almacenar resultados de todas las pruebas
+    all_results = []
+    
+    # Probar con diferentes tamaños
+    test_sizes = [2, 3, 5, 10, 15]
+    
+    for n_items in test_sizes:
+        print("\n" + "="*70)
+        print(f"PRUEBA CON n_items = {n_items}")
+        print("="*70)
         
-        # Penalizar desorden en la secuencia
-        for i in range(len(indices) - 1):
-            if indices[i] > indices[i+1]:
-                fitness += 0.05
+        optimal_indices = list(range(n_items))[::-1]
+        optimal_angles = [90 if i % 2 == 0 else 180 for i in range(n_items)]
         
-        return fitness
+        print(f"Objetivo:")
+        print(f"  Indices: {optimal_indices}")
+        print(f"  Ángulos: {optimal_angles}")
+        print("="*70 + "\n")
+        
+        allowed_angles = [0, 90, 180, 270]
+        
+        # Configuración adaptativa según tamaño
+        if n_items <= 3:
+            pop_size, n_gen = 20, 100
+        elif n_items <= 5:
+            pop_size, n_gen = 40, 150
+        elif n_items <= 10:
+            pop_size, n_gen = 60, 200
+        else:
+            pop_size, n_gen = 80, 300
+        
+        import time
+        start_time = time.time()
+        
+        best, fitness_hist, diversity_hist = genetic_algorithm_packing_diverse(
+            n_items=n_items,
+            allowed_angles=allowed_angles,
+            place_func=example_place_func,
+            fitness_func=example_fitness_func,
+            population_size=pop_size,
+            n_generations=n_gen,
+            elite_size=max(2, pop_size // 10),
+            mutation_rate_indices=0.5,
+            mutation_rate_angles=0.6,
+            crossover_rate=0.8,
+            tournament_size=3,
+            early_stopping_patience=40,
+            local_search_frequency=10,
+            local_search_iterations=15,
+            diversity_threshold=0.3,
+            diversity_check_frequency=5,
+            injection_rate=0.25,
+            adaptive_mutation=True,
+            verbose=True,
+            use_cache=True
+        )
+        
+        elapsed_time = time.time() - start_time
+        
+        # ====================================================================
+        # ANÁLISIS DETALLADO DE LA SOLUCIÓN
+        # ====================================================================
+        
+        print(f"\n{'='*70}")
+        print(f"RESULTADO DETALLADO PARA n_items={n_items}")
+        print(f"{'='*70}")
+        
+        # Información básica
+        print(f"\n📊 Métricas Generales:")
+        print(f"  Fitness final: {best.fitness:.6f}")
+        print(f"  Tiempo de ejecución: {elapsed_time:.2f} segundos")
+        print(f"  Generaciones ejecutadas: {len(fitness_hist)}")
+        
+        # Comparación con objetivo
+        print(f"\n🎯 Comparación con Objetivo:")
+        print(f"  Indices obtenidos: {best.indices}")
+        print(f"  Indices esperados:  {optimal_indices}")
+        print(f"  Ángulos obtenidos: {best.angles}")
+        print(f"  Ángulos esperados:  {optimal_angles}")
+        
+        # Calcular distancias
+        indices_array = np.array(best.indices)
+        angles_array = np.array(best.angles)
+        optimal_indices_array = np.array(optimal_indices)
+        optimal_angles_array = np.array(optimal_angles)
+        
+        index_distance = np.linalg.norm(indices_array - optimal_indices_array)
+        angle_distance = np.linalg.norm(angles_array - optimal_angles_array)
+        
+        is_optimal_indices = (best.indices == optimal_indices)
+        is_optimal_angles = (best.angles == optimal_angles)
+        
+        # Análisis de precisión
+        print(f"\n📏 Análisis de Distancias:")
+        print(f"  Distancia total: {best.fitness:.6f}")
+        print(f"  Distancia en indices: {index_distance:.6f} ({index_distance/best.fitness*100:.1f}% del total)")
+        print(f"  Distancia en ángulos: {angle_distance:.6f} ({angle_distance/best.fitness*100:.1f}% del total)")
+        
+        # Contar elementos correctos
+        correct_indices = sum(1 for a, b in zip(best.indices, optimal_indices) if a == b)
+        correct_angles = sum(1 for a, b in zip(best.angles, optimal_angles) if a == b)
+        
+        print(f"\n✓ Elementos Correctos:")
+        print(f"  Indices correctos: {correct_indices}/{n_items} ({correct_indices/n_items*100:.1f}%)")
+        print(f"  Ángulos correctos: {correct_angles}/{n_items} ({correct_angles/n_items*100:.1f}%)")
+        
+        # Determinar calidad de la solución
+        print(f"\n🏆 Evaluación de Calidad:")
+        
+        if is_optimal_indices and is_optimal_angles:
+            quality = "ÓPTIMA"
+            icon = "🥇"
+            print(f"  {icon} SOLUCIÓN {quality}!")
+            print(f"  ✓✓✓ Ambos componentes (indices y ángulos) son perfectos! ✓✓✓")
+            
+        elif best.fitness < 0.01:
+            quality = "CASI ÓPTIMA"
+            icon = "🥈"
+            print(f"  {icon} SOLUCIÓN {quality}")
+            print(f"  ✓✓ Extremadamente cercana al óptimo (fitness < 0.01)")
+            if is_optimal_indices:
+                print(f"  ✓ Indices perfectos")
+                print(f"  → Ángulos con {n_items - correct_angles} errores mínimos")
+            elif is_optimal_angles:
+                print(f"  ✓ Ángulos perfectos")
+                print(f"  → Indices con {n_items - correct_indices} errores mínimos")
+            else:
+                print(f"  → Ambos componentes casi perfectos")
+                
+        elif best.fitness < 1.0:
+            quality = "EXCELENTE"
+            icon = "🥉"
+            print(f"  {icon} SOLUCIÓN {quality}")
+            print(f"  ✓ Muy cercana al óptimo (fitness < 1.0)")
+            if is_optimal_indices:
+                print(f"  ✓ Indices perfectos")
+            elif is_optimal_angles:
+                print(f"  ✓ Ángulos perfectos")
+            print(f"  → Precisión en indices: {correct_indices/n_items*100:.1f}%")
+            print(f"  → Precisión en ángulos: {correct_angles/n_items*100:.1f}%")
+            
+        elif best.fitness < 5.0:
+            quality = "BUENA"
+            icon = "👍"
+            print(f"  {icon} SOLUCIÓN {quality}")
+            print(f"  → Aceptable pero mejorable (fitness < 5.0)")
+            print(f"  → Precisión en indices: {correct_indices/n_items*100:.1f}%")
+            print(f"  → Precisión en ángulos: {correct_angles/n_items*100:.1f}%")
+            
+        elif best.fitness < 10.0:
+            quality = "REGULAR"
+            icon = "→"
+            print(f"  {icon} SOLUCIÓN {quality}")
+            print(f"  → Distante del óptimo (5.0 ≤ fitness < 10.0)")
+            print(f"  → Precisión en indices: {correct_indices/n_items*100:.1f}%")
+            print(f"  → Precisión en ángulos: {correct_angles/n_items*100:.1f}%")
+            
+        else:
+            quality = "INSUFICIENTE"
+            icon = "⚠"
+            print(f"  {icon} SOLUCIÓN {quality}")
+            print(f"  ⚠ Muy distante del óptimo (fitness ≥ 10.0)")
+            print(f"  → Precisión en indices: {correct_indices/n_items*100:.1f}%")
+            print(f"  → Precisión en ángulos: {correct_angles/n_items*100:.1f}%")
+        
+        # Análisis de convergencia
+        if len(fitness_hist) > 10:
+            initial_fitness = fitness_hist[0]
+            final_fitness = fitness_hist[-1]
+            improvement = ((initial_fitness - final_fitness) / initial_fitness * 100) if initial_fitness > 0 else 0
+            
+            print(f"\n📈 Análisis de Convergencia:")
+            print(f"  Fitness inicial: {initial_fitness:.6f}")
+            print(f"  Fitness final: {final_fitness:.6f}")
+            print(f"  Mejora total: {improvement:.2f}%")
+            
+            # Detectar en qué generación encontró el mejor
+            best_gen = fitness_hist.index(min(fitness_hist))
+            print(f"  Mejor solución en gen: {best_gen}/{len(fitness_hist)} ({best_gen/len(fitness_hist)*100:.1f}%)")
+        
+        print(f"{'='*70}")
+        
+        # Guardar resultados para resumen final
+        all_results.append({
+            'n_items': n_items,
+            'fitness': best.fitness,
+            'time': elapsed_time,
+            'generations': len(fitness_hist),
+            'quality': quality,
+            'correct_indices': correct_indices,
+            'correct_angles': correct_angles,
+            'is_optimal': is_optimal_indices and is_optimal_angles,
+            'fitness_history': fitness_hist,
+            'diversity_history': diversity_hist
+        })
     
-    # ===== CONFIGURACIÓN DEL PROBLEMA =====
-    
-    n_items = 20
-    allowed_angles = [0, 90, 180, 270]
-    
-    # Opcionalmente, proporciona tamaños para inicialización heurística
-    item_sizes = [random.uniform(1, 10) for _ in range(n_items)]
+    # ========================================================================
+    # RESUMEN FINAL DE TODAS LAS PRUEBAS
+    # ========================================================================
     
     print("\n" + "="*70)
-    print("ALGORITMO GENÉTICO PARA IRREGULAR PACKING")
+    print("📊 RESUMEN GENERAL DE TODAS LAS PRUEBAS")
     print("="*70)
-    print(f"Número de items: {n_items}")
-    print(f"Ángulos permitidos: {allowed_angles}")
-    print(f"Tamaño de población: 100")
-    print(f"Generaciones máximas: 300")
-    print("="*70 + "\n")
     
-    # ===== EJECUTAR ALGORITMO =====
+    print(f"\n{'n_items':<10} {'Fitness':<12} {'Calidad':<15} {'Tiempo':<10} {'Gens':<8} {'Óptima':<8}")
+    print("-" * 70)
     
-    best_solution, history = genetic_algorithm_packing(
-        n_items=n_items,
-        allowed_angles=allowed_angles,
-        place_func=example_place_func,
-        fitness_func=example_fitness_func,
-        population_size=100,
-        n_generations=300,
-        elite_size=10,
-        mutation_rate_indices=0.2,
-        mutation_rate_angles=0.3,
-        crossover_rate=0.8,
-        tournament_size=5,
-        early_stopping_patience=50,
-        local_search_frequency=10,
-        local_search_iterations=20,
-        verbose=True,
-        item_sizes=item_sizes
-    )
+    for result in all_results:
+        optimal_mark = "✓" if result['is_optimal'] else "✗"
+        print(f"{result['n_items']:<10} {result['fitness']:<12.6f} {result['quality']:<15} "
+              f"{result['time']:<10.2f} {result['generations']:<8} {optimal_mark:<8}")
     
-    # ===== MOSTRAR RESULTADOS =====
+    # Estadísticas agregadas
+    print("\n" + "="*70)
+    print("📈 ESTADÍSTICAS AGREGADAS")
+    print("="*70)
+    
+    optimal_count = sum(1 for r in all_results if r['is_optimal'])
+    excellent_count = sum(1 for r in all_results if r['fitness'] < 1.0)
+    avg_time = sum(r['time'] for r in all_results) / len(all_results)
+    avg_fitness = sum(r['fitness'] for r in all_results) / len(all_results)
+    
+    print(f"\n  Soluciones óptimas encontradas: {optimal_count}/{len(all_results)} ({optimal_count/len(all_results)*100:.1f}%)")
+    print(f"  Soluciones excelentes (fitness<1): {excellent_count}/{len(all_results)} ({excellent_count/len(all_results)*100:.1f}%)")
+    print(f"  Tiempo promedio de ejecución: {avg_time:.2f} segundos")
+    print(f"  Fitness promedio: {avg_fitness:.6f}")
     
     print("\n" + "="*70)
-    print("SOLUCIÓN ÓPTIMA ENCONTRADA")
-    print("="*70)
-    print(f"\nOrden de colocación:")
-    print(best_solution.indices)
-    print(f"\nÁngulos correspondientes:")
-    print(best_solution.angles)
-    print(f"\nFitness final: {best_solution.fitness:.6f}")
-    print(f"Solución válida: {best_solution.is_valid}")
     
-    # Visualizar evolución del fitness
+    # ========================================================================
+    # VISUALIZACIÓN
+    # ========================================================================
+    
     try:
         import matplotlib.pyplot as plt
         
-        plt.figure(figsize=(10, 6))
-        plt.plot(history, linewidth=2)
-        plt.xlabel('Generación', fontsize=12)
-        plt.ylabel('Mejor Fitness', fontsize=12)
-        plt.title('Evolución del Mejor Fitness', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
+        print("\n🎨 Generando visualizaciones...")
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Evolución del fitness para cada tamaño
+        ax1 = axes[0, 0]
+        for result in all_results:
+            ax1.plot(result['fitness_history'], 
+                    label=f"n={result['n_items']}", 
+                    linewidth=2)
+        ax1.set_xlabel('Generación', fontsize=12)
+        ax1.set_ylabel('Mejor Fitness', fontsize=12)
+        ax1.set_title('Evolución del Fitness por Tamaño de Problema', 
+                     fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.set_yscale('log')
+        
+        # 2. Fitness final vs n_items
+        ax2 = axes[0, 1]
+        n_items_list = [r['n_items'] for r in all_results]
+        fitness_list = [r['fitness'] for r in all_results]
+        colors = ['green' if r['is_optimal'] else 'orange' if r['fitness'] < 1.0 else 'red' 
+                 for r in all_results]
+        ax2.scatter(n_items_list, fitness_list, c=colors, s=200, alpha=0.6)
+        ax2.plot(n_items_list, fitness_list, 'b--', alpha=0.3)
+        ax2.set_xlabel('Número de Items', fontsize=12)
+        ax2.set_ylabel('Fitness Final', fontsize=12)
+        ax2.set_title('Fitness Final vs Tamaño del Problema', 
+                     fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        # Leyenda de colores
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='green', alpha=0.6, label='Óptima'),
+            Patch(facecolor='orange', alpha=0.6, label='Excelente (< 1.0)'),
+            Patch(facecolor='red', alpha=0.6, label='Mejorable')
+        ]
+        ax2.legend(handles=legend_elements, loc='upper left')
+        
+        # 3. Tiempo de ejecución vs n_items
+        ax3 = axes[1, 0]
+        time_list = [r['time'] for r in all_results]
+        ax3.bar(n_items_list, time_list, color='steelblue', alpha=0.7)
+        ax3.set_xlabel('Número de Items', fontsize=12)
+        ax3.set_ylabel('Tiempo (segundos)', fontsize=12)
+        ax3.set_title('Tiempo de Ejecución vs Tamaño del Problema', 
+                     fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        # Agregar valores encima de las barras
+        for i, (n, t) in enumerate(zip(n_items_list, time_list)):
+            ax3.text(n, t, f'{t:.2f}s', ha='center', va='bottom', fontsize=9)
+        
+        # 4. Diversidad promedio (si está disponible)
+        ax4 = axes[1, 1]
+        for result in all_results:
+            if result['diversity_history']:
+                ax4.plot(result['diversity_history'], 
+                        label=f"n={result['n_items']}", 
+                        linewidth=2)
+        ax4.set_xlabel('Chequeo de Diversidad', fontsize=12)
+        ax4.set_ylabel('Diversidad', fontsize=12)
+        ax4.set_title('Evolución de la Diversidad', 
+                     fontsize=14, fontweight='bold')
+        ax4.axhline(y=0.3, color='red', linestyle='--', 
+                   label='Umbral mínimo', linewidth=2)
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
         plt.tight_layout()
-        plt.savefig('fitness_evolution.png', dpi=300)
-        print("\n✓ Gráfica de evolución guardada en 'fitness_evolution.png'")
+        plt.savefig('complete_analysis.png', dpi=300, bbox_inches='tight')
+        print("✓ Visualización guardada en 'complete_analysis.png'")
+        
     except ImportError:
         print("\n(matplotlib no disponible para visualización)")
+    except Exception as e:
+        print(f"\n(Error generando visualización: {e})")
     
     print("\n" + "="*70)
+    print("🎉 ANÁLISIS COMPLETO FINALIZADO")
+    print("="*70 + "\n")
