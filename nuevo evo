@@ -1,0 +1,1164 @@
+import random
+import numpy as np
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from copy import deepcopy
+
+
+# ============================================================================
+# CLASE PARA DEFINIR GRUPOS DE ÍNDICES
+# ============================================================================
+
+class IndexGroup:
+    """Define un grupo de índices con sus ángulos permitidos específicos"""
+    
+    def __init__(self, name, indices, allowed_angles):
+        """
+        Args:
+            name: Nombre del grupo (ej: "Grupo A")
+            indices: Lista de índices que pertenecen a este grupo
+            allowed_angles: Lista de ángulos permitidos para este grupo
+        """
+        self.name = name
+        self.indices = set(indices)  # Usar set para búsqueda O(1)
+        self.allowed_angles = allowed_angles
+    
+    def contains(self, index):
+        """Verifica si un índice pertenece a este grupo"""
+        return index in self.indices
+    
+    def __repr__(self):
+        return f"IndexGroup('{self.name}', indices={sorted(self.indices)}, angles={self.allowed_angles})"
+
+
+class GroupManager:
+    """Gestiona múltiples grupos de índices"""
+    
+    def __init__(self, groups=None):
+        """
+        Args:
+            groups: Lista de objetos IndexGroup
+        """
+        self.groups = groups or []
+        self._index_to_group = {}  # Cache: índice -> grupo
+        self._build_index_map()
+    
+    def _build_index_map(self):
+        """Construye un mapa rápido de índice a grupo"""
+        for group in self.groups:
+            for idx in group.indices:
+                self._index_to_group[idx] = group
+    
+    def get_group(self, index):
+        """Obtiene el grupo al que pertenece un índice"""
+        return self._index_to_group.get(index, None)
+    
+    def get_allowed_angles(self, index):
+        """Obtiene los ángulos permitidos para un índice"""
+        group = self.get_group(index)
+        if group:
+            return group.allowed_angles
+        return None  # Índice sin grupo
+    
+    def are_same_group(self, index1, index2):
+        """Verifica si dos índices pertenecen al mismo grupo"""
+        group1 = self.get_group(index1)
+        group2 = self.get_group(index2)
+        return group1 is not None and group1 == group2
+    
+    def get_group_indices(self, group_name):
+        """Obtiene todos los índices de un grupo por nombre"""
+        for group in self.groups:
+            if group.name == group_name:
+                return sorted(list(group.indices))
+        return []
+    
+    def validate_configuration(self, n_items):
+        """Valida que la configuración de grupos sea correcta"""
+        all_indices = set()
+        for group in self.groups:
+            # Verificar que no haya índices duplicados entre grupos
+            intersection = all_indices.intersection(group.indices)
+            if intersection:
+                raise ValueError(f"Índices duplicados entre grupos: {intersection}")
+            all_indices.update(group.indices)
+            
+            # Verificar que los índices estén en rango válido
+            for idx in group.indices:
+                if idx < 0 or idx >= n_items:
+                    raise ValueError(f"Índice {idx} fuera de rango [0, {n_items-1}] en grupo '{group.name}'")
+            
+            # Verificar que haya al menos un ángulo permitido
+            if not group.allowed_angles:
+                raise ValueError(f"El grupo '{group.name}' no tiene ángulos permitidos")
+        
+        return True
+
+
+# ============================================================================
+# CLASE INDIVIDUAL MEJORADA
+# ============================================================================
+
+class Individual:
+    """Representa una solución al problema de packing con soporte para grupos"""
+    
+    def __init__(self, n_items, allowed_angles, group_manager=None):
+        """
+        Args:
+            n_items: Número de items
+            allowed_angles: Ángulos permitidos por defecto (para índices sin grupo)
+            group_manager: Objeto GroupManager opcional para manejar grupos
+        """
+        self.n_items = n_items
+        self.indices = list(range(n_items))
+        self.allowed_angles = allowed_angles
+        self.group_manager = group_manager
+        
+        # Inicializar ángulos según el grupo al que pertenece cada índice
+        self.angles = []
+        for i in range(n_items):
+            if group_manager:
+                angles_for_index = group_manager.get_allowed_angles(i)
+                if angles_for_index:
+                    self.angles.append(random.choice(angles_for_index))
+                else:
+                    self.angles.append(random.choice(allowed_angles))
+            else:
+                self.angles.append(random.choice(allowed_angles))
+        
+        self.fitness = float('inf')
+        self.is_valid = False
+        self.age = 0
+        
+        # Nuevo: almacenar el resultado completo del evaluador
+        self.evaluation_result = None
+    
+    def copy(self):
+        new_ind = Individual(self.n_items, self.allowed_angles, self.group_manager)
+        new_ind.indices = self.indices.copy()
+        new_ind.angles = self.angles.copy()
+        new_ind.fitness = self.fitness
+        new_ind.is_valid = self.is_valid
+        new_ind.age = self.age
+        new_ind.evaluation_result = self.evaluation_result
+        return new_ind
+    
+    def get_signature(self):
+        return (tuple(self.indices), tuple(self.angles))
+    
+    def set_evaluation_result(self, result):
+        """
+        Almacena el resultado completo de la evaluación.
+        
+        Args:
+            result: Puede ser un número (fitness) o un diccionario con información detallada
+                   Ejemplo: {
+                       'fitness': 2.5,
+                       'width': 100.5,
+                       'height': 50.2,
+                       'area': 5050.1,
+                       'valid': True,
+                       'overlap': False
+                   }
+        """
+        if isinstance(result, (int, float)):
+            self.fitness = float(result)
+            self.evaluation_result = {'fitness': float(result)}
+        else:
+            self.fitness = float(result.get('fitness', float('inf')))
+            self.evaluation_result = result
+            if 'valid' in result:
+                self.is_valid = result['valid']
+
+
+# ============================================================================
+# OPERADORES DE MUTACIÓN MEJORADOS CON SOPORTE PARA GRUPOS
+# ============================================================================
+
+def mutate_indices_aggressive(indices, mutation_rate=0.2, force_change=False, group_manager=None):
+    """
+    Mutación más agresiva para índices con restricción de grupos.
+    Solo intercambia índices dentro del mismo grupo.
+    
+    Args:
+        indices: Lista de índices a mutar
+        mutation_rate: Probabilidad de mutación
+        force_change: Forzar al menos un cambio
+        group_manager: GroupManager para respetar restricciones de grupos
+    """
+    indices = indices.copy()
+    n = len(indices)
+    
+    # Caso especial: muy pocos items
+    if n <= 1:
+        return indices
+    
+    if n == 2:
+        # Solo puede hacer swap si están en el mismo grupo
+        if force_change or random.random() < mutation_rate:
+            if group_manager is None or group_manager.are_same_group(indices[0], indices[1]):
+                indices[0], indices[1] = indices[1], indices[0]
+        return indices
+    
+    # n >= 3: comportamiento normal con restricción de grupos
+    if force_change or random.random() < mutation_rate:
+        intensity = random.random()
+        
+        if intensity < 0.4:  # Mutación suave
+            operator = 'swap'
+        elif intensity < 0.7:  # Mutación media
+            operator = 'inversion'
+        else:  # Mutación fuerte
+            operator = 'scramble'
+        
+        if operator == 'swap':
+            # Múltiples swaps respetando grupos
+            n_swaps = random.randint(1, max(1, n // 10))
+            for _ in range(n_swaps):
+                if group_manager:
+                    # Seleccionar dos posiciones del mismo grupo
+                    i = random.randint(0, n - 1)
+                    group_i = group_manager.get_group(indices[i])
+                    
+                    if group_i:
+                        # Buscar otra posición con índice del mismo grupo
+                        candidates = [j for j in range(n) 
+                                    if j != i and group_manager.get_group(indices[j]) == group_i]
+                        if candidates:
+                            j = random.choice(candidates)
+                            indices[i], indices[j] = indices[j], indices[i]
+                else:
+                    # Sin restricciones de grupo
+                    i, j = random.sample(range(n), 2)
+                    indices[i], indices[j] = indices[j], indices[i]
+                
+        elif operator == 'inversion':
+            # Inversión de segmento respetando grupos
+            max_length = max(2, n // 3)
+            length = random.randint(2, min(max_length, n))
+            
+            if group_manager:
+                # Seleccionar un segmento donde los índices pertenezcan al mismo grupo
+                attempts = 0
+                max_attempts = 20
+                
+                while attempts < max_attempts:
+                    if length < n:
+                        i = random.randint(0, n - length)
+                    else:
+                        i = 0
+                        length = n
+                    
+                    segment = indices[i:i+length]
+                    
+                    # Verificar si todos los índices del segmento están en el mismo grupo
+                    if not group_manager.groups:
+                        # Sin grupos definidos, proceder normalmente
+                        indices[i:i+length] = list(reversed(segment))
+                        break
+                    
+                    groups_in_segment = set()
+                    for idx in segment:
+                        group = group_manager.get_group(idx)
+                        if group:
+                            groups_in_segment.add(group)
+                    
+                    if len(groups_in_segment) <= 1:
+                        # Todos del mismo grupo o sin grupo
+                        indices[i:i+length] = list(reversed(segment))
+                        break
+                    
+                    attempts += 1
+                    length = max(2, length - 1)  # Reducir tamaño del segmento
+            else:
+                if length < n:
+                    i = random.randint(0, n - length)
+                    indices[i:i+length] = list(reversed(indices[i:i+length]))
+                else:
+                    indices.reverse()
+            
+        elif operator == 'scramble':
+            # Scramble de segmento respetando grupos
+            max_length = max(3, n // 2)
+            length = random.randint(3, min(max_length, n))
+            
+            if group_manager:
+                # Intentar encontrar un segmento del mismo grupo
+                attempts = 0
+                max_attempts = 20
+                
+                while attempts < max_attempts:
+                    if length < n:
+                        max_i = max(0, n - length)
+                        i = random.randint(0, max_i) if max_i > 0 else 0
+                    else:
+                        i = 0
+                        length = n
+                    
+                    segment = indices[i:i+length]
+                    
+                    if not group_manager.groups:
+                        random.shuffle(segment)
+                        indices[i:i+length] = segment
+                        break
+                    
+                    groups_in_segment = set()
+                    for idx in segment:
+                        group = group_manager.get_group(idx)
+                        if group:
+                            groups_in_segment.add(group)
+                    
+                    if len(groups_in_segment) <= 1:
+                        random.shuffle(segment)
+                        indices[i:i+length] = segment
+                        break
+                    
+                    attempts += 1
+                    length = max(3, length - 1)
+            else:
+                if length < n:
+                    max_i = max(0, n - length)
+                    i = random.randint(0, max_i) if max_i > 0 else 0
+                    segment = indices[i:i+length]
+                    random.shuffle(segment)
+                    indices[i:i+length] = segment
+                else:
+                    random.shuffle(indices)
+    
+    return indices
+
+
+def mutate_angles_aggressive(angles, individual, mutation_rate=0.3, force_change=False):
+    """
+    Mutación más agresiva para ángulos respetando los ángulos permitidos por grupo.
+    
+    Args:
+        angles: Lista de ángulos a mutar
+        individual: Objeto Individual con información de grupos
+        mutation_rate: Probabilidad de mutación
+        force_change: Forzar al menos un cambio
+    """
+    angles = angles.copy()
+    changed = False
+    
+    for i in range(len(angles)):
+        should_mutate = force_change and not changed
+        should_mutate = should_mutate or random.random() < mutation_rate
+        
+        if should_mutate:
+            # Obtener ángulos permitidos para este índice específico
+            if individual.group_manager:
+                allowed = individual.group_manager.get_allowed_angles(i)
+                if allowed is None:
+                    allowed = individual.allowed_angles
+            else:
+                allowed = individual.allowed_angles
+            
+            if random.random() < 0.5:
+                new_angle = random.choice(allowed)
+                while force_change and new_angle == angles[i] and len(allowed) > 1:
+                    new_angle = random.choice(allowed)
+                angles[i] = new_angle
+            else:
+                if angles[i] in allowed:
+                    current_idx = allowed.index(angles[i])
+                    delta = random.choice([-1, 1])
+                    new_idx = (current_idx + delta) % len(allowed)
+                    angles[i] = allowed[new_idx]
+                else:
+                    # El ángulo actual no está en los permitidos, corregir
+                    angles[i] = random.choice(allowed)
+            
+            changed = True
+    
+    return angles
+
+
+# ============================================================================
+# MEDICIÓN DE DIVERSIDAD
+# ============================================================================
+
+def calculate_population_diversity(population):
+    """
+    Calcula la diversidad de la población.
+    Retorna el porcentaje de individuos únicos.
+    """
+    unique_signatures = set()
+    
+    for ind in population:
+        unique_signatures.add(ind.get_signature())
+    
+    diversity = len(unique_signatures) / len(population) if population else 0
+    return diversity, len(unique_signatures)
+
+
+def hamming_distance_indices(ind1, ind2):
+    """Distancia de Hamming entre dos permutaciones"""
+    if len(ind1.indices) == 0:
+        return 0
+    distance = sum(1 for i, j in zip(ind1.indices, ind2.indices) if i != j)
+    return distance / len(ind1.indices)
+
+
+def hamming_distance_angles(ind1, ind2):
+    """Distancia de Hamming entre dos vectores de ángulos"""
+    if len(ind1.angles) == 0:
+        return 0
+    distance = sum(1 for a1, a2 in zip(ind1.angles, ind2.angles) if a1 != a2)
+    return distance / len(ind1.angles)
+
+
+def population_diversity_metric(population):
+    """
+    Calcula diversidad promedio entre todos los pares.
+    """
+    if len(population) < 2:
+        return 1.0
+    
+    total_distance = 0
+    comparisons = 0
+    
+    sample_size = min(50, len(population))
+    sample = random.sample(population, sample_size)
+    
+    for i in range(len(sample)):
+        for j in range(i + 1, len(sample)):
+            dist_indices = hamming_distance_indices(sample[i], sample[j])
+            dist_angles = hamming_distance_angles(sample[i], sample[j])
+            total_distance += (dist_indices + dist_angles) / 2
+            comparisons += 1
+    
+    return total_distance / comparisons if comparisons > 0 else 0.0
+
+
+# ============================================================================
+# INYECCIÓN DE DIVERSIDAD Y ELIMINACIÓN DE DUPLICADOS
+# ============================================================================
+
+def inject_diversity(population, n_items, allowed_angles, injection_rate=0.2, group_manager=None):
+    """
+    Reemplaza parte de la población con individuos nuevos aleatorios.
+    """
+    n_replace = max(1, int(len(population) * injection_rate))
+    
+    # Ordenar por fitness (peores al final)
+    population.sort(key=lambda x: x.fitness)
+    
+    # Reemplazar los peores con nuevos individuos
+    for i in range(len(population) - n_replace, len(population)):
+        population[i] = Individual(n_items, allowed_angles, group_manager)
+    
+    return population
+
+
+def remove_duplicates(population, keep_best_n=None):
+    """
+    Elimina individuos duplicados de la población.
+    Mantiene el individuo con mejor fitness entre duplicados.
+    """
+    if keep_best_n is None:
+        keep_best_n = len(population)
+    
+    unique_dict = {}
+    
+    for ind in population:
+        sig = ind.get_signature()
+        if sig not in unique_dict:
+            unique_dict[sig] = ind
+        else:
+            # Mantener el que tiene mejor fitness
+            if ind.fitness < unique_dict[sig].fitness:
+                unique_dict[sig] = ind
+    
+    unique_population = list(unique_dict.values())
+    
+    # Si después de eliminar duplicados hay menos individuos de los deseados,
+    # completar con nuevos aleatorios
+    if len(unique_population) < keep_best_n:
+        n_items = len(unique_population[0].indices) if unique_population else 10
+        allowed_angles = unique_population[0].allowed_angles if unique_population else [0, 90, 180, 270]
+        group_manager = unique_population[0].group_manager if unique_population else None
+        
+        while len(unique_population) < keep_best_n:
+            unique_population.append(Individual(n_items, allowed_angles, group_manager))
+    
+    return unique_population[:keep_best_n]
+
+
+# ============================================================================
+# ALGORITMO EVOLUTIVO MEJORADO
+# ============================================================================
+
+def evolutionary_algorithm_with_groups(
+    evaluate_function,
+    n_items,
+    allowed_angles=[0, 90, 180, 270],
+    group_manager=None,
+    population_size=100,
+    max_generations=200,
+    mutation_rate_indices=0.2,
+    mutation_rate_angles=0.3,
+    elite_size=5,
+    tournament_size=5,
+    diversity_check_interval=20,
+    min_diversity_threshold=0.3,
+    injection_rate=0.2,
+    verbose=True
+):
+    """
+    Algoritmo evolutivo mejorado con soporte para grupos y resultado del evaluador.
+    
+    Args:
+        evaluate_function: Función que evalúa una solución.
+                          Debe aceptar (indices, angles) y retornar:
+                          - Un número (fitness), o
+                          - Un diccionario con 'fitness' y otra información
+        n_items: Número de items
+        allowed_angles: Ángulos permitidos por defecto
+        group_manager: Objeto GroupManager para manejar grupos (opcional)
+        ... (otros parámetros)
+    
+    Returns:
+        best_individual: Mejor solución encontrada
+        fitness_history: Historia del mejor fitness por generación
+        diversity_history: Historia de la diversidad
+    """
+    
+    # Validar configuración de grupos
+    if group_manager:
+        group_manager.validate_configuration(n_items)
+        if verbose:
+            print(f"\n🔧 Configuración de grupos:")
+            for group in group_manager.groups:
+                print(f"  {group}")
+    
+    # Inicializar población
+    population = [Individual(n_items, allowed_angles, group_manager) 
+                  for _ in range(population_size)]
+    
+    # Evaluar población inicial
+    for ind in population:
+        result = evaluate_function(ind.indices, ind.angles)
+        ind.set_evaluation_result(result)
+    
+    best_ever = min(population, key=lambda x: x.fitness).copy()
+    
+    fitness_history = [best_ever.fitness]
+    diversity_history = []
+    generations_without_improvement = 0
+    
+    for generation in range(max_generations):
+        # Verificar diversidad periódicamente
+        if generation % diversity_check_interval == 0:
+            diversity, n_unique = calculate_population_diversity(population)
+            diversity_history.append(diversity)
+            
+            if verbose and generation > 0:
+                print(f"Gen {generation}: Diversidad = {diversity:.3f} ({n_unique} únicos)")
+            
+            # Inyectar diversidad si es necesaria
+            if diversity < min_diversity_threshold:
+                if verbose:
+                    print(f"  ⚠ Baja diversidad detectada. Inyectando {injection_rate*100:.0f}% nuevos individuos...")
+                population = inject_diversity(population, n_items, allowed_angles, 
+                                             injection_rate, group_manager)
+                # Evaluar nuevos individuos
+                for ind in population[-int(len(population)*injection_rate):]:
+                    result = evaluate_function(ind.indices, ind.angles)
+                    ind.set_evaluation_result(result)
+        
+        # Selección de elite
+        population.sort(key=lambda x: x.fitness)
+        elite = [ind.copy() for ind in population[:elite_size]]
+        
+        # Actualizar mejor solución
+        if population[0].fitness < best_ever.fitness:
+            best_ever = population[0].copy()
+            generations_without_improvement = 0
+            if verbose:
+                if best_ever.evaluation_result and isinstance(best_ever.evaluation_result, dict):
+                    extra_info = {k: v for k, v in best_ever.evaluation_result.items() if k != 'fitness'}
+                    print(f"Gen {generation}: Nuevo mejor fitness = {best_ever.fitness:.6f}, Info: {extra_info}")
+                else:
+                    print(f"Gen {generation}: Nuevo mejor fitness = {best_ever.fitness:.6f}")
+        else:
+            generations_without_improvement += 1
+        
+        fitness_history.append(best_ever.fitness)
+        
+        # Crear nueva generación
+        new_population = elite.copy()
+        
+        while len(new_population) < population_size:
+            # Selección por torneo
+            tournament = random.sample(population, min(tournament_size, len(population)))
+            parent1 = min(tournament, key=lambda x: x.fitness)
+            
+            tournament = random.sample(population, min(tournament_size, len(population)))
+            parent2 = min(tournament, key=lambda x: x.fitness)
+            
+            # Crear hijo
+            child = parent1.copy()
+            
+            # Mutación de índices
+            child.indices = mutate_indices_aggressive(
+                child.indices, 
+                mutation_rate_indices,
+                group_manager=group_manager
+            )
+            
+            # Mutación de ángulos
+            child.angles = mutate_angles_aggressive(
+                child.angles,
+                child,
+                mutation_rate_angles
+            )
+            
+            # Evaluar hijo
+            result = evaluate_function(child.indices, child.angles)
+            child.set_evaluation_result(result)
+            
+            new_population.append(child)
+        
+        population = new_population
+        
+        # Criterio de parada temprana
+        if best_ever.fitness < 0.001:
+            if verbose:
+                print(f"\n✓ Convergencia óptima alcanzada en generación {generation}")
+            break
+        
+        if generations_without_improvement > 50:
+            if verbose:
+                print(f"\n⚠ Sin mejora en {generations_without_improvement} generaciones. Terminando...")
+            break
+    
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"🏆 MEJOR SOLUCIÓN ENCONTRADA")
+        print(f"{'='*70}")
+        print(f"Fitness: {best_ever.fitness:.6f}")
+        print(f"Índices: {best_ever.indices}")
+        print(f"Ángulos: {best_ever.angles}")
+        if best_ever.evaluation_result and isinstance(best_ever.evaluation_result, dict):
+            print(f"\nInformación detallada del evaluador:")
+            for key, value in best_ever.evaluation_result.items():
+                if key != 'fitness':
+                    print(f"  {key}: {value}")
+    
+    return best_ever, fitness_history, diversity_history
+
+
+# ============================================================================
+# EJEMPLO DE USO
+# ============================================================================
+
+def example_evaluate_function(indices, angles):
+    """
+    Función de evaluación de ejemplo que retorna información detallada.
+    
+    En tu caso real, esto sería la función que coloca los rectángulos
+    y calcula el fitness real del empaquetado.
+    """
+    # Simulación simple: penalizar diferencias con solución óptima
+    optimal_indices = list(range(len(indices)))
+    optimal_angles = [0] * len(angles)
+    
+    fitness_indices = sum(1 for i, j in zip(indices, optimal_indices) if i != j)
+    fitness_angles = sum(1 for a, b in zip(angles, optimal_angles) if a != b)
+    
+    fitness = fitness_indices + fitness_angles
+    
+    # Simular información adicional que tu evaluador podría retornar
+    return {
+        'fitness': fitness,
+        'width': 100 + random.uniform(-10, 10),
+        'height': 50 + random.uniform(-5, 5),
+        'area': (100 + random.uniform(-10, 10)) * (50 + random.uniform(-5, 5)),
+        'valid': fitness < 20,
+        'overlap': fitness > 10,
+        'indices_errors': fitness_indices,
+        'angles_errors': fitness_angles
+    }
+
+
+if __name__ == "__main__":
+    print("="*70)
+    print("🧬 ALGORITMO EVOLUTIVO MEJORADO CON GRUPOS")
+    print("="*70)
+    
+    # Configurar grupos
+    # Grupo A: índices 4, 7, 8, 12 con ángulos 0 y 90
+    # Grupo B: índices 1, 6 con ángulos 0, 90, 180, 270
+    # Los demás índices (0, 2, 3, 5, 9, 10, 11, 13, 14) sin restricciones
+    
+    n_items = 15
+    
+    groups = [
+        IndexGroup("Grupo A", [4, 7, 8, 12], [0, 90]),
+        IndexGroup("Grupo B", [1, 6], [0, 90, 180, 270])
+    ]
+    
+    group_manager = GroupManager(groups)
+    
+    print(f"\n📦 Problema con {n_items} items")
+    print(f"🎯 Grupos configurados:")
+    for group in groups:
+        print(f"  - {group.name}: índices {sorted(list(group.indices))}, ángulos {group.allowed_angles}")
+    
+    # Ejecutar algoritmo evolutivo
+    best, fitness_hist, diversity_hist = evolutionary_algorithm_with_groups(
+        evaluate_function=example_evaluate_function,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        group_manager=group_manager,
+        population_size=100,
+        max_generations=200,
+        verbose=True
+    )
+    
+    print("\n" + "="*70)
+    print("✅ EJECUCIÓN COMPLETADA")
+    print("="*70)
+    
+    # Mostrar historial de mejora
+    print(f"\n📊 Mejora del fitness:")
+    print(f"  Inicial: {fitness_hist[0]:.6f}")
+    print(f"  Final: {fitness_hist[-1]:.6f}")
+    print(f"  Mejora: {((fitness_hist[0] - fitness_hist[-1]) / fitness_hist[0] * 100):.2f}%")
+    
+    # Verificar restricciones de grupo en la solución
+    print(f"\n🔍 Verificación de grupos en la solución:")
+    for i, (idx, angle) in enumerate(zip(best.indices, best.angles)):
+        group = group_manager.get_group(idx)
+        if group:
+            allowed = group.allowed_angles
+            status = "✓" if angle in allowed else "✗"
+            print(f"  Posición {i}: índice {idx} ({group.name}), ángulo {angle}° {status}")
+
+"""
+EJEMPLOS PRÁCTICOS DE USO
+Algoritmo Evolutivo Mejorado con Grupos
+
+Este archivo contiene ejemplos completos y listos para ejecutar.
+"""
+
+from evolutionary_algorithm_improved import (
+    IndexGroup, GroupManager, Individual,
+    evolutionary_algorithm_with_groups
+)
+import random
+
+
+# ============================================================================
+# EJEMPLO 1: USO BÁSICO SIN GRUPOS
+# ============================================================================
+
+def ejemplo_1_basico():
+    """Uso básico sin grupos, compatible con código anterior"""
+    print("="*70)
+    print("EJEMPLO 1: Uso Básico (Sin Grupos)")
+    print("="*70)
+    
+    def evaluador_simple(indices, angles):
+        """Evaluador simple que retorna solo el fitness"""
+        optimal = list(range(len(indices)))
+        fitness = sum(1 for i, j in zip(indices, optimal) if i != j)
+        return fitness  # Retorna solo un número
+    
+    n_items = 10
+    
+    best, fitness_hist, div_hist = evolutionary_algorithm_with_groups(
+        evaluate_function=evaluador_simple,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        # group_manager=None (por defecto, sin grupos)
+        population_size=50,
+        max_generations=100,
+        verbose=True
+    )
+    
+    print(f"\n✓ Mejor fitness encontrado: {best.fitness}")
+
+
+# ============================================================================
+# EJEMPLO 2: USO CON RESULTADO DETALLADO DEL EVALUADOR
+# ============================================================================
+
+def ejemplo_2_resultado_detallado():
+    """Uso con evaluador que retorna información detallada"""
+    print("\n" + "="*70)
+    print("EJEMPLO 2: Evaluador con Resultado Detallado")
+    print("="*70)
+    
+    def evaluador_detallado(indices, angles):
+        """Evaluador que retorna diccionario con información completa"""
+        optimal_indices = list(range(len(indices)))
+        optimal_angles = [0] * len(angles)
+        
+        error_indices = sum(1 for i, j in zip(indices, optimal_indices) if i != j)
+        error_angles = sum(1 for a, b in zip(angles, optimal_angles) if a != b)
+        
+        fitness = error_indices + error_angles * 0.5
+        
+        # Simular métricas adicionales de empaquetado
+        width = 100 + random.uniform(-5, 5)
+        height = 50 + random.uniform(-3, 3)
+        area = width * height
+        
+        return {
+            'fitness': fitness,
+            'width': width,
+            'height': height,
+            'area': area,
+            'utilization': min(1.0, 4500 / area),  # Simulación
+            'valid': fitness < 15,
+            'overlap': fitness > 10,
+            'errors_indices': error_indices,
+            'errors_angles': error_angles
+        }
+    
+    n_items = 10
+    
+    best, fitness_hist, div_hist = evolutionary_algorithm_with_groups(
+        evaluate_function=evaluador_detallado,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        population_size=50,
+        max_generations=100,
+        verbose=True
+    )
+    
+    print(f"\n✓ Información detallada de la mejor solución:")
+    if best.evaluation_result:
+        for key, value in best.evaluation_result.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
+
+
+# ============================================================================
+# EJEMPLO 3: USO CON GRUPOS SIMPLES
+# ============================================================================
+
+def ejemplo_3_grupos_simples():
+    """Uso básico con grupos"""
+    print("\n" + "="*70)
+    print("EJEMPLO 3: Uso con Grupos Simples")
+    print("="*70)
+    
+    n_items = 12
+    
+    # Definir grupos
+    groups = [
+        IndexGroup("Grupo A", [4, 7, 8], [0, 90]),           # Solo 0° y 90°
+        IndexGroup("Grupo B", [1, 6], [0, 90, 180, 270])     # Todos los ángulos
+    ]
+    
+    group_manager = GroupManager(groups)
+    
+    print(f"\nConfiguración de grupos:")
+    for group in groups:
+        print(f"  {group.name}: índices {sorted(list(group.indices))}")
+        print(f"    Ángulos permitidos: {group.allowed_angles}")
+    
+    def evaluador(indices, angles):
+        optimal = list(range(len(indices)))
+        fitness = sum(1 for i, j in zip(indices, optimal) if i != j)
+        return fitness
+    
+    best, fitness_hist, div_hist = evolutionary_algorithm_with_groups(
+        evaluate_function=evaluador,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        group_manager=group_manager,
+        population_size=50,
+        max_generations=100,
+        verbose=True
+    )
+    
+    # Verificar que se respetaron las restricciones
+    print(f"\n🔍 Verificación de restricciones:")
+    for i, (idx, angle) in enumerate(zip(best.indices, best.angles)):
+        group = group_manager.get_group(idx)
+        if group:
+            allowed = group.allowed_angles
+            status = "✓" if angle in allowed else "✗ ERROR"
+            print(f"  Pos {i}: idx={idx} ({group.name}), ángulo={angle}° {status}")
+
+
+# ============================================================================
+# EJEMPLO 4: PROBLEMA REALISTA - EMPAQUETADO DE RECTÁNGULOS
+# ============================================================================
+
+def ejemplo_4_empaquetado_realista():
+    """Ejemplo más realista de empaquetado con restricciones"""
+    print("\n" + "="*70)
+    print("EJEMPLO 4: Empaquetado Realista con Restricciones")
+    print("="*70)
+    
+    n_items = 15
+    
+    # Simular diferentes tipos de cajas
+    groups = [
+        # Cajas frágiles: solo horizontal (0°, 180°)
+        IndexGroup("Cajas Frágiles", [0, 3, 7, 11], [0, 180]),
+        
+        # Cajas pesadas: solo vertical (90°, 270°)
+        IndexGroup("Cajas Pesadas", [1, 5, 9], [90, 270]),
+        
+        # Cajas flexibles: cualquier orientación
+        IndexGroup("Cajas Flexibles", [2, 4, 6], [0, 90, 180, 270])
+    ]
+    
+    group_manager = GroupManager(groups)
+    
+    print(f"\n📦 Tipos de cajas:")
+    for group in groups:
+        print(f"  {group.name}:")
+        print(f"    Cantidad: {len(group.indices)}")
+        print(f"    Índices: {sorted(list(group.indices))}")
+        print(f"    Orientaciones: {group.allowed_angles}")
+    
+    # Simular dimensiones de cajas
+    box_dimensions = {
+        i: (random.randint(10, 50), random.randint(10, 50))
+        for i in range(n_items)
+    }
+    
+    def evaluador_empaquetado(indices, angles):
+        """
+        Simula un evaluador de empaquetado real.
+        
+        En tu caso real, aquí irías:
+        1. Colocar rectángulos según el orden (indices) y rotación (angles)
+        2. Calcular área ocupada, detectar solapamientos, etc.
+        3. Retornar métricas detalladas
+        """
+        # Simulación simple
+        total_width = 0
+        max_height = 0
+        
+        for idx, angle in zip(indices, angles):
+            w, h = box_dimensions[idx]
+            
+            # Rotar dimensiones según ángulo
+            if angle in [90, 270]:
+                w, h = h, w
+            
+            total_width += w
+            max_height = max(max_height, h)
+        
+        area = total_width * max_height
+        
+        # Penalizar por área (queremos minimizar)
+        fitness = area / 1000.0
+        
+        # Penalizar solapamientos (simulado)
+        overlap_penalty = random.uniform(0, 2) if fitness > 10 else 0
+        
+        fitness += overlap_penalty
+        
+        return {
+            'fitness': fitness,
+            'width': total_width,
+            'height': max_height,
+            'area': area,
+            'overlap_penalty': overlap_penalty,
+            'valid': overlap_penalty == 0,
+            'utilization': 4500 / area if area > 0 else 0
+        }
+    
+    best, fitness_hist, div_hist = evolutionary_algorithm_with_groups(
+        evaluate_function=evaluador_empaquetado,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        group_manager=group_manager,
+        population_size=100,
+        max_generations=150,
+        verbose=True
+    )
+    
+    print(f"\n📊 Análisis de la mejor solución:")
+    if best.evaluation_result:
+        print(f"  Área total: {best.evaluation_result.get('area', 0):.2f}")
+        print(f"  Ancho: {best.evaluation_result.get('width', 0):.2f}")
+        print(f"  Alto: {best.evaluation_result.get('height', 0):.2f}")
+        print(f"  Utilización: {best.evaluation_result.get('utilization', 0)*100:.2f}%")
+        print(f"  Válida: {best.evaluation_result.get('valid', False)}")
+
+
+# ============================================================================
+# EJEMPLO 5: MANEJO DE ERRORES Y VALIDACIÓN
+# ============================================================================
+
+def ejemplo_5_validacion():
+    """Ejemplos de validación y manejo de errores"""
+    print("\n" + "="*70)
+    print("EJEMPLO 5: Validación y Manejo de Errores")
+    print("="*70)
+    
+    n_items = 10
+    
+    # CASO 1: Índices duplicados entre grupos (ERROR)
+    print("\n❌ CASO 1: Intentar crear grupos con índices duplicados")
+    try:
+        groups_mal = [
+            IndexGroup("Grupo A", [1, 2, 3], [0, 90]),
+            IndexGroup("Grupo B", [3, 4, 5], [0, 90, 180, 270])  # 3 está duplicado
+        ]
+        gm = GroupManager(groups_mal)
+        gm.validate_configuration(n_items)
+    except ValueError as e:
+        print(f"  Error capturado correctamente: {e}")
+    
+    # CASO 2: Índices fuera de rango (ERROR)
+    print("\n❌ CASO 2: Índices fuera de rango")
+    try:
+        groups_mal = [
+            IndexGroup("Grupo A", [1, 2, 15], [0, 90])  # 15 está fuera de rango
+        ]
+        gm = GroupManager(groups_mal)
+        gm.validate_configuration(n_items)
+    except ValueError as e:
+        print(f"  Error capturado correctamente: {e}")
+    
+    # CASO 3: Configuración correcta
+    print("\n✓ CASO 3: Configuración válida")
+    groups_ok = [
+        IndexGroup("Grupo A", [1, 2, 3], [0, 90]),
+        IndexGroup("Grupo B", [4, 5, 6], [0, 90, 180, 270])
+    ]
+    gm = GroupManager(groups_ok)
+    try:
+        gm.validate_configuration(n_items)
+        print("  Configuración validada correctamente")
+        
+        # Mostrar información
+        print("\n  Información de grupos:")
+        for i in range(n_items):
+            group = gm.get_group(i)
+            if group:
+                print(f"    Índice {i}: {group.name} (ángulos: {group.allowed_angles})")
+            else:
+                print(f"    Índice {i}: Sin grupo (ángulos por defecto)")
+    except ValueError as e:
+        print(f"  Error inesperado: {e}")
+
+
+# ============================================================================
+# EJEMPLO 6: COMPARACIÓN CON Y SIN GRUPOS
+# ============================================================================
+
+def ejemplo_6_comparacion():
+    """Comparar resultados con y sin grupos"""
+    print("\n" + "="*70)
+    print("EJEMPLO 6: Comparación Con y Sin Grupos")
+    print("="*70)
+    
+    n_items = 12
+    
+    def evaluador(indices, angles):
+        optimal = list(range(len(indices)))
+        fitness = sum(1 for i, j in zip(indices, optimal) if i != j)
+        return fitness
+    
+    # SIN GRUPOS
+    print("\n🔹 Ejecutando SIN grupos...")
+    best_sin, hist_sin, _ = evolutionary_algorithm_with_groups(
+        evaluate_function=evaluador,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        group_manager=None,
+        population_size=50,
+        max_generations=100,
+        verbose=False
+    )
+    
+    # CON GRUPOS
+    print("\n🔹 Ejecutando CON grupos...")
+    groups = [
+        IndexGroup("Grupo A", [4, 7, 8], [0, 90]),
+        IndexGroup("Grupo B", [1, 6], [0, 90, 180, 270])
+    ]
+    gm = GroupManager(groups)
+    
+    best_con, hist_con, _ = evolutionary_algorithm_with_groups(
+        evaluate_function=evaluador,
+        n_items=n_items,
+        allowed_angles=[0, 90, 180, 270],
+        group_manager=gm,
+        population_size=50,
+        max_generations=100,
+        verbose=False
+    )
+    
+    print("\n📊 Comparación de resultados:")
+    print(f"  Sin grupos:")
+    print(f"    Fitness final: {best_sin.fitness}")
+    print(f"    Generaciones: {len(hist_sin)}")
+    
+    print(f"  Con grupos:")
+    print(f"    Fitness final: {best_con.fitness}")
+    print(f"    Generaciones: {len(hist_con)}")
+    
+    # Ventajas de usar grupos
+    print(f"\n💡 Ventajas de usar grupos:")
+    print(f"  • Soluciones respetan restricciones del problema")
+    print(f"  • Búsqueda más eficiente (no explora soluciones inválidas)")
+    print(f"  • Convergencia puede ser más rápida")
+
+
+# ============================================================================
+# EJECUTAR TODOS LOS EJEMPLOS
+# ============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "🎯"*35)
+    print(" "*20 + "EJEMPLOS PRÁCTICOS")
+    print("🎯"*35 + "\n")
+    
+    # Selecciona qué ejemplos ejecutar
+    ejemplos = [
+        (ejemplo_1_basico, "Uso Básico"),
+        (ejemplo_2_resultado_detallado, "Resultado Detallado"),
+        (ejemplo_3_grupos_simples, "Grupos Simples"),
+        (ejemplo_4_empaquetado_realista, "Empaquetado Realista"),
+        (ejemplo_5_validacion, "Validación"),
+        (ejemplo_6_comparacion, "Comparación")
+    ]
+    
+    print("Selecciona ejemplos a ejecutar:")
+    for i, (func, nombre) in enumerate(ejemplos, 1):
+        print(f"  {i}. {nombre}")
+    print("  0. Ejecutar todos")
+    
+    try:
+        seleccion = input("\nIngresa número(s) separados por coma (ej: 1,3,5) o 0 para todos: ")
+        
+        if seleccion.strip() == "0":
+            indices = range(len(ejemplos))
+        else:
+            indices = [int(x.strip()) - 1 for x in seleccion.split(",")]
+        
+        for idx in indices:
+            if 0 <= idx < len(ejemplos):
+                func, nombre = ejemplos[idx]
+                print(f"\n{'='*70}")
+                print(f"Ejecutando: {nombre}")
+                print(f"{'='*70}")
+                func()
+            else:
+                print(f"⚠ Índice {idx+1} no válido, omitiendo...")
+        
+        print("\n" + "🎉"*35)
+        print(" "*15 + "EJEMPLOS COMPLETADOS")
+        print("🎉"*35 + "\n")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠ Ejecución interrumpida por el usuario")
+    except Exception as e:
+        print(f"\n\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
