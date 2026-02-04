@@ -1,0 +1,109 @@
+import torch
+import torch.fft
+import time
+
+class CascadaCorrelacion:
+    def __init__(self, size_canvas, device='cuda'):
+        """
+        Inicializa el acumulador en el dominio de la frecuencia.
+        
+        Args:
+            size_canvas (tuple): (H, W) Tamaño TOTAL del espacio de trabajo.
+                                 Debe ser suficientemente grande para evitar
+                                 efecto circular si se acumulan muchas máscaras.
+            device (str): 'cuda' o 'cpu'.
+        """
+        self.device = device
+        self.h, self.w = size_canvas
+        self.acumulador_freq = None # Aquí guardamos el estado actual en Frecuencia
+        self.inicializado = False
+
+    def agregar_imagen(self, img_tensor, es_referencia=False):
+        """
+        Multiplica la nueva imagen al resultado acumulado anterior.
+        
+        Args:
+            img_tensor (Tensor): Imagen binaria (1, H_img, W_img).
+            es_referencia (bool): 
+                - True: Es la imagen base (se usa FFT normal).
+                - False: Es una máscara/filtro (se usa FFT Conjugada para correlación).
+        """
+        # 1. Preparar tensor
+        img = img_tensor.to(self.device).float()
+        
+        # 2. Calcular FFT de la nueva imagen
+        # Usamos el tamaño del canvas definido al inicio para el padding automático
+        fft_nueva = torch.fft.rfft2(img, s=(self.h, self.w))
+        
+        # 3. Lógica de Correlación:
+        # Si es filtro/máscara a buscar, usamos el CONJUGADO.
+        # Si es la imagen base, usamos la FFT normal.
+        if not es_referencia:
+            fft_nueva = torch.conj(fft_nueva)
+            
+        # 4. Acumulación (Multiplicación en Frecuencia)
+        if not self.inicializado:
+            self.acumulador_freq = fft_nueva
+            self.inicializado = True
+        else:
+            # Aquí es donde el "resultado anterior" se multiplica por el nuevo
+            # Sin salir de la GPU ni hacer IFFT
+            self.acumulador_freq *= fft_nueva
+
+    def obtener_resultado(self):
+        """
+        Realiza la IFFT única para obtener el mapa espacial final.
+        """
+        if self.acumulador_freq is None:
+            return None
+            
+        # Solo aquí volvemos al dominio del tiempo/espacio
+        resultado = torch.fft.irfft2(self.acumulador_freq, s=(self.h, self.w))
+        
+        # Centrar el resultado (opcional, para visualización más clara)
+        resultado = torch.fft.fftshift(resultado)
+        return resultado
+
+# --- EJEMPLO DE USO ---
+
+if __name__ == "__main__":
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # 1. Definir un Canvas grande
+    # Al multiplicar muchas imágenes, el área de activación se puede mover.
+    # Usamos un tamaño seguro (ej. 1024x1024 o 2048x2048)
+    CANVAS_SIZE = (1024, 1024)
+    
+    # Inicializar la cascada
+    proceso = CascadaCorrelacion(CANVAS_SIZE, device=device)
+    
+    # Simulación de imágenes (tensores binarios)
+    # Supongamos:
+    # img1: Imagen base
+    # img2: Un patrón a buscar
+    # img3: Un segundo filtro que refina el resultado del anterior
+    img1 = torch.randn(1, 500, 500) > 0  # Imagen base
+    img2 = torch.randn(1, 100, 100) > 0  # Máscara 1
+    img3 = torch.randn(1, 50, 50) > 0    # Máscara 2 (refinamiento)
+    
+    print("Iniciando proceso en cascada...")
+    start = time.time()
+    
+    # PASO 1: Agregar imagen base (Referencia=True)
+    proceso.agregar_imagen(img1, es_referencia=True)
+    
+    # PASO 2: Correlacionar con máscara 1 (El resultado queda en memoria de frecuencia)
+    proceso.agregar_imagen(img2, es_referencia=False)
+    
+    # PASO 3: Correlacionar el resultado anterior con máscara 2
+    proceso.agregar_imagen(img3, es_referencia=False)
+    
+    # PASO FINAL: Materializar resultado
+    mapa_final = proceso.obtener_resultado()
+    
+    if device == 'cuda': torch.cuda.synchronize()
+    end = time.time()
+    
+    print(f"Tiempo total de la cadena: {(end-start)*1000:.4f} ms")
+    print(f"Shape final: {mapa_final.shape}")
+    print(f"Valor máximo acumulado: {torch.max(mapa_final):.2f}")
