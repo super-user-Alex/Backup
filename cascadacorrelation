@@ -1,109 +1,530 @@
+import os
 import torch
-import torch.fft
-import time
+import numpy as np
+from PIL import Image
+from typing import List, Tuple, Optional
+import itertools
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing as mp
 
-class CascadaCorrelacion:
-    def __init__(self, size_canvas, device='cuda'):
-        """
-        Inicializa el acumulador en el dominio de la frecuencia.
-        
-        Args:
-            size_canvas (tuple): (H, W) Tamaño TOTAL del espacio de trabajo.
-                                 Debe ser suficientemente grande para evitar
-                                 efecto circular si se acumulan muchas máscaras.
-            device (str): 'cuda' o 'cpu'.
-        """
-        self.device = device
-        self.h, self.w = size_canvas
-        self.acumulador_freq = None # Aquí guardamos el estado actual en Frecuencia
-        self.inicializado = False
+def read_binary_images(folder: str) -> List[torch.Tensor]:
+    """Lee imágenes binarias y las convierte a tensores"""
+    files = sorted(os.listdir(folder))
+    polygons = []
 
-    def agregar_imagen(self, img_tensor, es_referencia=False):
-        """
-        Multiplica la nueva imagen al resultado acumulado anterior.
+    for f in files:
+        if not f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+            continue
+        img = Image.open(os.path.join(folder, f)).convert("L")
+        arr = np.array(img, dtype=np.uint8)
+        mask = (arr > 127).astype(np.float32)
+        polygons.append(torch.from_numpy(mask))
+
+    return polygons
+
+def init_container(h: int, w: int, device="cpu") -> torch.Tensor:
+    """Inicializa contenedor vacío"""
+    return torch.zeros((h, w), dtype=torch.float32, device=device)
+
+def grow_container(container: torch.Tensor, new_w: int) -> torch.Tensor:
+    """Expande el contenedor horizontalmente si es necesario"""
+    h, w = container.shape
+    if new_w <= w:
+        return container
+    return torch.nn.functional.pad(container, (0, new_w - w, 0, 0))
+
+def fft_collision_check(container: torch.Tensor,
+                        polygon: torch.Tensor) -> torch.Tensor:
+    """
+    Usa FFT para calcular correlación y detectar colisiones.
+    """
+    h, w = container.shape
+    ph, pw = polygon.shape
+    device = container.device
+
+    fft_h = h + ph - 1
+    fft_w = w + pw - 1
+    
+    opt_h = 2 ** int(np.ceil(np.log2(fft_h)))
+    opt_w = 2 ** int(np.ceil(np.log2(fft_w)))
+
+    cont_pad = torch.zeros((opt_h, opt_w), device=device, dtype=torch.float32)
+    cont_pad[:h, :w] = container
+
+    poly_flip = torch.flip(polygon, (0, 1))
+    poly_pad = torch.zeros((opt_h, opt_w), device=device, dtype=torch.float32)
+    poly_pad[:ph, :pw] = poly_flip
+
+    F_cont = torch.fft.rfft2(cont_pad)
+    F_poly = torch.fft.rfft2(poly_pad)
+    
+    correlation_full = torch.fft.irfft2(F_cont * F_poly, s=(opt_h, opt_w))
+    valid_correlation = correlation_full[ph-1:h, pw-1:w]
+    
+    return valid_correlation
+
+
+def get_valid_positions(collision_map: torch.Tensor, 
+                        eps: float = 1e-4) -> torch.Tensor:
+    """Convierte el mapa de colisión en máscara booleana"""
+    return collision_map.abs() < eps
+
+
+def select_bottom_left(valid_mask: torch.Tensor) -> Tuple[int, int]:
+    """Selección Bottom-Left"""
+    ys, xs = torch.where(valid_mask)
+
+    if xs.numel() == 0:
+        raise RuntimeError("No hay posiciones válidas")
+
+    min_x = xs.min().item()
+    mask_min_x = xs == min_x
+    ys_at_min_x = ys[mask_min_x]
+    max_y = ys_at_min_x.max().item()
+
+    return int(min_x), int(max_y)
+
+
+def place_polygon(container: torch.Tensor,
+                  polygon: torch.Tensor,
+                  x: int,
+                  y: int) -> torch.Tensor:
+    """Coloca el polígono verificando colisión"""
+    ph, pw = polygon.shape
+    
+    if y + ph > container.shape[0] or x + pw > container.shape[1]:
+        raise ValueError(f"Polígono no cabe en posición ({x}, {y})")
+    
+    region = container[y:y+ph, x:x+pw]
+    overlap = (region * polygon).sum()
+    
+    if overlap > 1e-4:
+        raise ValueError(f"Colisión detectada en ({x}, {y})! Overlap: {overlap.item()}")
+    
+    container[y:y+ph, x:x+pw] = torch.maximum(
+        container[y:y+ph, x:x+pw],
+        polygon
+    )
+    
+    return container
+
+
+def raster_nesting_single(polygons: List[torch.Tensor],
+                          h: int,
+                          w_init: int,
+                          device: str = "cpu",
+                          collision_eps: float = 1e-4,
+                          sequence_id: int = 0,
+                          verbose: bool = True) -> Tuple[torch.Tensor, List[Tuple[int, int]], float]:
+    """
+    Ejecuta un único proceso de nesting.
+    Retorna: (container, placements, efficiency)
+    """
+    container = init_container(h, w_init, device)
+    placements = []
+
+    for idx, poly in enumerate(polygons):
+        poly = poly.to(device)
+        ph, pw = poly.shape
+
+        if ph > h:
+            raise ValueError(f"Polígono {idx} más alto ({ph}) que el contenedor ({h})")
+
+        min_width = max(container.shape[1], pw)
+        container = grow_container(container, min_width)
+
+        placed = False
+        attempts = 0
+        max_attempts = 50
         
-        Args:
-            img_tensor (Tensor): Imagen binaria (1, H_img, W_img).
-            es_referencia (bool): 
-                - True: Es la imagen base (se usa FFT normal).
-                - False: Es una máscara/filtro (se usa FFT Conjugada para correlación).
-        """
-        # 1. Preparar tensor
-        img = img_tensor.to(self.device).float()
-        
-        # 2. Calcular FFT de la nueva imagen
-        # Usamos el tamaño del canvas definido al inicio para el padding automático
-        fft_nueva = torch.fft.rfft2(img, s=(self.h, self.w))
-        
-        # 3. Lógica de Correlación:
-        # Si es filtro/máscara a buscar, usamos el CONJUGADO.
-        # Si es la imagen base, usamos la FFT normal.
-        if not es_referencia:
-            fft_nueva = torch.conj(fft_nueva)
+        while not placed and attempts < max_attempts:
+            attempts += 1
             
-        # 4. Acumulación (Multiplicación en Frecuencia)
-        if not self.inicializado:
-            self.acumulador_freq = fft_nueva
-            self.inicializado = True
-        else:
-            # Aquí es donde el "resultado anterior" se multiplica por el nuevo
-            # Sin salir de la GPU ni hacer IFFT
-            self.acumulador_freq *= fft_nueva
+            collision_map = fft_collision_check(container, poly)
+            valid_mask = get_valid_positions(collision_map, eps=collision_eps)
 
-    def obtener_resultado(self):
-        """
-        Realiza la IFFT única para obtener el mapa espacial final.
-        """
-        if self.acumulador_freq is None:
-            return None
-            
-        # Solo aquí volvemos al dominio del tiempo/espacio
-        resultado = torch.fft.irfft2(self.acumulador_freq, s=(self.h, self.w))
+            if valid_mask.any():
+                x, y = select_bottom_left(valid_mask)
+                
+                region = container[y:y+ph, x:x+pw]
+                overlap_check = (region * poly).sum().item()
+                
+                if overlap_check > collision_eps:
+                    valid_mask[y, x] = False
+                    if valid_mask.any():
+                        x, y = select_bottom_left(valid_mask)
+                    else:
+                        growth = max(pw, container.shape[1] // 2)
+                        new_width = container.shape[1] + growth
+                        container = grow_container(container, new_width)
+                        continue
+                
+                container = place_polygon(container, poly, x, y)
+                placements.append((x, y))
+                placed = True
+                
+                if verbose:
+                    print(f"[Seq {sequence_id}] Polígono {idx}: colocado en ({x:3d}, {y:3d})")
+            else:
+                growth = max(pw, container.shape[1] // 2)
+                new_width = container.shape[1] + growth
+                container = grow_container(container, new_width)
+
+        if not placed:
+            raise RuntimeError(f"No se pudo colocar polígono {idx}")
+
+    # Recortar al ancho necesario
+    if placements:
+        max_x = max(x + polygons[i].shape[1] for i, (x, y) in enumerate(placements))
+        container = container[:, :max_x]
+
+    # Calcular eficiencia
+    container_area = container.shape[0] * container.shape[1]
+    used_area = container.sum().item()
+    efficiency = (used_area / container_area) * 100
+
+    return container, placements, efficiency
+
+
+# ==================== ESTRATEGIA 1: Multi-GPU (Paralelo Real) ====================
+
+def run_parallel_gpu(polygons_sequences: List[List[torch.Tensor]],
+                     h: int,
+                     w_init: int,
+                     devices: List[str],
+                     collision_eps: float = 1e-4) -> List[Tuple[torch.Tensor, List[Tuple[int, int]], float]]:
+    """
+    Ejecuta múltiples secuencias en paralelo usando diferentes GPUs.
+    Cada secuencia se ejecuta en una GPU diferente.
+    
+    Args:
+        polygons_sequences: Lista de secuencias de polígonos
+        h: Altura del contenedor
+        w_init: Ancho inicial
+        devices: Lista de dispositivos ['cuda:0', 'cuda:1', ...]
+        collision_eps: Threshold de colisión
+    
+    Returns:
+        Lista de (container, placements, efficiency) para cada secuencia
+    """
+    print(f"\n{'='*60}")
+    print(f"MODO: Multi-GPU Paralelo")
+    print(f"Secuencias: {len(polygons_sequences)}")
+    print(f"Dispositivos: {devices}")
+    print(f"{'='*60}\n")
+    
+    results = []
+    
+    # Usar ThreadPoolExecutor para ejecutar en paralelo
+    # (threads funcionan bien porque cada uno usa una GPU diferente)
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        futures = []
         
-        # Centrar el resultado (opcional, para visualización más clara)
-        resultado = torch.fft.fftshift(resultado)
-        return resultado
+        for seq_id, (polygons, device) in enumerate(zip(polygons_sequences, devices)):
+            future = executor.submit(
+                raster_nesting_single,
+                polygons, h, w_init, device, collision_eps, seq_id, True
+            )
+            futures.append(future)
+        
+        # Recopilar resultados
+        for future in futures:
+            results.append(future.result())
+    
+    return results
 
-# --- EJEMPLO DE USO ---
+
+# ==================== ESTRATEGIA 2: GPU Streams (Misma GPU, Concurrente) ====================
+
+def run_parallel_streams(polygons_sequences: List[List[torch.Tensor]],
+                        h: int,
+                        w_init: int,
+                        device: str = 'cuda:0',
+                        collision_eps: float = 1e-4) -> List[Tuple[torch.Tensor, List[Tuple[int, int]], float]]:
+    """
+    Ejecuta múltiples secuencias en la misma GPU usando CUDA streams.
+    Esto permite solapamiento de operaciones.
+    
+    NOTA: Esto es más complejo y requiere gestión manual de streams.
+    Útil cuando tienes 1 GPU potente.
+    """
+    print(f"\n{'='*60}")
+    print(f"MODO: Single-GPU con Streams")
+    print(f"Secuencias: {len(polygons_sequences)}")
+    print(f"Dispositivo: {device}")
+    print(f"{'='*60}\n")
+    
+    # Crear un stream por secuencia
+    streams = [torch.cuda.Stream(device=device) for _ in polygons_sequences]
+    results = [None] * len(polygons_sequences)
+    
+    # Ejecutar cada secuencia en su stream
+    for seq_id, (polygons, stream) in enumerate(zip(polygons_sequences, streams)):
+        with torch.cuda.stream(stream):
+            results[seq_id] = raster_nesting_single(
+                polygons, h, w_init, device, collision_eps, seq_id, False
+            )
+    
+    # Sincronizar todos los streams
+    torch.cuda.synchronize(device)
+    
+    return results
+
+
+# ==================== ESTRATEGIA 3: Batching Inteligente (Menor Memoria) ====================
+
+def run_sequential_batched(polygons_sequences: List[List[torch.Tensor]],
+                           h: int,
+                           w_init: int,
+                           device: str = 'cuda:0',
+                           batch_size: int = 2,
+                           collision_eps: float = 1e-4) -> List[Tuple[torch.Tensor, List[Tuple[int, int]], float]]:
+    """
+    Ejecuta secuencias en batches para controlar el uso de memoria.
+    Procesa batch_size secuencias a la vez, luego libera memoria.
+    
+    Args:
+        polygons_sequences: Lista de secuencias
+        h, w_init: Parámetros del contenedor
+        device: GPU a usar
+        batch_size: Número de secuencias a procesar simultáneamente
+        collision_eps: Threshold de colisión
+    
+    Returns:
+        Lista de resultados
+    """
+    print(f"\n{'='*60}")
+    print(f"MODO: Batching Secuencial")
+    print(f"Secuencias totales: {len(polygons_sequences)}")
+    print(f"Batch size: {batch_size}")
+    print(f"Dispositivo: {device}")
+    print(f"{'='*60}\n")
+    
+    all_results = []
+    
+    # Procesar en batches
+    for batch_start in range(0, len(polygons_sequences), batch_size):
+        batch_end = min(batch_start + batch_size, len(polygons_sequences))
+        batch = polygons_sequences[batch_start:batch_end]
+        
+        print(f"\nProcesando batch {batch_start//batch_size + 1} "
+              f"(secuencias {batch_start} a {batch_end-1})...")
+        
+        # Ejecutar batch en paralelo con threads
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = []
+            for seq_id, polygons in enumerate(batch, start=batch_start):
+                future = executor.submit(
+                    raster_nesting_single,
+                    polygons, h, w_init, device, collision_eps, seq_id, True
+                )
+                futures.append(future)
+            
+            # Recopilar resultados del batch
+            for future in futures:
+                all_results.append(future.result())
+        
+        # Liberar memoria GPU
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+    
+    return all_results
+
+
+# ==================== GENERADOR DE PERMUTACIONES ====================
+
+def generate_polygon_sequences(polygons: List[torch.Tensor], 
+                               num_sequences: int,
+                               strategy: str = 'random') -> List[List[torch.Tensor]]:
+    """
+    Genera múltiples secuencias de polígonos.
+    
+    Args:
+        polygons: Lista original de polígonos
+        num_sequences: Número de secuencias a generar
+        strategy: 'random', 'all_permutations', 'heuristic'
+    
+    Returns:
+        Lista de secuencias
+    """
+    sequences = []
+    
+    if strategy == 'random':
+        # Generar permutaciones aleatorias
+        np.random.seed(42)
+        for i in range(num_sequences):
+            indices = np.random.permutation(len(polygons))
+            sequences.append([polygons[idx] for idx in indices])
+    
+    elif strategy == 'all_permutations':
+        # Generar todas las permutaciones (¡cuidado con el número!)
+        if len(polygons) > 8:
+            print(f"ADVERTENCIA: {len(polygons)} polígonos generarán "
+                  f"{np.math.factorial(len(polygons))} permutaciones!")
+            return []
+        
+        for perm in itertools.permutations(polygons):
+            sequences.append(list(perm))
+            if len(sequences) >= num_sequences:
+                break
+    
+    elif strategy == 'heuristic':
+        # Estrategias heurísticas
+        heuristics = [
+            # Original
+            polygons.copy(),
+            # Ordenar por área (descendente)
+            sorted(polygons, key=lambda p: p.sum(), reverse=True),
+            # Ordenar por ancho (descendente)
+            sorted(polygons, key=lambda p: p.shape[1], reverse=True),
+            # Ordenar por altura (descendente)
+            sorted(polygons, key=lambda p: p.shape[0], reverse=True),
+            # Ordenar por perímetro
+            sorted(polygons, key=lambda p: p.shape[0] + p.shape[1], reverse=True),
+            # Reverso
+            polygons[::-1],
+        ]
+        
+        # Añadir algunas permutaciones aleatorias
+        np.random.seed(42)
+        for i in range(num_sequences - len(heuristics)):
+            indices = np.random.permutation(len(polygons))
+            heuristics.append([polygons[idx] for idx in indices])
+        
+        sequences = heuristics[:num_sequences]
+    
+    return sequences
+
+
+# ==================== UTILIDADES ====================
+
+def find_best_result(results: List[Tuple[torch.Tensor, List[Tuple[int, int]], float]]) -> Tuple[int, Tuple]:
+    """
+    Encuentra el mejor resultado (mayor eficiencia).
+    
+    Returns:
+        (índice, resultado)
+    """
+    best_idx = 0
+    best_efficiency = results[0][2]
+    
+    for idx, (container, placements, efficiency) in enumerate(results):
+        if efficiency > best_efficiency:
+            best_efficiency = efficiency
+            best_idx = idx
+    
+    return best_idx, results[best_idx]
+
+
+def save_container(container: torch.Tensor, path: str):
+    """Guarda el contenedor como imagen"""
+    img = (container.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    Image.fromarray(img, mode='L').save(path)
+
+
+def visualize_placements(container: torch.Tensor, 
+                        polygons: List[torch.Tensor],
+                        placements: List[Tuple[int, int]],
+                        path: str):
+    """Crea visualización con colores diferentes"""
+    h, w = container.shape
+    result = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    np.random.seed(42)
+    colors = []
+    for i in range(len(polygons)):
+        hue = (i * 137.508) % 360
+        color = np.array([
+            int(255 * (0.5 + 0.5 * np.cos(np.radians(hue)))),
+            int(255 * (0.5 + 0.5 * np.cos(np.radians(hue + 120)))),
+            int(255 * (0.5 + 0.5 * np.cos(np.radians(hue + 240))))
+        ], dtype=np.uint8)
+        colors.append(tuple(color))
+    
+    for idx, (poly, (x, y)) in enumerate(zip(polygons, placements)):
+        ph, pw = poly.shape
+        color = colors[idx]
+        poly_cpu = poly.cpu()
+        mask = poly_cpu.numpy() > 0.5
+        
+        for c in range(3):
+            result[y:y+ph, x:x+pw, c][mask] = color[c]
+    
+    Image.fromarray(result).save(path)
+
+
+# ==================== MAIN ====================
+
+def main():
+    # Configuración
+    path = r'D:\Alex\Trabajo\images'
+    output_folder = os.path.join(path, 'resultados')
+    os.makedirs(output_folder, exist_ok=True)
+    
+    height = 100
+    width = 100
+    num_sequences = 10  # Número de secuencias a probar
+    
+    # Detectar GPUs disponibles
+    num_gpus = torch.cuda.device_count()
+    print(f"GPUs disponibles: {num_gpus}")
+    
+    # Cargar polígonos
+    polygons = read_binary_images(path)
+    print(f"\nPolígonos cargados: {len(polygons)}")
+    
+    # Generar secuencias
+    print(f"\nGenerando {num_sequences} secuencias...")
+    sequences = generate_polygon_sequences(polygons, num_sequences, strategy='heuristic')
+    
+    # ELEGIR ESTRATEGIA
+    # Opción 1: Multi-GPU (si tienes varias GPUs)
+    if num_gpus > 1:
+        devices = [f'cuda:{i}' for i in range(min(num_gpus, len(sequences)))]
+        results = run_parallel_gpu(sequences[:len(devices)], height, width, devices)
+    
+    # Opción 2: Single GPU con batching (recomendado para 1 GPU)
+    elif num_gpus == 1:
+        results = run_sequential_batched(
+            sequences, height, width, 
+            device='cuda:0', 
+            batch_size=2  # Ajustar según memoria disponible
+        )
+    
+    # Opción 3: CPU (si no hay GPU)
+    else:
+        results = run_sequential_batched(
+            sequences, height, width, 
+            device='cpu', 
+            batch_size=4
+        )
+    
+    # Encontrar mejor resultado
+    print(f"\n{'='*60}")
+    print("ANÁLISIS DE RESULTADOS")
+    print(f"{'='*60}")
+    
+    for idx, (container, placements, efficiency) in enumerate(results):
+        print(f"Secuencia {idx}: "
+              f"Ancho={container.shape[1]}, "
+              f"Eficiencia={efficiency:.2f}%")
+    
+    best_idx, (best_container, best_placements, best_efficiency) = find_best_result(results)
+    
+    print(f"\n{'='*60}")
+    print(f"MEJOR RESULTADO: Secuencia {best_idx}")
+    print(f"Eficiencia: {best_efficiency:.2f}%")
+    print(f"Dimensiones: {best_container.shape[1]} x {best_container.shape[0]}")
+    print(f"{'='*60}\n")
+    
+    # Guardar mejor resultado
+    best_sequence = sequences[best_idx]
+    save_container(best_container, os.path.join(output_folder, 'mejor_contenedor.png'))
+    visualize_placements(best_container, best_sequence, best_placements, 
+                        os.path.join(output_folder, 'mejor_contenedor_color.png'))
+    
+    print(f"Resultados guardados en: {output_folder}")
+
 
 if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # 1. Definir un Canvas grande
-    # Al multiplicar muchas imágenes, el área de activación se puede mover.
-    # Usamos un tamaño seguro (ej. 1024x1024 o 2048x2048)
-    CANVAS_SIZE = (1024, 1024)
-    
-    # Inicializar la cascada
-    proceso = CascadaCorrelacion(CANVAS_SIZE, device=device)
-    
-    # Simulación de imágenes (tensores binarios)
-    # Supongamos:
-    # img1: Imagen base
-    # img2: Un patrón a buscar
-    # img3: Un segundo filtro que refina el resultado del anterior
-    img1 = torch.randn(1, 500, 500) > 0  # Imagen base
-    img2 = torch.randn(1, 100, 100) > 0  # Máscara 1
-    img3 = torch.randn(1, 50, 50) > 0    # Máscara 2 (refinamiento)
-    
-    print("Iniciando proceso en cascada...")
-    start = time.time()
-    
-    # PASO 1: Agregar imagen base (Referencia=True)
-    proceso.agregar_imagen(img1, es_referencia=True)
-    
-    # PASO 2: Correlacionar con máscara 1 (El resultado queda en memoria de frecuencia)
-    proceso.agregar_imagen(img2, es_referencia=False)
-    
-    # PASO 3: Correlacionar el resultado anterior con máscara 2
-    proceso.agregar_imagen(img3, es_referencia=False)
-    
-    # PASO FINAL: Materializar resultado
-    mapa_final = proceso.obtener_resultado()
-    
-    if device == 'cuda': torch.cuda.synchronize()
-    end = time.time()
-    
-    print(f"Tiempo total de la cadena: {(end-start)*1000:.4f} ms")
-    print(f"Shape final: {mapa_final.shape}")
-    print(f"Valor máximo acumulado: {torch.max(mapa_final):.2f}")
+    main()
