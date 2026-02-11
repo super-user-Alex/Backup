@@ -1,0 +1,269 @@
+import fitz  # PyMuPDF
+import numpy as np
+from collections import defaultdict
+from shapely.geometry import Polygon, MultiPolygon, box
+from shapely.ops import unary_union
+import copy
+
+class VectorObjectExtractor:
+    def __init__(self, pdf_path, tolerance=2.0):
+        """
+        Args:
+            pdf_path: Ruta al PDF
+            tolerance: Distancia máxima para considerar primitivas como conectadas
+        """
+        self.doc = fitz.open(pdf_path)
+        self.tolerance = tolerance
+    
+    def extract_drawings_from_page(self, page_num=0):
+        """Extrae todos los drawings de una página"""
+        page = self.doc[page_num]
+        drawings = page.get_drawings()
+        return page, drawings
+    
+    def get_drawing_bounds(self, drawing):
+        """Calcula el bounding box de un drawing"""
+        points = []
+        
+        for item in drawing.get("items", []):
+            if item[0] == "l":  # línea
+                points.extend([item[1], item[2]])
+            elif item[0] == "c":  # curva bézier
+                points.extend([item[1], item[2], item[3], item[4]])
+            elif item[0] == "re":  # rectángulo
+                x, y, w, h = item[1:]
+                points.extend([
+                    fitz.Point(x, y),
+                    fitz.Point(x + w, y),
+                    fitz.Point(x, y + h),
+                    fitz.Point(x + w, y + h)
+                ])
+        
+        if not points:
+            return None
+        
+        xs = [p.x for p in points]
+        ys = [p.y for p in points]
+        
+        return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+    
+    def drawings_are_connected(self, draw1, draw2):
+        """
+        Determina si dos drawings están conectados espacialmente
+        """
+        rect1 = self.get_drawing_bounds(draw1)
+        rect2 = self.get_drawing_bounds(draw2)
+        
+        if not rect1 or not rect2:
+            return False
+        
+        # Expandir rectángulos con la tolerancia
+        expanded_rect1 = fitz.Rect(
+            rect1.x0 - self.tolerance,
+            rect1.y0 - self.tolerance,
+            rect1.x1 + self.tolerance,
+            rect1.y1 + self.tolerance
+        )
+        
+        # Verificar si los rectángulos expandidos se intersectan
+        return expanded_rect1.intersects(rect2)
+    
+    def is_white_background(self, drawing):
+        """
+        Detecta si un drawing es parte del fondo blanco
+        """
+        # Verificar color de relleno
+        fill = drawing.get("fill")
+        if fill:
+            # CMYK: blanco es (0, 0, 0, 0) o muy cercano
+            # RGB: blanco es (1, 1, 1) o muy cercano
+            if isinstance(fill, (list, tuple)):
+                if len(fill) == 4:  # CMYK
+                    return all(c < 0.05 for c in fill)
+                elif len(fill) == 3:  # RGB
+                    return all(c > 0.95 for c in fill)
+        
+        return False
+    
+    def group_connected_drawings(self, drawings):
+        """
+        Agrupa drawings conectados usando un enfoque de Union-Find
+        """
+        n = len(drawings)
+        parent = list(range(n))
+        
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+        
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+        
+        # Filtrar fondos blancos
+        valid_drawings = []
+        valid_indices = []
+        
+        for i, drawing in enumerate(drawings):
+            if not self.is_white_background(drawing):
+                valid_drawings.append(drawing)
+                valid_indices.append(i)
+        
+        # Construir grafo de conectividad
+        for i in range(len(valid_drawings)):
+            for j in range(i + 1, len(valid_drawings)):
+                if self.drawings_are_connected(valid_drawings[i], valid_drawings[j]):
+                    union(i, j)
+        
+        # Agrupar por componente
+        groups = defaultdict(list)
+        for i, drawing in enumerate(valid_drawings):
+            root = find(i)
+            groups[root].append(drawing)
+        
+        return list(groups.values())
+    
+    def get_object_contour(self, drawings_group):
+        """
+        Calcula el contorno exterior de un grupo de drawings
+        """
+        polygons = []
+        
+        for drawing in drawings_group:
+            rect = self.get_drawing_bounds(drawing)
+            if rect:
+                # Convertir a polígono de Shapely
+                poly = box(rect.x0, rect.y0, rect.x1, rect.y1)
+                polygons.append(poly)
+        
+        if not polygons:
+            return None
+        
+        # Unir todos los polígonos
+        merged = unary_union(polygons)
+        
+        # Obtener el contorno exterior
+        if isinstance(merged, Polygon):
+            return list(merged.exterior.coords)
+        elif isinstance(merged, MultiPolygon):
+            # Si hay múltiples polígonos, tomar el de mayor área
+            largest = max(merged.geoms, key=lambda p: p.area)
+            return list(largest.exterior.coords)
+        
+        return None
+    
+    def extract_object_to_new_pdf(self, drawings_group, output_path):
+        """
+        Extrae un grupo de drawings a un nuevo PDF
+        """
+        # Calcular bounding box del grupo
+        all_rects = [self.get_drawing_bounds(d) for d in drawings_group]
+        all_rects = [r for r in all_rects if r]
+        
+        if not all_rects:
+            return None
+        
+        # Unir todos los bounding boxes
+        bbox = all_rects[0]
+        for rect in all_rects[1:]:
+            bbox |= rect  # Unión de rectángulos
+        
+        # Crear nuevo PDF
+        new_doc = fitz.open()
+        new_page = new_doc.new_page(width=bbox.width, height=bbox.height)
+        
+        # Aquí necesitarías recrear los paths en el nuevo PDF
+        # PyMuPDF no ofrece una forma directa de copiar drawings,
+        # pero puedes usar el stream de contenido original
+        
+        new_doc.save(output_path)
+        new_doc.close()
+        
+        return bbox
+    
+    def visualize_groups(self, page, groups, output_path):
+        """
+        Crea un PDF visualizando los grupos detectados con colores
+        """
+        colors = [
+            (1, 0, 0),    # Rojo
+            (0, 1, 0),    # Verde
+            (0, 0, 1),    # Azul
+            (1, 1, 0),    # Amarillo
+            (1, 0, 1),    # Magenta
+            (0, 1, 1),    # Cyan
+        ]
+        
+        # Crear copia del documento
+        temp_doc = fitz.open()
+        temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)
+        
+        # Dibujar cada grupo con un color diferente
+        for i, group in enumerate(groups):
+            color = colors[i % len(colors)]
+            
+            for drawing in group:
+                rect = self.get_drawing_bounds(drawing)
+                if rect:
+                    temp_page.draw_rect(rect, color=color, width=2)
+            
+            # Dibujar contorno
+            contour = self.get_object_contour(group)
+            if contour and len(contour) > 2:
+                for j in range(len(contour) - 1):
+                    p1 = fitz.Point(contour[j][0], contour[j][1])
+                    p2 = fitz.Point(contour[j+1][0], contour[j+1][1])
+                    temp_page.draw_line(p1, p2, color=color, width=3)
+        
+        temp_doc.save(output_path)
+        temp_doc.close()
+    
+    def process_page(self, page_num=0):
+        """
+        Procesa una página completa y retorna los objetos agrupados
+        """
+        page, drawings = self.extract_drawings_from_page(page_num)
+        
+        print(f"Total drawings encontrados: {len(drawings)}")
+        
+        # Agrupar drawings conectados
+        groups = self.group_connected_drawings(drawings)
+        
+        print(f"Objetos independientes detectados: {len(groups)}")
+        
+        results = []
+        for i, group in enumerate(groups):
+            contour = self.get_object_contour(group)
+            bbox = self.get_drawing_bounds(group[0]) if group else None
+            
+            results.append({
+                'id': i,
+                'drawings': group,
+                'contour': contour,
+                'bbox': bbox,
+                'num_primitives': len(group)
+            })
+        
+        return page, results
+
+
+# Ejemplo de uso
+if __name__ == "__main__":
+    # Inicializar extractor
+    extractor = VectorObjectExtractor("tu_archivo.pdf", tolerance=3.0)
+    
+    # Procesar página
+    page, objects = extractor.process_page(page_num=0)
+    
+    # Mostrar información
+    for obj in objects:
+        print(f"\nObjeto {obj['id']}:")
+        print(f"  - Primitivas: {obj['num_primitives']}")
+        print(f"  - BBox: {obj['bbox']}")
+        print(f"  - Puntos del contorno: {len(obj['contour']) if obj['contour'] else 0}")
+    
+    # Visualizar grupos
+    extractor.visualize_groups(page, [obj['drawings'] for obj in objects], 
+                               "grupos_visualizados.pdf
