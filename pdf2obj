@@ -1,3 +1,4 @@
+```python
 import fitz  # PyMuPDF
 import numpy as np
 from collections import defaultdict
@@ -6,14 +7,16 @@ from shapely.ops import unary_union
 import os
 
 class VectorObjectExtractor:
-    def __init__(self, pdf_path, tolerance=2.0):
+    def __init__(self, pdf_path, proximity_tolerance=1.0, containment_margin=2.0):
         """
         Args:
             pdf_path: Ruta al PDF
-            tolerance: Distancia máxima para considerar primitivas como conectadas
+            proximity_tolerance: Distancia máxima para considerar elementos como tocándose (0.5-2 pts)
+            containment_margin: Margen para detectar contención (permite pequeñas diferencias)
         """
         self.doc = fitz.open(pdf_path)
-        self.tolerance = tolerance
+        self.proximity_tolerance = proximity_tolerance
+        self.containment_margin = containment_margin
     
     def extract_drawings_from_page(self, page_num=0):
         """Extrae todos los drawings de una página"""
@@ -31,7 +34,7 @@ class VectorObjectExtractor:
             elif item[0] == "c":  # curva bézier
                 points.extend([item[1], item[2], item[3], item[4]])
             elif item[0] == "re":  # rectángulo
-                # CORRECCIÓN: item[1] es una tupla (x, y, w, h)
+                # item[1] es un objeto Rect
                 rect_data = item[1]
                 x, y, w, h = rect_data.x, rect_data.y, rect_data.width, rect_data.height
                 points.extend([
@@ -49,21 +52,74 @@ class VectorObjectExtractor:
         
         return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
     
-    def rect_contains_rect(self, outer, inner):
+    def rect_contains_rect(self, outer, inner, margin=None):
         """
         Verifica si outer contiene completamente a inner
+        
+        Args:
+            margin: Margen de tolerancia (permite que inner sea ligeramente más grande)
         """
         if not outer or not inner:
             return False
         
-        return (outer.x0 <= inner.x0 and 
-                outer.y0 <= inner.y0 and
-                outer.x1 >= inner.x1 and
-                outer.y1 >= inner.y1)
+        if margin is None:
+            margin = self.containment_margin
+        
+        # Inner debe estar dentro de outer (con margen de tolerancia)
+        return (outer.x0 - margin <= inner.x0 and 
+                outer.y0 - margin <= inner.y0 and
+                outer.x1 + margin >= inner.x1 and
+                outer.y1 + margin >= inner.y1)
+    
+    def rects_are_touching(self, rect1, rect2, tolerance=None):
+        """
+        Verifica si dos rectángulos se tocan o están muy cerca
+        
+        Args:
+            tolerance: Distancia máxima para considerar como "tocándose"
+        """
+        if not rect1 or not rect2:
+            return False
+        
+        if tolerance is None:
+            tolerance = self.proximity_tolerance
+        
+        # Calcular distancia mínima entre rectángulos
+        # Horizontal
+        if rect1.x1 < rect2.x0:  # rect1 está a la izquierda
+            dx = rect2.x0 - rect1.x1
+        elif rect2.x1 < rect1.x0:  # rect2 está a la izquierda
+            dx = rect1.x0 - rect2.x1
+        else:  # Se solapan horizontalmente
+            dx = 0
+        
+        # Vertical
+        if rect1.y1 < rect2.y0:  # rect1 está arriba
+            dy = rect2.y0 - rect1.y1
+        elif rect2.y1 < rect1.y0:  # rect2 está arriba
+            dy = rect1.y0 - rect2.y1
+        else:  # Se solapan verticalmente
+            dy = 0
+        
+        # Distancia euclidiana
+        distance = (dx**2 + dy**2)**0.5
+        
+        return distance <= tolerance
+    
+    def rects_overlap(self, rect1, rect2):
+        """Verifica si dos rectángulos se solapan"""
+        if not rect1 or not rect2:
+            return False
+        return rect1.intersects(rect2)
     
     def drawings_are_connected(self, draw1, draw2):
         """
-        Determina si dos drawings están conectados espacialmente o uno contiene al otro
+        Determina si dos drawings pertenecen al mismo objeto
+        
+        Criterios (en orden de prioridad):
+        1. Uno contiene al otro (jerarquía)
+        2. Se solapan parcialmente
+        3. Se tocan o están muy cerca
         """
         rect1 = self.get_drawing_bounds(draw1)
         rect2 = self.get_drawing_bounds(draw2)
@@ -71,20 +127,20 @@ class VectorObjectExtractor:
         if not rect1 or not rect2:
             return False
         
-        # Verificar contención jerárquica
-        if self.rect_contains_rect(rect1, rect2) or self.rect_contains_rect(rect2, rect1):
+        # Criterio 1: Contención jerárquica
+        if (self.rect_contains_rect(rect1, rect2) or 
+            self.rect_contains_rect(rect2, rect1)):
             return True
         
-        # Expandir rectángulos con la tolerancia para detectar proximidad
-        expanded_rect1 = fitz.Rect(
-            rect1.x0 - self.tolerance,
-            rect1.y0 - self.tolerance,
-            rect1.x1 + self.tolerance,
-            rect1.y1 + self.tolerance
-        )
+        # Criterio 2: Solapamiento
+        if self.rects_overlap(rect1, rect2):
+            return True
         
-        # Verificar si los rectángulos expandidos se intersectan
-        return expanded_rect1.intersects(rect2)
+        # Criterio 3: Proximidad (elementos que se tocan)
+        if self.rects_are_touching(rect1, rect2):
+            return True
+        
+        return False
     
     def is_white_background(self, drawing):
         """
@@ -103,7 +159,73 @@ class VectorObjectExtractor:
         
         return False
     
-    def group_connected_drawings(self, drawings):
+    def debug_connections(self, drawings):
+        """Muestra información detallada de las conexiones"""
+        valid_drawings = [d for d in drawings if not self.is_white_background(d)]
+        
+        print(f"\n{'='*70}")
+        print("DEBUG: Análisis de conexiones")
+        print(f"{'='*70}\n")
+        print(f"Drawings válidos analizados: {len(valid_drawings)}")
+        print(f"Proximity tolerance: {self.proximity_tolerance}")
+        print(f"Containment margin: {self.containment_margin}\n")
+        
+        connection_count = 0
+        
+        for i in range(len(valid_drawings)):
+            for j in range(i + 1, len(valid_drawings)):
+                rect1 = self.get_drawing_bounds(valid_drawings[i])
+                rect2 = self.get_drawing_bounds(valid_drawings[j])
+                
+                if not rect1 or not rect2:
+                    continue
+                
+                # Verificar cada criterio
+                contains_1_2 = self.rect_contains_rect(rect1, rect2)
+                contains_2_1 = self.rect_contains_rect(rect2, rect1)
+                contains = contains_1_2 or contains_2_1
+                overlaps = self.rects_overlap(rect1, rect2)
+                touching = self.rects_are_touching(rect1, rect2)
+                
+                if contains or overlaps or touching:
+                    connection_count += 1
+                    reasons = []
+                    if contains_1_2: reasons.append("RECT1 CONTIENE RECT2")
+                    if contains_2_1: reasons.append("RECT2 CONTIENE RECT1")
+                    if overlaps and not contains: reasons.append("SOLAPAMIENTO")
+                    if touching and not overlaps and not contains: reasons.append("PROXIMIDAD")
+                    
+                    print(f"Conexión #{connection_count}: Drawing {i} ↔ Drawing {j}")
+                    print(f"  Razón: {', '.join(reasons)}")
+                    print(f"  Rect1: ({rect1.x0:.1f}, {rect1.y0:.1f}) → ({rect1.x1:.1f}, {rect1.y1:.1f}) [w:{rect1.width:.1f} h:{rect1.height:.1f}]")
+                    print(f"  Rect2: ({rect2.x0:.1f}, {rect2.y0:.1f}) → ({rect2.x1:.1f}, {rect2.y1:.1f}) [w:{rect2.width:.1f} h:{rect2.height:.1f}]")
+                    
+                    if touching and not overlaps and not contains:
+                        # Calcular distancia exacta
+                        if rect1.x1 < rect2.x0:
+                            dx = rect2.x0 - rect1.x1
+                        elif rect2.x1 < rect1.x0:
+                            dx = rect1.x0 - rect2.x1
+                        else:
+                            dx = 0
+                        
+                        if rect1.y1 < rect2.y0:
+                            dy = rect2.y0 - rect1.y1
+                        elif rect2.y1 < rect1.y0:
+                            dy = rect1.y0 - rect2.y1
+                        else:
+                            dy = 0
+                        
+                        distance = (dx**2 + dy**2)**0.5
+                        print(f"  Distancia: dx={dx:.2f}, dy={dy:.2f}, total={distance:.2f} pts")
+                    
+                    print()
+        
+        print(f"{'='*70}")
+        print(f"Total de conexiones detectadas: {connection_count}")
+        print(f"{'='*70}\n")
+    
+    def group_connected_drawings(self, drawings, debug=False):
         """
         Agrupa drawings conectados usando un enfoque de Union-Find
         Incluye contención jerárquica
@@ -131,6 +253,10 @@ class VectorObjectExtractor:
                 valid_indices.append(i)
         
         print(f"Drawings válidos (sin fondo blanco): {len(valid_drawings)}")
+        
+        # Mostrar debug si se solicita
+        if debug:
+            self.debug_connections(drawings)
         
         # Construir grafo de conectividad (incluyendo contención)
         connections = 0
@@ -219,39 +345,14 @@ class VectorObjectExtractor:
         # Asegurar que no salga de los límites de la página
         crop_rect = crop_rect & page.rect
         
-        # Crear nuevo documento
-        new_doc = fitz.open()
-        
-        # Crear nueva página con el tamaño del recorte
-        new_page = new_doc.new_page(
-            width=crop_rect.width,
-            height=crop_rect.height
-        )
-        
-        # Estrategia: Copiar la página completa y luego recortar
-        # Esto preserva todos los vectores originales
-        
-        # Insertar la página original
-        new_page.show_pdf_page(
-            new_page.rect,  # Rectángulo destino
-            self.doc,       # Documento fuente
-            page.number,    # Número de página fuente
-            clip=crop_rect  # Área a copiar
-        )
-        
-        # Ajustar la posición (mover el contenido al origen)
-        # Esto se hace moviendo todo el contenido
-        matrix = fitz.Matrix(1, 0, 0, 1, -crop_rect.x0, -crop_rect.y0)
-        
-        # Aplicar transformación al contenido
-        # Necesitamos reconstruir la página con el offset
+        # Crear nuevo documento temporal
         temp_doc = fitz.open()
         temp_page = temp_doc.new_page(
             width=crop_rect.width,
             height=crop_rect.height
         )
         
-        # Mostrar con transformación
+        # Mostrar la página original recortada
         temp_page.show_pdf_page(
             fitz.Rect(0, 0, crop_rect.width, crop_rect.height),
             self.doc,
@@ -262,7 +363,6 @@ class VectorObjectExtractor:
         # Guardar
         temp_doc.save(output_path)
         temp_doc.close()
-        new_doc.close()
         
         print(f"✓ Exportado: {output_path} (bbox: {bbox})")
         return bbox
@@ -281,6 +381,9 @@ class VectorObjectExtractor:
             (0.5, 0, 0),  # Rojo oscuro
             (0, 0.5, 0),  # Verde oscuro
             (0, 0, 0.5),  # Azul oscuro
+            (1, 0.5, 0),  # Naranja
+            (0.5, 0, 0.5),# Púrpura
+            (0, 0.5, 0.5),# Teal
         ]
         
         # Crear copia del documento
@@ -294,11 +397,11 @@ class VectorObjectExtractor:
         for i, group in enumerate(groups):
             color = colors[i % len(colors)]
             
-            # Dibujar bounding boxes de cada drawing
+            # Dibujar bounding boxes de cada drawing individual
             for drawing in group:
                 rect = self.get_drawing_bounds(drawing)
                 if rect:
-                    temp_page.draw_rect(rect, color=color, width=1.5, fill_opacity=0.1)
+                    temp_page.draw_rect(rect, color=color, width=1.0, fill_opacity=0.05)
             
             # Dibujar bounding box del grupo completo
             group_bbox = self.get_group_bbox(group)
@@ -315,23 +418,34 @@ class VectorObjectExtractor:
             
             # Añadir etiqueta con número de objeto
             if group_bbox:
+                # Fondo blanco para la etiqueta
+                label_rect = fitz.Rect(
+                    group_bbox.x0 + 2,
+                    group_bbox.y0 + 2,
+                    group_bbox.x0 + 50,
+                    group_bbox.y0 + 18
+                )
+                temp_page.draw_rect(label_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                
                 temp_page.insert_text(
                     fitz.Point(group_bbox.x0 + 5, group_bbox.y0 + 15),
-                    f"Obj {i}",
-                    fontsize=12,
-                    color=color
+                    f"Obj {i} ({len(group)})",
+                    fontsize=10,
+                    color=color,
+                    fontname="helv"
                 )
         
         temp_doc.save(output_path)
         temp_doc.close()
     
-    def process_and_export(self, page_num=0, output_dir="extracted_objects"):
+    def process_and_export(self, page_num=0, output_dir="extracted_objects", debug=False):
         """
         Procesa una página, detecta objetos y exporta cada uno a un PDF individual
         
         Args:
             page_num: Número de página a procesar
             output_dir: Directorio donde guardar los PDFs individuales
+            debug: Si True, muestra información detallada de conexiones
         """
         # Crear directorio de salida
         os.makedirs(output_dir, exist_ok=True)
@@ -343,9 +457,12 @@ class VectorObjectExtractor:
         print(f"Procesando página {page_num}")
         print(f"{'='*60}")
         print(f"Total drawings encontrados: {len(drawings)}")
+        print(f"Parámetros:")
+        print(f"  - Proximity tolerance: {self.proximity_tolerance} pts")
+        print(f"  - Containment margin: {self.containment_margin} pts")
         
         # Agrupar drawings conectados
-        groups = self.group_connected_drawings(drawings)
+        groups = self.group_connected_drawings(drawings, debug=debug)
         
         print(f"\n{'='*60}")
         print(f"✓ Objetos independientes detectados: {len(groups)}")
@@ -387,18 +504,26 @@ if __name__ == "__main__":
     
     if not os.path.exists(pdf_path):
         print(f"Error: No se encuentra el archivo {pdf_path}")
+        print(f"Uso: python {sys.argv[0]} <archivo.pdf>")
         sys.exit(1)
     
     print(f"Procesando: {pdf_path}\n")
     
     # Inicializar extractor
-    # Ajusta la tolerancia según la separación entre elementos
-    extractor = VectorObjectExtractor(pdf_path, tolerance=3.0)
+    # Ajusta estos valores según tus necesidades:
+    # - proximity_tolerance: 0 = solo si se tocan, 1-2 = permite pequeños espacios
+    # - containment_margin: margen para detectar contención
+    extractor = VectorObjectExtractor(
+        pdf_path, 
+        proximity_tolerance=1.0,    # Ajustar según necesidad
+        containment_margin=2.0
+    )
     
-    # Procesar y exportar
+    # Procesar y exportar con debug activado
     page, objects = extractor.process_and_export(
         page_num=0,
-        output_dir="objetos_extraidos"
+        output_dir="objetos_extraidos",
+        debug=True  # Activar para ver análisis detallado de conexiones
     )
     
     # Resumen final
@@ -412,6 +537,9 @@ if __name__ == "__main__":
         print(f"    - Primitivas: {obj['num_primitives']}")
         if obj['bbox']:
             print(f"    - Dimensiones: {obj['bbox'].width:.1f} x {obj['bbox'].height:.1f} pts")
+            print(f"    - Posición: ({obj['bbox'].x0:.1f}, {obj['bbox'].y0:.1f})")
         print(f"    - Archivo: {obj['output_path']}")
     
     print(f"\n✓ Proceso completado")
+    print(f"\nPara ver las conexiones detectadas, revisa el output DEBUG arriba.")
+    print(f"Para ver los grupos visualmente, abre: objetos_extraidos/_visualizacion_grupos.pdf")
