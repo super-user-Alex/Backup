@@ -1,44 +1,62 @@
 import fitz  # PyMuPDF
 
-def items_in_region(page, region_rect):
-    items = {"text": [], "images": [], "drawings": [], "annots": []}
+def items_in_region(page, region_rect, threshold=0.8):
+    """Devuelve lista de ítems (texto, imágenes, dibujos, anotaciones) 
+    cuyos bounding boxes estén >= threshold dentro de region_rect."""
+    found = []
 
-    # --- Texto e imágenes (extraer bloques) ---
-    # Obtener bloques de tipo texto (0) e imagen (1) en el page
-    # Se puede usar flags TEXT_PRESERVE_IMAGES (4) y opcional TEXT_COLLECT_VECTORS (1024) si se quieren vectores aquí.
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES | fitz.TEXT_COLLECT_VECTORS)["blocks"]
-    for b in blocks:
-        bbox = fitz.Rect(b["bbox"])
-        area = bbox.get_area()
-        if area <= 0: 
-            continue
-        inter = bbox & region_rect
-        if inter.get_area() / area >= 0.8:
-            if b["type"] == 0:
-                items["text"].append(b)    # guarda el bloque de texto
-            elif b["type"] == 1:
-                items["images"].append(b)  # guarda el bloque de imagen
+    # 1. Texto: obtener todas las palabras con su bbox
+    words = page.get_text("words")  # lista de tuplas (x0,y0,x1,y1, "palabra", ...)
+    for w in words:
+        x0, y0, x1, y1 = w[:4]
+        item_rect = fitz.Rect(x0, y0, x1, y1)
+        # calcular intersección
+        inter = region_rect & item_rect  # área de intersección
+        if not inter.is_empty:
+            # ratio de solapamiento sobre el área del ítem
+            if inter.get_area() / item_rect.get_area() >= threshold:
+                found.append(("texto", w[4], (x0,y0,x1,y1)))
 
-    # --- Dibujos vectoriales ---
-    paths = page.get_drawings()
-    for path in paths:
-        bbox = path["rect"]
-        area = bbox.get_area()
-        if area <= 0:
-            continue
-        inter = bbox & region_rect
-        if inter.get_area() / area >= 0.8:
-            items["drawings"].append(path)
+    # 2. Imágenes: obtener información de cada imagen referenciada
+    images = page.get_images(full=True)
+    for img in images:
+        # img es una tupla (xref, smask, width, height, bpc, colorspace, alt, name)
+        # get_image_rects devuelve los rects donde aparece esta imagen
+        rects = page.get_image_rects(img)
+        for r in rects:
+            item_rect = fitz.Rect(r)
+            inter = region_rect & item_rect
+            if not inter.is_empty:
+                if inter.get_area() / item_rect.get_area() >= threshold:
+                    found.append(("imagen", img, r))
 
-    # --- Anotaciones (PDF) ---
-    annot = page.first_annot
-    while annot:
-        bbox = annot.rect
-        area = bbox.get_area()
-        if area > 0:
-            inter = bbox & region_rect
-            if inter.get_area() / area >= 0.8:
-                items["annots"].append(annot)
-        annot = annot.next
+    # 3. Dibujos (vectoriales): cada trazado tiene 'bbox'
+    drawings = page.get_drawings()  # lista de dicts con clave 'rect' entre otras
+    for d in drawings:
+        # 'rect' da el bounding box del trazo vectorial
+        item_rect = fitz.Rect(d["bbox"])
+        inter = region_rect & item_rect
+        if not inter.is_empty:
+            if inter.get_area() / item_rect.get_area() >= threshold:
+                found.append(("dibujo", d))
 
-    return items
+    # 4. Anotaciones: todas las anotaciones de la página
+    for annot in page.annots():
+        item_rect = annot.rect
+        inter = region_rect & item_rect
+        if not inter.is_empty:
+            if inter.get_area() / item_rect.get_area() >= threshold:
+                found.append(("anotacion", annot.type[1], (item_rect.x0, item_rect.y0, item_rect.x1, item_rect.y1)))
+
+    return found
+
+# --- Uso del ejemplo ---
+# Abrir documento y cargar página
+doc = fitz.open("mi_documento.pdf")
+page = doc.load_page(0)  # página 0
+# Definir región manual (por ejemplo, rectángulo desde (50,100) hasta (300,400))
+region = fitz.Rect(50, 100, 300, 400)
+# Filtrar ítems y mostrar resultados
+items = items_in_region(page, region, threshold=0.8)
+for tipo, info, coord in items:
+    print(tipo, info, coord)
