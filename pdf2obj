@@ -1,32 +1,83 @@
 #!/usr/bin/env python3
 """
-Advanced Vector PDF Masking with True Clipping
-Versión avanzada que aplica clipping paths reales al contenido vectorial.
+Vector PDF Masking Tool - Versión Completa
+Aplica máscaras PNG a PDFs vectoriales sin rasterización.
+
+Incluye dos métodos:
+1. Overlay: Rectángulos blancos sobre áreas ocultas (RECOMENDADO)
+2. Clip: Clipping real mediante múltiples inserciones de página
+
+Autor: Experto en PyMuPDF
+Versión: 2.0
 """
 
 import fitz  # PyMuPDF
 from PIL import Image
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
+
+# ============================================================================
+# FUNCIONES AUXILIARES COMUNES
+# ============================================================================
 
 def load_mask(mask_path: str) -> np.ndarray:
-    """Carga y binariza la máscara PNG."""
+    """
+    Carga y binariza la máscara PNG.
+    
+    Args:
+        mask_path: Ruta al archivo PNG de la máscara
+        
+    Returns:
+        Array numpy binario (True = visible, False = oculto)
+    """
     img = Image.open(mask_path).convert('L')
     mask_array = np.array(img)
     return mask_array > 128
 
 
-def create_grid_cells(page_rect: fitz.Rect, grid_divisions: int) -> List[fitz.Rect]:
-    """Divide la página en grilla uniforme."""
+def get_mask_bounds(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Obtiene el bounding box de la región visible (blanca) en la máscara.
+    
+    Args:
+        mask: Array binario de la máscara
+        
+    Returns:
+        (x_min, y_min, x_max, y_max) en píxeles de la máscara, o None si todo negro
+    """
+    white_pixels = np.where(mask)
+    
+    if len(white_pixels[0]) == 0:
+        return None
+    
+    y_min = int(np.min(white_pixels[0]))
+    y_max = int(np.max(white_pixels[0]))
+    x_min = int(np.min(white_pixels[1]))
+    x_max = int(np.max(white_pixels[1]))
+    
+    return (x_min, y_min, x_max, y_max)
+
+
+def create_grid_cells(bbox: fitz.Rect, grid_divisions: int) -> List[fitz.Rect]:
+    """
+    Divide un rectángulo en grilla uniforme.
+    
+    Args:
+        bbox: Rectángulo a dividir
+        grid_divisions: Número de divisiones por eje
+        
+    Returns:
+        Lista de rectángulos (celdas)
+    """
     cells = []
-    cell_width = page_rect.width / grid_divisions
-    cell_height = page_rect.height / grid_divisions
+    cell_width = bbox.width / grid_divisions
+    cell_height = bbox.height / grid_divisions
     
     for i in range(grid_divisions):
         for j in range(grid_divisions):
-            x0 = page_rect.x0 + j * cell_width
-            y0 = page_rect.y0 + i * cell_height
+            x0 = bbox.x0 + j * cell_width
+            y0 = bbox.y0 + i * cell_height
             x1 = x0 + cell_width
             y1 = y0 + cell_height
             cells.append(fitz.Rect(x0, y0, x1, y1))
@@ -36,7 +87,18 @@ def create_grid_cells(page_rect: fitz.Rect, grid_divisions: int) -> List[fitz.Re
 
 def is_cell_visible(cell: fitz.Rect, page_rect: fitz.Rect, 
                     mask: np.ndarray, threshold: float = 0.5) -> bool:
-    """Determina si una celda debe ser visible según la máscara."""
+    """
+    Determina si una celda debe ser visible según la máscara.
+    
+    Args:
+        cell: Rectángulo de la celda
+        page_rect: Rectángulo de la página completa
+        mask: Array binario de la máscara
+        threshold: Umbral de visibilidad (0-1)
+        
+    Returns:
+        True si la mayoría de píxeles en la celda son blancos (visibles)
+    """
     mask_height, mask_width = mask.shape
     
     # Mapear coordenadas PDF a máscara
@@ -70,7 +132,12 @@ def is_cell_visible(cell: fitz.Rect, page_rect: fitz.Rect,
 def merge_adjacent_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
     """
     Fusiona rectángulos adyacentes horizontal y verticalmente.
-    Optimización para reducir el número de regiones de clipping.
+    
+    Args:
+        rects: Lista de rectángulos
+        
+    Returns:
+        Lista optimizada de rectángulos
     """
     if not rects:
         return []
@@ -110,106 +177,82 @@ def merge_adjacent_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
     return v_merged
 
 
-def create_clipping_path(visible_rects: List[fitz.Rect]) -> str:
+def calculate_work_region(page_rect: fitz.Rect, mask: np.ndarray, 
+                         mask_bounds: Optional[Tuple], 
+                         use_bounds: bool) -> fitz.Rect:
     """
-    Crea un path de clipping en formato PDF para las regiones visibles.
+    Calcula la región de trabajo optimizada.
     
+    Args:
+        page_rect: Rectángulo de la página
+        mask: Array de la máscara
+        mask_bounds: Bounds precalculados de la máscara
+        use_bounds: Si True, usa optimización de región
+        
     Returns:
-        String con comandos PDF para el clipping path
+        Rectángulo de trabajo
     """
-    if not visible_rects:
-        return ""
+    if not use_bounds or not mask_bounds:
+        return page_rect
     
-    # Construir path usando comandos PDF
-    path_commands = []
+    mask_height, mask_width = mask.shape
     
-    for rect in visible_rects:
-        # Rectángulo en coordenadas PDF
-        x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
-        
-        # Comandos PDF: m (moveto), l (lineto), h (closepath)
-        path_commands.append(f"{x0:.2f} {y0:.2f} m")  # Mover a esquina inferior izquierda
-        path_commands.append(f"{x1:.2f} {y0:.2f} l")  # Línea a esquina inferior derecha
-        path_commands.append(f"{x1:.2f} {y1:.2f} l")  # Línea a esquina superior derecha
-        path_commands.append(f"{x0:.2f} {y1:.2f} l")  # Línea a esquina superior izquierda
-        path_commands.append("h")  # Cerrar path
+    x0_norm = mask_bounds[0] / mask_width
+    y0_norm = mask_bounds[1] / mask_height
+    x1_norm = mask_bounds[2] / mask_width
+    y1_norm = mask_bounds[3] / mask_height
     
-    # Usar regla non-zero winding para áreas múltiples
-    path_commands.append("W n")  # W = clip, n = newpath
+    # Expandir ligeramente para cubrir bordes
+    margin = 0.02
+    x0_norm = max(0, x0_norm - margin)
+    y0_norm = max(0, y0_norm - margin)
+    x1_norm = min(1, x1_norm + margin)
+    y1_norm = min(1, y1_norm + margin)
     
-    return "\n".join(path_commands)
+    work_rect = fitz.Rect(
+        page_rect.x0 + x0_norm * page_rect.width,
+        page_rect.y0 + y0_norm * page_rect.height,
+        page_rect.x0 + x1_norm * page_rect.width,
+        page_rect.y0 + y1_norm * page_rect.height
+    )
+    
+    return work_rect
 
 
-def apply_vector_mask(input_pdf: str, mask_path: str, output_pdf: str, 
-                     grid_divisions: int = 50) -> None:
-    """
-    Aplica máscara a PDF insertando clipping path en el stream de contenido.
-    
-    Esta versión manipula directamente el stream de contenido de cada página
-    para insertar comandos de clipping vectorial.
-    """
-    print(f"Cargando máscara: {mask_path}")
-    mask = load_mask(mask_path)
-    print(f"  Dimensiones: {mask.shape[1]}x{mask.shape[0]}")
-    
-    print(f"Abriendo PDF: {input_pdf}")
-    doc = fitz.open(input_pdf)
-    
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        page_rect = page.rect
-        
-        print(f"\nPágina {page_num + 1}/{len(doc)}")
-        print(f"  Tamaño: {page_rect.width:.1f}x{page_rect.height:.1f}")
-        
-        # Crear grilla y determinar celdas visibles
-        print(f"  Grilla: {grid_divisions}x{grid_divisions}")
-        cells = create_grid_cells(page_rect, grid_divisions)
-        
-        visible_cells = [
-            cell for cell in cells 
-            if is_cell_visible(cell, page_rect, mask)
-        ]
-        
-        print(f"  Visibles: {len(visible_cells)}/{len(cells)}")
-        
-        # Optimizar rectángulos
-        visible_rects = merge_adjacent_rects(visible_cells)
-        print(f"  Optimizados: {len(visible_rects)} rectángulos")
-        
-        # Obtener contenido actual de la página
-        content_stream = page.read_contents()
-        
-        # Crear path de clipping
-        clip_path = create_clipping_path(visible_rects)
-        
-        # Insertar clipping al inicio del stream
-        # El clipping afecta todo el contenido que viene después
-        new_content = f"q\n{clip_path}\n".encode() + content_stream + b"\nQ"
-        
-        # Limpiar contenido anterior
-        page.clean_contents()
-        
-        # Establecer nuevo contenido con clipping
-        page.set_contents(new_content)
-    
-    print(f"\nGuardando: {output_pdf}")
-    doc.save(output_pdf, garbage=4, deflate=True, clean=True)
-    doc.close()
-    print("✓ Completado")
-
+# ============================================================================
+# MÉTODO 1: OVERLAY (RECOMENDADO)
+# ============================================================================
 
 def apply_overlay_mask(input_pdf: str, mask_path: str, output_pdf: str, 
-                      grid_divisions: int = 50) -> None:
+                      grid_divisions: int = 50, use_bounds: bool = True) -> None:
     """
     Aplica máscara usando overlay de rectángulos blancos sobre áreas ocultas.
     
-    Método alternativo más simple y compatible que no requiere manipular
-    el stream de contenido directamente.
+    Este es el método RECOMENDADO por su compatibilidad y rendimiento.
+    
+    Args:
+        input_pdf: Ruta al PDF de entrada
+        mask_path: Ruta a la máscara PNG (blanco=visible, negro=oculto)
+        output_pdf: Ruta al PDF de salida
+        grid_divisions: Número de divisiones por eje (20-200)
+        use_bounds: Si True, optimiza procesando solo región visible
+        
+    Ejemplo:
+        apply_overlay_mask('doc.pdf', 'mask.png', 'result.pdf', 100, True)
     """
     print(f"Cargando máscara: {mask_path}")
     mask = load_mask(mask_path)
     print(f"  Dimensiones: {mask.shape[1]}x{mask.shape[0]}")
+    
+    # Obtener bounds de la máscara
+    mask_bounds = None
+    if use_bounds:
+        mask_bounds = get_mask_bounds(mask)
+        if mask_bounds:
+            print(f"  Región visible: x[{mask_bounds[0]}-{mask_bounds[2]}] "
+                  f"y[{mask_bounds[1]}-{mask_bounds[3]}]")
+        else:
+            print("  ⚠️ Máscara completamente negra, se ocultará todo")
     
     print(f"Abriendo PDF: {input_pdf}")
     doc = fitz.open(input_pdf)
@@ -220,8 +263,18 @@ def apply_overlay_mask(input_pdf: str, mask_path: str, output_pdf: str,
         
         print(f"\nPágina {page_num + 1}/{len(doc)}")
         
-        # Crear grilla
-        cells = create_grid_cells(page_rect, grid_divisions)
+        # Calcular región de trabajo
+        work_rect = calculate_work_region(page_rect, mask, mask_bounds, use_bounds)
+        
+        if use_bounds and mask_bounds:
+            print(f"  Región de trabajo: {work_rect.width:.1f}x{work_rect.height:.1f} "
+                  f"(optimizado)")
+        else:
+            print(f"  Región de trabajo: {work_rect.width:.1f}x{work_rect.height:.1f} "
+                  f"(página completa)")
+        
+        # Crear grilla solo en región de trabajo
+        cells = create_grid_cells(work_rect, grid_divisions)
         
         # Identificar celdas ocultas
         hidden_cells = [
@@ -229,20 +282,47 @@ def apply_overlay_mask(input_pdf: str, mask_path: str, output_pdf: str,
             if not is_cell_visible(cell, page_rect, mask)
         ]
         
-        print(f"  Ocultas: {len(hidden_cells)}/{len(cells)}")
+        print(f"  Celdas ocultas: {len(hidden_cells)}/{len(cells)}")
+        
+        # Si use_bounds activo, añadir bandas exteriores
+        if use_bounds and mask_bounds:
+            outer_rects = []
+            
+            # Banda superior
+            if work_rect.y0 > page_rect.y0:
+                outer_rects.append(fitz.Rect(page_rect.x0, page_rect.y0, 
+                                           page_rect.x1, work_rect.y0))
+            
+            # Banda inferior
+            if work_rect.y1 < page_rect.y1:
+                outer_rects.append(fitz.Rect(page_rect.x0, work_rect.y1, 
+                                           page_rect.x1, page_rect.y1))
+            
+            # Banda izquierda
+            if work_rect.x0 > page_rect.x0:
+                outer_rects.append(fitz.Rect(page_rect.x0, work_rect.y0, 
+                                           work_rect.x0, work_rect.y1))
+            
+            # Banda derecha
+            if work_rect.x1 < page_rect.x1:
+                outer_rects.append(fitz.Rect(work_rect.x1, work_rect.y0, 
+                                           page_rect.x1, work_rect.y1))
+            
+            hidden_cells.extend(outer_rects)
+            print(f"  + {len(outer_rects)} bandas exteriores")
         
         # Optimizar
         hidden_rects = merge_adjacent_rects(hidden_cells)
         print(f"  Optimizados: {len(hidden_rects)} rectángulos")
         
-        # Dibujar rectángulos blancos sobre áreas ocultas
+        # Dibujar rectángulos blancos
         shape = page.new_shape()
         
         for rect in hidden_rects:
             shape.draw_rect(rect)
             shape.finish(
                 fill=fitz.utils.getColor("white"),
-                color=None,  # Sin borde
+                color=None,
                 width=0
             )
         
@@ -251,11 +331,137 @@ def apply_overlay_mask(input_pdf: str, mask_path: str, output_pdf: str,
     print(f"\nGuardando: {output_pdf}")
     doc.save(output_pdf, garbage=4, deflate=True)
     doc.close()
-    print("✓ Completado")
+    print("✓ Completado - Método Overlay")
+
+
+# ============================================================================
+# MÉTODO 2: CLIP
+# ============================================================================
+
+def apply_clip_mask(input_pdf: str, mask_path: str, output_pdf: str, 
+                   grid_divisions: int = 50, use_bounds: bool = True) -> None:
+    """
+    Aplica máscara con clipping real usando múltiples inserciones de página.
+    
+    Este método usa clipping vectorial real sin añadir contenido extra.
+    
+    Args:
+        input_pdf: Ruta al PDF de entrada
+        mask_path: Ruta a la máscara PNG (blanco=visible, negro=oculto)
+        output_pdf: Ruta al PDF de salida
+        grid_divisions: Número de divisiones por eje (20-200)
+        use_bounds: Si True, optimiza procesando solo región visible
+        
+    Ejemplo:
+        apply_clip_mask('doc.pdf', 'mask.png', 'result.pdf', 100, True)
+        
+    Nota:
+        Puede generar archivos más grandes que el método overlay.
+    """
+    print(f"Cargando máscara: {mask_path}")
+    mask = load_mask(mask_path)
+    print(f"  Dimensiones: {mask.shape[1]}x{mask.shape[0]}")
+    
+    # Obtener bounds
+    mask_bounds = None
+    if use_bounds:
+        mask_bounds = get_mask_bounds(mask)
+        if mask_bounds:
+            print(f"  Región visible: x[{mask_bounds[0]}-{mask_bounds[2]}] "
+                  f"y[{mask_bounds[1]}-{mask_bounds[3]}]")
+    
+    print(f"Abriendo PDF: {input_pdf}")
+    src_doc = fitz.open(input_pdf)
+    
+    # Crear documento de salida
+    out_doc = fitz.open()
+    
+    for page_num in range(len(src_doc)):
+        src_page = src_doc[page_num]
+        page_rect = src_page.rect
+        
+        print(f"\nPágina {page_num + 1}/{len(src_doc)}")
+        
+        # Crear página nueva
+        out_page = out_doc.new_page(width=page_rect.width, height=page_rect.height)
+        
+        # Calcular región de trabajo
+        work_rect = calculate_work_region(page_rect, mask, mask_bounds, use_bounds)
+        
+        if use_bounds and mask_bounds:
+            print(f"  Región: {work_rect.width:.1f}x{work_rect.height:.1f} (optimizado)")
+        else:
+            print(f"  Región: {work_rect.width:.1f}x{work_rect.height:.1f} (completa)")
+        
+        # Crear grilla
+        cells = create_grid_cells(work_rect, grid_divisions)
+        
+        # Celdas visibles
+        visible_cells = [
+            cell for cell in cells 
+            if is_cell_visible(cell, page_rect, mask)
+        ]
+        
+        print(f"  Celdas visibles: {len(visible_cells)}/{len(cells)}")
+        
+        # Optimizar
+        visible_rects = merge_adjacent_rects(visible_cells)
+        print(f"  Optimizados: {len(visible_rects)} rectángulos")
+        
+        # Insertar la página fuente múltiples veces con clipping
+        for clip_rect in visible_rects:
+            out_page.show_pdf_page(
+                page_rect,      # Donde insertar (página completa)
+                src_doc,        # Documento fuente
+                page_num,       # Número de página
+                clip=clip_rect  # Rectángulo de clipping
+            )
+    
+    print(f"\nGuardando: {output_pdf}")
+    out_doc.save(output_pdf, garbage=4, deflate=True)
+    out_doc.close()
+    src_doc.close()
+    print("✓ Completado - Método Clip")
+
+
+# ============================================================================
+# FUNCIÓN PRINCIPAL
+# ============================================================================
+
+def apply_mask(input_pdf: str, mask_path: str, output_pdf: str, 
+               grid_divisions: int = 50, method: str = "overlay",
+               use_bounds: bool = True) -> None:
+    """
+    Función unificada para aplicar máscara con el método especificado.
+    
+    Args:
+        input_pdf: Ruta al PDF de entrada
+        mask_path: Ruta a la máscara PNG (blanco=visible, negro=oculto)
+        output_pdf: Ruta al PDF de salida
+        grid_divisions: Número de divisiones por eje (20-200)
+        method: Método a usar: "overlay" o "clip"
+        use_bounds: Si True, optimiza procesando solo región visible
+        
+    Raises:
+        ValueError: Si el método no es válido
+        
+    Ejemplo:
+        # Método recomendado
+        apply_mask('doc.pdf', 'mask.png', 'out.pdf', 100, 'overlay', True)
+        
+        # Método con clipping real
+        apply_mask('doc.pdf', 'mask.png', 'out.pdf', 100, 'clip', True)
+    """
+    if method == "overlay":
+        apply_overlay_mask(input_pdf, mask_path, output_pdf, grid_divisions, use_bounds)
+    elif method == "clip":
+        apply_clip_mask(input_pdf, mask_path, output_pdf, grid_divisions, use_bounds)
+    else:
+        raise ValueError(f"Método inválido: {method}. Usa 'overlay' o 'clip'")
 
 
 def main():
-    """Función principal."""
+    """Función principal con ejemplo de uso."""
     import sys
     
     # Configuración
@@ -264,27 +470,34 @@ def main():
     output_pdf = "output_masked.pdf"
     grid_divisions = 100
     method = "overlay"  # "overlay" o "clip"
+    use_bounds = True   # Optimización activada
     
     print("=" * 70)
-    print("VECTOR PDF MASKING TOOL")
+    print("VECTOR PDF MASKING TOOL v2.0")
     print("=" * 70)
-    print(f"Input: {input_pdf}")
-    print(f"Mask: {mask_path}")
-    print(f"Output: {output_pdf}")
-    print(f"Grid: {grid_divisions}x{grid_divisions}")
-    print(f"Method: {method}")
+    print(f"Input PDF:      {input_pdf}")
+    print(f"Máscara PNG:    {mask_path}")
+    print(f"Output PDF:     {output_pdf}")
+    print(f"Grid:           {grid_divisions}x{grid_divisions}")
+    print(f"Método:         {method}")
+    print(f"Optimización:   {'Activada' if use_bounds else 'Desactivada'}")
     print("=" * 70)
     
     try:
-        if method == "clip":
-            # Método avanzado: clipping path en stream
-            apply_vector_mask(input_pdf, mask_path, output_pdf, grid_divisions)
-        else:
-            # Método overlay: rectángulos blancos
-            apply_overlay_mask(input_pdf, mask_path, output_pdf, grid_divisions)
+        apply_mask(
+            input_pdf=input_pdf,
+            mask_path=mask_path,
+            output_pdf=output_pdf,
+            grid_divisions=grid_divisions,
+            method=method,
+            use_bounds=use_bounds
+        )
             
     except FileNotFoundError as e:
         print(f"\n❌ Archivo no encontrado: {e}")
+        print("\nAsegúrate de que existan:")
+        print(f"  - {input_pdf}")
+        print(f"  - {mask_path}")
         sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
