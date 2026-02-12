@@ -1,545 +1,297 @@
-```python
-import fitz  # PyMuPDF
-import numpy as np
-from collections import defaultdict
-from shapely.geometry import Polygon, MultiPolygon, box
-from shapely.ops import unary_union
-import os
+#!/usr/bin/env python3
+"""
+Advanced Vector PDF Masking with True Clipping
+Versión avanzada que aplica clipping paths reales al contenido vectorial.
+"""
 
-class VectorObjectExtractor:
-    def __init__(self, pdf_path, proximity_tolerance=1.0, containment_margin=2.0):
-        """
-        Args:
-            pdf_path: Ruta al PDF
-            proximity_tolerance: Distancia máxima para considerar elementos como tocándose (0.5-2 pts)
-            containment_margin: Margen para detectar contención (permite pequeñas diferencias)
-        """
-        self.doc = fitz.open(pdf_path)
-        self.proximity_tolerance = proximity_tolerance
-        self.containment_margin = containment_margin
+import fitz  # PyMuPDF
+from PIL import Image
+import numpy as np
+from typing import List, Tuple
+
+
+def load_mask(mask_path: str) -> np.ndarray:
+    """Carga y binariza la máscara PNG."""
+    img = Image.open(mask_path).convert('L')
+    mask_array = np.array(img)
+    return mask_array > 128
+
+
+def create_grid_cells(page_rect: fitz.Rect, grid_divisions: int) -> List[fitz.Rect]:
+    """Divide la página en grilla uniforme."""
+    cells = []
+    cell_width = page_rect.width / grid_divisions
+    cell_height = page_rect.height / grid_divisions
     
-    def extract_drawings_from_page(self, page_num=0):
-        """Extrae todos los drawings de una página"""
-        page = self.doc[page_num]
-        drawings = page.get_drawings()
-        return page, drawings
+    for i in range(grid_divisions):
+        for j in range(grid_divisions):
+            x0 = page_rect.x0 + j * cell_width
+            y0 = page_rect.y0 + i * cell_height
+            x1 = x0 + cell_width
+            y1 = y0 + cell_height
+            cells.append(fitz.Rect(x0, y0, x1, y1))
     
-    def get_drawing_bounds(self, drawing):
-        """Calcula el bounding box de un drawing"""
-        points = []
-        
-        for item in drawing.get("items", []):
-            if item[0] == "l":  # línea
-                points.extend([item[1], item[2]])
-            elif item[0] == "c":  # curva bézier
-                points.extend([item[1], item[2], item[3], item[4]])
-            elif item[0] == "re":  # rectángulo
-                # item[1] es un objeto Rect
-                rect_data = item[1]
-                x, y, w, h = rect_data.x, rect_data.y, rect_data.width, rect_data.height
-                points.extend([
-                    fitz.Point(x, y),
-                    fitz.Point(x + w, y),
-                    fitz.Point(x, y + h),
-                    fitz.Point(x + w, y + h)
-                ])
-        
-        if not points:
-            return None
-        
-        xs = [p.x for p in points]
-        ys = [p.y for p in points]
-        
-        return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+    return cells
+
+
+def is_cell_visible(cell: fitz.Rect, page_rect: fitz.Rect, 
+                    mask: np.ndarray, threshold: float = 0.5) -> bool:
+    """Determina si una celda debe ser visible según la máscara."""
+    mask_height, mask_width = mask.shape
     
-    def rect_contains_rect(self, outer, inner, margin=None):
-        """
-        Verifica si outer contiene completamente a inner
-        
-        Args:
-            margin: Margen de tolerancia (permite que inner sea ligeramente más grande)
-        """
-        if not outer or not inner:
-            return False
-        
-        if margin is None:
-            margin = self.containment_margin
-        
-        # Inner debe estar dentro de outer (con margen de tolerancia)
-        return (outer.x0 - margin <= inner.x0 and 
-                outer.y0 - margin <= inner.y0 and
-                outer.x1 + margin >= inner.x1 and
-                outer.y1 + margin >= inner.y1)
+    # Mapear coordenadas PDF a máscara
+    x0_norm = (cell.x0 - page_rect.x0) / page_rect.width
+    y0_norm = (cell.y0 - page_rect.y0) / page_rect.height
+    x1_norm = (cell.x1 - page_rect.x0) / page_rect.width
+    y1_norm = (cell.y1 - page_rect.y0) / page_rect.height
     
-    def rects_are_touching(self, rect1, rect2, tolerance=None):
-        """
-        Verifica si dos rectángulos se tocan o están muy cerca
-        
-        Args:
-            tolerance: Distancia máxima para considerar como "tocándose"
-        """
-        if not rect1 or not rect2:
-            return False
-        
-        if tolerance is None:
-            tolerance = self.proximity_tolerance
-        
-        # Calcular distancia mínima entre rectángulos
-        # Horizontal
-        if rect1.x1 < rect2.x0:  # rect1 está a la izquierda
-            dx = rect2.x0 - rect1.x1
-        elif rect2.x1 < rect1.x0:  # rect2 está a la izquierda
-            dx = rect1.x0 - rect2.x1
-        else:  # Se solapan horizontalmente
-            dx = 0
-        
-        # Vertical
-        if rect1.y1 < rect2.y0:  # rect1 está arriba
-            dy = rect2.y0 - rect1.y1
-        elif rect2.y1 < rect1.y0:  # rect2 está arriba
-            dy = rect1.y0 - rect2.y1
-        else:  # Se solapan verticalmente
-            dy = 0
-        
-        # Distancia euclidiana
-        distance = (dx**2 + dy**2)**0.5
-        
-        return distance <= tolerance
+    x0_px = int(x0_norm * mask_width)
+    y0_px = int(y0_norm * mask_height)
+    x1_px = int(x1_norm * mask_width)
+    y1_px = int(y1_norm * mask_height)
     
-    def rects_overlap(self, rect1, rect2):
-        """Verifica si dos rectángulos se solapan"""
-        if not rect1 or not rect2:
-            return False
-        return rect1.intersects(rect2)
+    # Límites válidos
+    x0_px = max(0, min(x0_px, mask_width - 1))
+    x1_px = max(0, min(x1_px, mask_width))
+    y0_px = max(0, min(y0_px, mask_height - 1))
+    y1_px = max(0, min(y1_px, mask_height))
     
-    def drawings_are_connected(self, draw1, draw2):
-        """
-        Determina si dos drawings pertenecen al mismo objeto
-        
-        Criterios (en orden de prioridad):
-        1. Uno contiene al otro (jerarquía)
-        2. Se solapan parcialmente
-        3. Se tocan o están muy cerca
-        """
-        rect1 = self.get_drawing_bounds(draw1)
-        rect2 = self.get_drawing_bounds(draw2)
-        
-        if not rect1 or not rect2:
-            return False
-        
-        # Criterio 1: Contención jerárquica
-        if (self.rect_contains_rect(rect1, rect2) or 
-            self.rect_contains_rect(rect2, rect1)):
-            return True
-        
-        # Criterio 2: Solapamiento
-        if self.rects_overlap(rect1, rect2):
-            return True
-        
-        # Criterio 3: Proximidad (elementos que se tocan)
-        if self.rects_are_touching(rect1, rect2):
-            return True
-        
+    if x1_px <= x0_px or y1_px <= y0_px:
         return False
     
-    def is_white_background(self, drawing):
-        """
-        Detecta si un drawing es parte del fondo blanco
-        """
-        # Verificar color de relleno
-        fill = drawing.get("fill")
-        if fill:
-            # CMYK: blanco es (0, 0, 0, 0) o muy cercano
-            # RGB: blanco es (1, 1, 1) o muy cercano
-            if isinstance(fill, (list, tuple)):
-                if len(fill) == 4:  # CMYK
-                    return all(c < 0.05 for c in fill)
-                elif len(fill) == 3:  # RGB
-                    return all(c > 0.95 for c in fill)
-        
+    region = mask[y0_px:y1_px, x0_px:x1_px]
+    
+    if region.size == 0:
         return False
     
-    def debug_connections(self, drawings):
-        """Muestra información detallada de las conexiones"""
-        valid_drawings = [d for d in drawings if not self.is_white_background(d)]
-        
-        print(f"\n{'='*70}")
-        print("DEBUG: Análisis de conexiones")
-        print(f"{'='*70}\n")
-        print(f"Drawings válidos analizados: {len(valid_drawings)}")
-        print(f"Proximity tolerance: {self.proximity_tolerance}")
-        print(f"Containment margin: {self.containment_margin}\n")
-        
-        connection_count = 0
-        
-        for i in range(len(valid_drawings)):
-            for j in range(i + 1, len(valid_drawings)):
-                rect1 = self.get_drawing_bounds(valid_drawings[i])
-                rect2 = self.get_drawing_bounds(valid_drawings[j])
-                
-                if not rect1 or not rect2:
-                    continue
-                
-                # Verificar cada criterio
-                contains_1_2 = self.rect_contains_rect(rect1, rect2)
-                contains_2_1 = self.rect_contains_rect(rect2, rect1)
-                contains = contains_1_2 or contains_2_1
-                overlaps = self.rects_overlap(rect1, rect2)
-                touching = self.rects_are_touching(rect1, rect2)
-                
-                if contains or overlaps or touching:
-                    connection_count += 1
-                    reasons = []
-                    if contains_1_2: reasons.append("RECT1 CONTIENE RECT2")
-                    if contains_2_1: reasons.append("RECT2 CONTIENE RECT1")
-                    if overlaps and not contains: reasons.append("SOLAPAMIENTO")
-                    if touching and not overlaps and not contains: reasons.append("PROXIMIDAD")
-                    
-                    print(f"Conexión #{connection_count}: Drawing {i} ↔ Drawing {j}")
-                    print(f"  Razón: {', '.join(reasons)}")
-                    print(f"  Rect1: ({rect1.x0:.1f}, {rect1.y0:.1f}) → ({rect1.x1:.1f}, {rect1.y1:.1f}) [w:{rect1.width:.1f} h:{rect1.height:.1f}]")
-                    print(f"  Rect2: ({rect2.x0:.1f}, {rect2.y0:.1f}) → ({rect2.x1:.1f}, {rect2.y1:.1f}) [w:{rect2.width:.1f} h:{rect2.height:.1f}]")
-                    
-                    if touching and not overlaps and not contains:
-                        # Calcular distancia exacta
-                        if rect1.x1 < rect2.x0:
-                            dx = rect2.x0 - rect1.x1
-                        elif rect2.x1 < rect1.x0:
-                            dx = rect1.x0 - rect2.x1
-                        else:
-                            dx = 0
-                        
-                        if rect1.y1 < rect2.y0:
-                            dy = rect2.y0 - rect1.y1
-                        elif rect2.y1 < rect1.y0:
-                            dy = rect1.y0 - rect2.y1
-                        else:
-                            dy = 0
-                        
-                        distance = (dx**2 + dy**2)**0.5
-                        print(f"  Distancia: dx={dx:.2f}, dy={dy:.2f}, total={distance:.2f} pts")
-                    
-                    print()
-        
-        print(f"{'='*70}")
-        print(f"Total de conexiones detectadas: {connection_count}")
-        print(f"{'='*70}\n")
+    return np.mean(region) > threshold
+
+
+def merge_adjacent_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
+    """
+    Fusiona rectángulos adyacentes horizontal y verticalmente.
+    Optimización para reducir el número de regiones de clipping.
+    """
+    if not rects:
+        return []
     
-    def group_connected_drawings(self, drawings, debug=False):
-        """
-        Agrupa drawings conectados usando un enfoque de Union-Find
-        Incluye contención jerárquica
-        """
-        n = len(drawings)
-        parent = list(range(n))
-        
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])
-            return parent[x]
-        
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
-        
-        # Filtrar fondos blancos
-        valid_drawings = []
-        valid_indices = []
-        
-        for i, drawing in enumerate(drawings):
-            if not self.is_white_background(drawing):
-                valid_drawings.append(drawing)
-                valid_indices.append(i)
-        
-        print(f"Drawings válidos (sin fondo blanco): {len(valid_drawings)}")
-        
-        # Mostrar debug si se solicita
-        if debug:
-            self.debug_connections(drawings)
-        
-        # Construir grafo de conectividad (incluyendo contención)
-        connections = 0
-        for i in range(len(valid_drawings)):
-            for j in range(i + 1, len(valid_drawings)):
-                if self.drawings_are_connected(valid_drawings[i], valid_drawings[j]):
-                    union(i, j)
-                    connections += 1
-        
-        print(f"Conexiones detectadas: {connections}")
-        
-        # Agrupar por componente
-        groups = defaultdict(list)
-        for i, drawing in enumerate(valid_drawings):
-            root = find(i)
-            groups[root].append(drawing)
-        
-        return list(groups.values())
+    # Fusión horizontal
+    sorted_rects = sorted(rects, key=lambda r: (round(r.y0, 2), round(r.x0, 2)))
+    h_merged = []
+    current = sorted_rects[0]
     
-    def get_object_contour(self, drawings_group):
-        """
-        Calcula el contorno exterior de un grupo de drawings
-        """
-        polygons = []
+    for rect in sorted_rects[1:]:
+        same_row = abs(current.y0 - rect.y0) < 1 and abs(current.y1 - rect.y1) < 1
+        adjacent = abs(current.x1 - rect.x0) < 1
         
-        for drawing in drawings_group:
-            rect = self.get_drawing_bounds(drawing)
-            if rect:
-                poly = box(rect.x0, rect.y0, rect.x1, rect.y1)
-                polygons.append(poly)
-        
-        if not polygons:
-            return None
-        
-        # Unir todos los polígonos
-        merged = unary_union(polygons)
-        
-        # Obtener el contorno exterior
-        if isinstance(merged, Polygon):
-            return list(merged.exterior.coords)
-        elif isinstance(merged, MultiPolygon):
-            largest = max(merged.geoms, key=lambda p: p.area)
-            return list(largest.exterior.coords)
-        
-        return None
+        if same_row and adjacent:
+            current = fitz.Rect(current.x0, current.y0, rect.x1, rect.y1)
+        else:
+            h_merged.append(current)
+            current = rect
+    h_merged.append(current)
     
-    def get_group_bbox(self, drawings_group):
-        """Calcula el bounding box total de un grupo"""
-        all_rects = [self.get_drawing_bounds(d) for d in drawings_group]
-        all_rects = [r for r in all_rects if r]
-        
-        if not all_rects:
-            return None
-        
-        bbox = all_rects[0]
-        for rect in all_rects[1:]:
-            bbox |= rect  # Unión de rectángulos
-        
-        return bbox
+    # Fusión vertical
+    sorted_rects = sorted(h_merged, key=lambda r: (round(r.x0, 2), round(r.y0, 2)))
+    v_merged = []
+    current = sorted_rects[0]
     
-    def extract_object_to_pdf(self, page, drawings_group, output_path, margin=5):
-        """
-        Extrae un grupo de drawings a un PDF individual preservando vectores
+    for rect in sorted_rects[1:]:
+        same_col = abs(current.x0 - rect.x0) < 1 and abs(current.x1 - rect.x1) < 1
+        adjacent = abs(current.y1 - rect.y0) < 1
         
-        Args:
-            page: Página fuente de PyMuPDF
-            drawings_group: Lista de drawings del grupo
-            output_path: Ruta del PDF de salida
-            margin: Margen adicional alrededor del objeto (en puntos)
-        """
-        # Calcular bounding box del grupo
-        bbox = self.get_group_bbox(drawings_group)
-        
-        if not bbox:
-            print(f"No se pudo calcular bbox para {output_path}")
-            return None
-        
-        # Añadir margen
-        crop_rect = fitz.Rect(
-            bbox.x0 - margin,
-            bbox.y0 - margin,
-            bbox.x1 + margin,
-            bbox.y1 + margin
-        )
-        
-        # Asegurar que no salga de los límites de la página
-        crop_rect = crop_rect & page.rect
-        
-        # Crear nuevo documento temporal
-        temp_doc = fitz.open()
-        temp_page = temp_doc.new_page(
-            width=crop_rect.width,
-            height=crop_rect.height
-        )
-        
-        # Mostrar la página original recortada
-        temp_page.show_pdf_page(
-            fitz.Rect(0, 0, crop_rect.width, crop_rect.height),
-            self.doc,
-            page.number,
-            clip=crop_rect
-        )
-        
-        # Guardar
-        temp_doc.save(output_path)
-        temp_doc.close()
-        
-        print(f"✓ Exportado: {output_path} (bbox: {bbox})")
-        return bbox
+        if same_col and adjacent:
+            current = fitz.Rect(current.x0, current.y0, rect.x1, rect.y1)
+        else:
+            v_merged.append(current)
+            current = rect
+    v_merged.append(current)
     
-    def visualize_groups(self, page, groups, output_path):
-        """
-        Crea un PDF visualizando los grupos detectados con colores
-        """
-        colors = [
-            (1, 0, 0),    # Rojo
-            (0, 1, 0),    # Verde
-            (0, 0, 1),    # Azul
-            (1, 1, 0),    # Amarillo
-            (1, 0, 1),    # Magenta
-            (0, 1, 1),    # Cyan
-            (0.5, 0, 0),  # Rojo oscuro
-            (0, 0.5, 0),  # Verde oscuro
-            (0, 0, 0.5),  # Azul oscuro
-            (1, 0.5, 0),  # Naranja
-            (0.5, 0, 0.5),# Púrpura
-            (0, 0.5, 0.5),# Teal
+    return v_merged
+
+
+def create_clipping_path(visible_rects: List[fitz.Rect]) -> str:
+    """
+    Crea un path de clipping en formato PDF para las regiones visibles.
+    
+    Returns:
+        String con comandos PDF para el clipping path
+    """
+    if not visible_rects:
+        return ""
+    
+    # Construir path usando comandos PDF
+    path_commands = []
+    
+    for rect in visible_rects:
+        # Rectángulo en coordenadas PDF
+        x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
+        
+        # Comandos PDF: m (moveto), l (lineto), h (closepath)
+        path_commands.append(f"{x0:.2f} {y0:.2f} m")  # Mover a esquina inferior izquierda
+        path_commands.append(f"{x1:.2f} {y0:.2f} l")  # Línea a esquina inferior derecha
+        path_commands.append(f"{x1:.2f} {y1:.2f} l")  # Línea a esquina superior derecha
+        path_commands.append(f"{x0:.2f} {y1:.2f} l")  # Línea a esquina superior izquierda
+        path_commands.append("h")  # Cerrar path
+    
+    # Usar regla non-zero winding para áreas múltiples
+    path_commands.append("W n")  # W = clip, n = newpath
+    
+    return "\n".join(path_commands)
+
+
+def apply_vector_mask(input_pdf: str, mask_path: str, output_pdf: str, 
+                     grid_divisions: int = 50) -> None:
+    """
+    Aplica máscara a PDF insertando clipping path en el stream de contenido.
+    
+    Esta versión manipula directamente el stream de contenido de cada página
+    para insertar comandos de clipping vectorial.
+    """
+    print(f"Cargando máscara: {mask_path}")
+    mask = load_mask(mask_path)
+    print(f"  Dimensiones: {mask.shape[1]}x{mask.shape[0]}")
+    
+    print(f"Abriendo PDF: {input_pdf}")
+    doc = fitz.open(input_pdf)
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        page_rect = page.rect
+        
+        print(f"\nPágina {page_num + 1}/{len(doc)}")
+        print(f"  Tamaño: {page_rect.width:.1f}x{page_rect.height:.1f}")
+        
+        # Crear grilla y determinar celdas visibles
+        print(f"  Grilla: {grid_divisions}x{grid_divisions}")
+        cells = create_grid_cells(page_rect, grid_divisions)
+        
+        visible_cells = [
+            cell for cell in cells 
+            if is_cell_visible(cell, page_rect, mask)
         ]
         
-        # Crear copia del documento
-        temp_doc = fitz.open()
-        temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)
+        print(f"  Visibles: {len(visible_cells)}/{len(cells)}")
         
-        # Copiar contenido original
-        temp_page.show_pdf_page(temp_page.rect, self.doc, page.number)
+        # Optimizar rectángulos
+        visible_rects = merge_adjacent_rects(visible_cells)
+        print(f"  Optimizados: {len(visible_rects)} rectángulos")
         
-        # Dibujar cada grupo con un color diferente
-        for i, group in enumerate(groups):
-            color = colors[i % len(colors)]
-            
-            # Dibujar bounding boxes de cada drawing individual
-            for drawing in group:
-                rect = self.get_drawing_bounds(drawing)
-                if rect:
-                    temp_page.draw_rect(rect, color=color, width=1.0, fill_opacity=0.05)
-            
-            # Dibujar bounding box del grupo completo
-            group_bbox = self.get_group_bbox(group)
-            if group_bbox:
-                temp_page.draw_rect(group_bbox, color=color, width=3)
-            
-            # Dibujar contorno exterior
-            contour = self.get_object_contour(group)
-            if contour and len(contour) > 2:
-                for j in range(len(contour) - 1):
-                    p1 = fitz.Point(contour[j][0], contour[j][1])
-                    p2 = fitz.Point(contour[j+1][0], contour[j+1][1])
-                    temp_page.draw_line(p1, p2, color=color, width=2, dashes="[3 2]")
-            
-            # Añadir etiqueta con número de objeto
-            if group_bbox:
-                # Fondo blanco para la etiqueta
-                label_rect = fitz.Rect(
-                    group_bbox.x0 + 2,
-                    group_bbox.y0 + 2,
-                    group_bbox.x0 + 50,
-                    group_bbox.y0 + 18
-                )
-                temp_page.draw_rect(label_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
-                
-                temp_page.insert_text(
-                    fitz.Point(group_bbox.x0 + 5, group_bbox.y0 + 15),
-                    f"Obj {i} ({len(group)})",
-                    fontsize=10,
-                    color=color,
-                    fontname="helv"
-                )
+        # Obtener contenido actual de la página
+        content_stream = page.read_contents()
         
-        temp_doc.save(output_path)
-        temp_doc.close()
+        # Crear path de clipping
+        clip_path = create_clipping_path(visible_rects)
+        
+        # Insertar clipping al inicio del stream
+        # El clipping afecta todo el contenido que viene después
+        new_content = f"q\n{clip_path}\n".encode() + content_stream + b"\nQ"
+        
+        # Limpiar contenido anterior
+        page.clean_contents()
+        
+        # Establecer nuevo contenido con clipping
+        page.set_contents(new_content)
     
-    def process_and_export(self, page_num=0, output_dir="extracted_objects", debug=False):
-        """
-        Procesa una página, detecta objetos y exporta cada uno a un PDF individual
-        
-        Args:
-            page_num: Número de página a procesar
-            output_dir: Directorio donde guardar los PDFs individuales
-            debug: Si True, muestra información detallada de conexiones
-        """
-        # Crear directorio de salida
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Extraer drawings
-        page, drawings = self.extract_drawings_from_page(page_num)
-        
-        print(f"\n{'='*60}")
-        print(f"Procesando página {page_num}")
-        print(f"{'='*60}")
-        print(f"Total drawings encontrados: {len(drawings)}")
-        print(f"Parámetros:")
-        print(f"  - Proximity tolerance: {self.proximity_tolerance} pts")
-        print(f"  - Containment margin: {self.containment_margin} pts")
-        
-        # Agrupar drawings conectados
-        groups = self.group_connected_drawings(drawings, debug=debug)
-        
-        print(f"\n{'='*60}")
-        print(f"✓ Objetos independientes detectados: {len(groups)}")
-        print(f"{'='*60}\n")
-        
-        # Exportar cada grupo
-        results = []
-        for i, group in enumerate(groups):
-            output_path = os.path.join(output_dir, f"objeto_{i:03d}.pdf")
-            
-            bbox = self.extract_object_to_pdf(page, group, output_path)
-            contour = self.get_object_contour(group)
-            
-            results.append({
-                'id': i,
-                'drawings': group,
-                'contour': contour,
-                'bbox': bbox,
-                'num_primitives': len(group),
-                'output_path': output_path
-            })
-            
-            print(f"  Objeto {i}: {len(group)} primitivas → {output_path}")
-        
-        # Crear visualización
-        viz_path = os.path.join(output_dir, "_visualizacion_grupos.pdf")
-        self.visualize_groups(page, [obj['drawings'] for obj in results], viz_path)
-        print(f"\n✓ Visualización guardada: {viz_path}")
-        
-        return page, results
+    print(f"\nGuardando: {output_pdf}")
+    doc.save(output_pdf, garbage=4, deflate=True, clean=True)
+    doc.close()
+    print("✓ Completado")
 
 
-# Ejemplo de uso
-if __name__ == "__main__":
+def apply_overlay_mask(input_pdf: str, mask_path: str, output_pdf: str, 
+                      grid_divisions: int = 50) -> None:
+    """
+    Aplica máscara usando overlay de rectángulos blancos sobre áreas ocultas.
+    
+    Método alternativo más simple y compatible que no requiere manipular
+    el stream de contenido directamente.
+    """
+    print(f"Cargando máscara: {mask_path}")
+    mask = load_mask(mask_path)
+    print(f"  Dimensiones: {mask.shape[1]}x{mask.shape[0]}")
+    
+    print(f"Abriendo PDF: {input_pdf}")
+    doc = fitz.open(input_pdf)
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        page_rect = page.rect
+        
+        print(f"\nPágina {page_num + 1}/{len(doc)}")
+        
+        # Crear grilla
+        cells = create_grid_cells(page_rect, grid_divisions)
+        
+        # Identificar celdas ocultas
+        hidden_cells = [
+            cell for cell in cells 
+            if not is_cell_visible(cell, page_rect, mask)
+        ]
+        
+        print(f"  Ocultas: {len(hidden_cells)}/{len(cells)}")
+        
+        # Optimizar
+        hidden_rects = merge_adjacent_rects(hidden_cells)
+        print(f"  Optimizados: {len(hidden_rects)} rectángulos")
+        
+        # Dibujar rectángulos blancos sobre áreas ocultas
+        shape = page.new_shape()
+        
+        for rect in hidden_rects:
+            shape.draw_rect(rect)
+            shape.finish(
+                fill=fitz.utils.getColor("white"),
+                color=None,  # Sin borde
+                width=0
+            )
+        
+        shape.commit()
+    
+    print(f"\nGuardando: {output_pdf}")
+    doc.save(output_pdf, garbage=4, deflate=True)
+    doc.close()
+    print("✓ Completado")
+
+
+def main():
+    """Función principal."""
     import sys
     
-    # Usar argumento de línea de comandos o archivo por defecto
-    pdf_path = sys.argv[1] if len(sys.argv) > 1 else "tu_archivo.pdf"
+    # Configuración
+    input_pdf = "input.pdf"
+    mask_path = "mask.png"
+    output_pdf = "output_masked.pdf"
+    grid_divisions = 100
+    method = "overlay"  # "overlay" o "clip"
     
-    if not os.path.exists(pdf_path):
-        print(f"Error: No se encuentra el archivo {pdf_path}")
-        print(f"Uso: python {sys.argv[0]} <archivo.pdf>")
+    print("=" * 70)
+    print("VECTOR PDF MASKING TOOL")
+    print("=" * 70)
+    print(f"Input: {input_pdf}")
+    print(f"Mask: {mask_path}")
+    print(f"Output: {output_pdf}")
+    print(f"Grid: {grid_divisions}x{grid_divisions}")
+    print(f"Method: {method}")
+    print("=" * 70)
+    
+    try:
+        if method == "clip":
+            # Método avanzado: clipping path en stream
+            apply_vector_mask(input_pdf, mask_path, output_pdf, grid_divisions)
+        else:
+            # Método overlay: rectángulos blancos
+            apply_overlay_mask(input_pdf, mask_path, output_pdf, grid_divisions)
+            
+    except FileNotFoundError as e:
+        print(f"\n❌ Archivo no encontrado: {e}")
         sys.exit(1)
-    
-    print(f"Procesando: {pdf_path}\n")
-    
-    # Inicializar extractor
-    # Ajusta estos valores según tus necesidades:
-    # - proximity_tolerance: 0 = solo si se tocan, 1-2 = permite pequeños espacios
-    # - containment_margin: margen para detectar contención
-    extractor = VectorObjectExtractor(
-        pdf_path, 
-        proximity_tolerance=1.0,    # Ajustar según necesidad
-        containment_margin=2.0
-    )
-    
-    # Procesar y exportar con debug activado
-    page, objects = extractor.process_and_export(
-        page_num=0,
-        output_dir="objetos_extraidos",
-        debug=True  # Activar para ver análisis detallado de conexiones
-    )
-    
-    # Resumen final
-    print(f"\n{'='*60}")
-    print("RESUMEN")
-    print(f"{'='*60}")
-    print(f"Total de objetos exportados: {len(objects)}")
-    
-    for obj in objects:
-        print(f"\n  Objeto {obj['id']:03d}:")
-        print(f"    - Primitivas: {obj['num_primitives']}")
-        if obj['bbox']:
-            print(f"    - Dimensiones: {obj['bbox'].width:.1f} x {obj['bbox'].height:.1f} pts")
-            print(f"    - Posición: ({obj['bbox'].x0:.1f}, {obj['bbox'].y0:.1f})")
-        print(f"    - Archivo: {obj['output_path']}")
-    
-    print(f"\n✓ Proceso completado")
-    print(f"\nPara ver las conexiones detectadas, revisa el output DEBUG arriba.")
-    print(f"Para ver los grupos visualmente, abre: objetos_extraidos/_visualizacion_grupos.pdf")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
