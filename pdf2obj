@@ -1,62 +1,675 @@
+# #!/usr/bin/env python3
+# """
+# Script para mostrar la construcción progresiva de paths vectoriales en un PDF.
+# Genera un nuevo PDF donde cada página muestra los paths acumulativamente.
+# """
+
+# import fitz  # PyMuPDF
+# import sys
+# import os
+
+# def extract_paths_from_page(page):
+#     """
+#     Extrae todos los paths vectoriales de una página.
+#     Retorna una lista de diccionarios con la información de cada path.
+#     """
+#     paths = []
+    
+#     # Obtener los dibujos (drawings) de la página
+#     drawings = page.get_drawings()
+    
+#     for drawing in drawings:
+#         paths.append(drawing)
+    
+#     return paths
+
+# def recreate_path_on_page(page, path_info):
+#     """
+#     Recrea un path en una página con MÁXIMA FIDELIDAD.
+#     Maneja todos los tipos de elementos y propiedades visuales.
+#     """
+#     if 'items' not in path_info or len(path_info['items']) == 0:
+#         return
+    
+#     try:
+#         # Crear una forma (shape) para dibujar
+#         shape = page.new_shape()
+        
+#         # Extraer todas las propiedades con valores por defecto seguros
+#         fill_color = path_info.get('fill', None)
+#         stroke_color = path_info.get('color', None)
+        
+#         # Asegurar que width es float
+#         width = path_info.get('width')
+#         width = float(width) if width is not None else 1.0
+        
+#         # Asegurar que lineCap y lineJoin son enteros
+#         line_cap = path_info.get('lineCap')
+#         if line_cap is not None:
+#             # Puede venir como tuple, list o número
+#             if isinstance(line_cap, (tuple, list)):
+#                 line_cap = int(line_cap[0]) if len(line_cap) > 0 else 0
+#             else:
+#                 line_cap = int(line_cap)
+#         else:
+#             line_cap = 0
+            
+#         line_join = path_info.get('lineJoin')
+#         if line_join is not None:
+#             # Puede venir como tuple, list o número
+#             if isinstance(line_join, (tuple, list)):
+#                 line_join = int(line_join[0]) if len(line_join) > 0 else 0
+#             else:
+#                 line_join = int(line_join)
+#         else:
+#             line_join = 0
+        
+#         dashes = path_info.get('dashes', '')
+        
+#         # Asegurar que las opacidades son float
+#         fill_opacity = path_info.get('fill_opacity')
+#         fill_opacity = float(fill_opacity) if fill_opacity is not None else 1.0
+#         stroke_opacity = path_info.get('stroke_opacity')
+#         stroke_opacity = float(stroke_opacity) if stroke_opacity is not None else 1.0
+        
+#         closePath = path_info.get('closePath', False)
+#         even_odd = path_info.get('even_odd', False)
+        
+#         # Aplicar transformación si existe
+#         matrix = path_info.get('matrix', None)
+#         if matrix:
+#             shape.matrix = matrix
+        
+#         # Variable para rastrear el punto actual
+#         current_point = None
+        
+#         # Procesar cada item del path
+#         for item in path_info['items']:
+#             cmd = item[0]
+            
+#             if cmd == 'm':  # Mover (establece punto inicial)
+#                 current_point = item[1]
+#                 # No se dibuja nada, solo se mueve el "cursor"
+                
+#             elif cmd == 'l':  # Línea recta
+#                 if current_point is None:
+#                     # Si no hay punto previo, el primer punto es el de inicio
+#                     current_point = item[1]
+#                 shape.draw_line(item[1], item[2])
+#                 current_point = item[2]
+                
+#             elif cmd == 'c':  # Curva Bézier cúbica
+#                 # c tiene 4 puntos: punto_inicial(implícito), ctrl1, ctrl2, punto_final
+#                 if current_point is None:
+#                     current_point = item[1]
+#                 shape.draw_bezier(item[1], item[2], item[3], item[4])
+#                 current_point = item[4]
+                
+#             elif cmd == 'v':  # Curva Bézier (variante)
+#                 # v: punto_actual es p0, item[1] es p1 y p2, item[2] es p3
+#                 if len(item) >= 3:
+#                     if current_point is None:
+#                         current_point = item[1]
+#                     # El primer punto de control se repite
+#                     shape.draw_bezier(current_point, item[1], item[1], item[2])
+#                     current_point = item[2]
+                    
+#             elif cmd == 'y':  # Curva Bézier (variante 2)
+#                 # y: punto_actual es p0, item[1] es p1, item[2] es p2 y p3
+#                 if len(item) >= 3:
+#                     if current_point is None:
+#                         current_point = item[1]
+#                     # El segundo punto de control se repite
+#                     shape.draw_bezier(current_point, item[1], item[2], item[2])
+#                     current_point = item[2]
+                    
+#             elif cmd == 're':  # Rectángulo
+#                 rect = item[1]
+#                 shape.draw_rect(rect)
+#                 # Actualizar current_point al primer vértice del rectángulo
+#                 current_point = fitz.Point(rect.x0, rect.y0)
+                
+#             elif cmd == 'qu':  # Cuadrilátero
+#                 quad = item[1]
+#                 shape.draw_quad(quad)
+#                 # Actualizar current_point al primer vértice del quad
+#                 current_point = quad.ul
+                
+#             elif cmd == 'h':  # Cerrar path
+#                 # Se maneja con closePath al final
+#                 pass
+        
+#         # Construir argumentos para finish()
+#         finish_args = {}
+        
+#         # Colores
+#         if fill_color is not None:
+#             finish_args['fill'] = fill_color
+#         if stroke_color is not None:
+#             finish_args['color'] = stroke_color
+#             finish_args['width'] = width
+        
+#         # Propiedades de línea
+#         if stroke_color is not None:
+#             finish_args['lineCap'] = line_cap
+#             finish_args['lineJoin'] = line_join
+#             # Convertir dashes si es necesario
+#             if dashes:
+#                 if isinstance(dashes, str) and dashes.strip():
+#                     finish_args['dashes'] = dashes
+#                 elif isinstance(dashes, (list, tuple)):
+#                     finish_args['dashes'] = str(dashes)
+        
+#         # Opacidades (ya normalizadas arriba)
+#         if fill_color is not None and fill_opacity < 1.0:
+#             finish_args['fill_opacity'] = fill_opacity
+#         if stroke_color is not None and stroke_opacity < 1.0:
+#             finish_args['stroke_opacity'] = stroke_opacity
+        
+#         # Cerrar path si es necesario
+#         if closePath:
+#             finish_args['closePath'] = True
+        
+#         # Regla de relleno
+#         if even_odd:
+#             finish_args['even_odd'] = True
+        
+#         # Aplicar el path con todas las propiedades
+#         shape.finish(**finish_args)
+        
+#         # Aplicar área de recorte si existe
+#         scissor = path_info.get('scissor', None)
+#         if scissor:
+#             shape.clip = scissor
+        
+#         shape.commit()
+        
+#     except Exception as e:
+#         print(f"Advertencia: No se pudo recrear un path: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         # Continuar con los demás paths
+
+# def create_progressive_pdf(input_pdf_path, output_pdf_path):
+#     """
+#     Crea un PDF mostrando la construcción progresiva de los paths.
+#     Mantiene el orden correcto de dibujo usando seqno.
+#     """
+#     # Abrir el PDF original
+#     doc = fitz.open(input_pdf_path)
+    
+#     if len(doc) == 0:
+#         print("Error: El PDF no tiene páginas")
+#         return
+    
+#     # Trabajar con la primera página (puedes modificar para múltiples páginas)
+#     original_page = doc[0]
+#     page_rect = original_page.rect
+    
+#     # Extraer todos los paths
+#     print("Extrayendo paths del PDF...")
+#     all_paths = extract_paths_from_page(original_page)
+    
+#     # Verificar valores de seqno antes de ordenar
+#     seqno_none_count = sum(1 for p in all_paths if p.get('seqno') is None)
+#     if seqno_none_count > 0:
+#         print(f"  ⚠️  {seqno_none_count} paths sin seqno - se colocarán al final")
+    
+#     # Ordenar paths por número de secuencia (seqno) para mantener orden correcto
+#     # Manejar casos donde seqno puede ser None
+#     all_paths.sort(key=lambda x: x.get('seqno') if x.get('seqno') is not None else float('inf'))
+    
+#     print(f"Se encontraron {len(all_paths)} paths en el documento")
+    
+#     # Mostrar información detallada de cada path
+#     print("\nDetalles de los paths:")
+#     for i, path in enumerate(all_paths):
+#         path_type = str(path.get('type', '?'))
+#         seqno = path.get('seqno', 'N/A')
+#         items_count = len(path.get('items', []))
+#         fill = 'Sí' if path.get('fill') else 'No'
+#         stroke = 'Sí' if path.get('color') else 'No'
+#         layer = str(path.get('layer', 'N/A'))
+#         print(f"  Path {i}: tipo={path_type}, seqno={seqno}, items={items_count}, fill={fill}, stroke={stroke}, layer={layer}")
+    
+#     # Crear el nuevo PDF
+#     output_doc = fitz.open()
+    
+#     # Página 1: Documento original completo
+#     print("\n" + "="*60)
+#     print("Creando página 1: Documento original completo")
+#     print("="*60)
+#     new_page = output_doc.new_page(width=page_rect.width, height=page_rect.height)
+#     new_page.show_pdf_page(new_page.rect, doc, 0)
+    
+#     # Páginas siguientes: construcción progresiva
+#     for i in range(len(all_paths)):
+#         print(f"Creando página {i+2}: Mostrando paths 0 a {i} (total: {i+1} paths)")
+#         new_page = output_doc.new_page(width=page_rect.width, height=page_rect.height)
+        
+#         # Dibujar todos los paths hasta el índice i (inclusive)
+#         for j in range(i + 1):
+#             recreate_path_on_page(new_page, all_paths[j])
+    
+#     # Guardar el PDF resultante
+#     output_doc.save(output_pdf_path)
+#     output_doc.close()
+#     doc.close()
+    
+#     print("\n" + "="*60)
+#     print(f"✓ PDF generado exitosamente: {output_pdf_path}")
+#     print("="*60)
+#     print(f"Total de páginas: {len(all_paths) + 1}")
+#     print(f"  - Página 1: Documento original")
+#     print(f"  - Páginas 2-{len(all_paths)+1}: Construcción progresiva de paths")
+#     print(f"\nCada página muestra la construcción acumulativa de los elementos.")
+
+
+# def main():
+#     if len(sys.argv) < 2:
+#         print("Uso: python progressive_pdf_paths.py <archivo_entrada.pdf> [archivo_salida.pdf]")
+#         print("\nEjemplo:")
+#         print("  python progressive_pdf_paths.py documento.pdf documento_progresivo.pdf")
+#         sys.exit(1)
+    
+#     input_pdf = sys.argv[1]
+    
+#     if not os.path.exists(input_pdf):
+#         print(f"Error: El archivo '{input_pdf}' no existe")
+#         sys.exit(1)
+    
+#     # Determinar nombre de salida
+#     if len(sys.argv) >= 3:
+#         output_pdf = sys.argv[2]
+#     else:
+#         base_name = os.path.splitext(input_pdf)[0]
+#         output_pdf = f"{base_name}_progresivo.pdf"
+    
+#     print(f"Procesando: {input_pdf}")
+#     print(f"Salida: {output_pdf}")
+#     print("-" * 50)
+    
+#     try:
+#         create_progressive_pdf(input_pdf, output_pdf)
+#     except Exception as e:
+#         print(f"\nError al procesar el PDF: {str(e)}")
+#         import traceback
+#         traceback.print_exc()
+#         sys.exit(1)
+
+# if __name__ == "__main__":
+#     main()
+
+#!/usr/bin/env python3
+"""
+Script para mostrar la construcción progresiva de paths vectoriales en un PDF.
+Genera un nuevo PDF donde cada página muestra los paths acumulativamente.
+"""
+
 import fitz  # PyMuPDF
+import sys
+import os
 
-def items_in_region(page, region_rect, threshold=0.8):
-    """Devuelve lista de ítems (texto, imágenes, dibujos, anotaciones) 
-    cuyos bounding boxes estén >= threshold dentro de region_rect."""
-    found = []
+def extract_paths_from_page(page):
+    """
+    Extrae todos los paths vectoriales de una página.
+    Retorna una lista de diccionarios con la información de cada path.
+    """
+    paths = []
+    
+    # Obtener los dibujos (drawings) de la página
+    drawings = page.get_drawings()
+    
+    for drawing in drawings:
+        paths.append(drawing)
+    
+    return paths
 
-    # 1. Texto: obtener todas las palabras con su bbox
-    words = page.get_text("words")  # lista de tuplas (x0,y0,x1,y1, "palabra", ...)
-    for w in words:
-        x0, y0, x1, y1 = w[:4]
-        item_rect = fitz.Rect(x0, y0, x1, y1)
-        # calcular intersección
-        inter = region_rect & item_rect  # área de intersección
-        if not inter.is_empty:
-            # ratio de solapamiento sobre el área del ítem
-            if inter.get_area() / item_rect.get_area() >= threshold:
-                found.append(("texto", w[4], (x0,y0,x1,y1)))
+def extract_text_from_page(page):
+    """
+    Extrae todos los bloques de texto de una página con su información completa.
+    """
+    text_blocks = []
+    
+    # Obtener texto con información detallada (posición, fuente, tamaño, color)
+    text_dict = page.get_text("dict")
+    
+    for block in text_dict.get("blocks", []):
+        if block.get("type") == 0:  # Tipo 0 = texto
+            text_blocks.append(block)
+    
+    return text_blocks
 
-    # 2. Imágenes: obtener información de cada imagen referenciada
-    images = page.get_images(full=True)
-    for img in images:
-        # img es una tupla (xref, smask, width, height, bpc, colorspace, alt, name)
-        # get_image_rects devuelve los rects donde aparece esta imagen
-        rects = page.get_image_rects(img)
-        for r in rects:
-            item_rect = fitz.Rect(r)
-            inter = region_rect & item_rect
-            if not inter.is_empty:
-                if inter.get_area() / item_rect.get_area() >= threshold:
-                    found.append(("imagen", img, r))
+def recreate_text_on_page(page, text_block):
+    """
+    Recrea un bloque de texto en una página.
+    """
+    try:
+        for line in text_block.get("lines", []):
+            for span in line.get("spans", []):
+                # Extraer información del span
+                text = span.get("text", "")
+                if not text:
+                    continue
+                
+                origin = span.get("origin")  # Punto de inserción del texto
+                font = span.get("font", "helv")
+                size = span.get("size", 11)
+                color = span.get("color", 0)  # Color en formato entero
+                flags = span.get("flags", 0)
+                
+                # Convertir color de entero a RGB normalizado
+                # PyMuPDF usa color como entero donde RGB = (R<<16) + (G<<8) + B
+                if isinstance(color, int):
+                    r = ((color >> 16) & 0xFF) / 255.0
+                    g = ((color >> 8) & 0xFF) / 255.0
+                    b = (color & 0xFF) / 255.0
+                    color_rgb = (r, g, b)
+                else:
+                    color_rgb = (0, 0, 0)  # Negro por defecto
+                
+                # Insertar texto
+                page.insert_text(
+                    origin,
+                    text,
+                    fontname=font,
+                    fontsize=size,
+                    color=color_rgb,
+                    render_mode=0  # 0 = fill (rellenar)
+                )
+                
+    except Exception as e:
+        print(f"Advertencia: No se pudo recrear texto: {e}")
 
-    # 3. Dibujos (vectoriales): cada trazado tiene 'bbox'
-    drawings = page.get_drawings()  # lista de dicts con clave 'rect' entre otras
-    for d in drawings:
-        # 'rect' da el bounding box del trazo vectorial
-        item_rect = fitz.Rect(d["bbox"])
-        inter = region_rect & item_rect
-        if not inter.is_empty:
-            if inter.get_area() / item_rect.get_area() >= threshold:
-                found.append(("dibujo", d))
+def recreate_path_on_page(page, path_info):
+    """
+    Recrea un path en una página con MÁXIMA FIDELIDAD.
+    Maneja todos los tipos de elementos y propiedades visuales.
+    """
+    if 'items' not in path_info or len(path_info['items']) == 0:
+        return
+    
+    try:
+        # Crear una forma (shape) para dibujar
+        shape = page.new_shape()
+        
+        # Extraer todas las propiedades con valores por defecto seguros
+        fill_color = path_info.get('fill', None)
+        stroke_color = path_info.get('color', None)
+        
+        # Asegurar que width es float
+        width = path_info.get('width')
+        width = float(width) if width is not None else 1.0
+        
+        # Asegurar que lineCap y lineJoin son enteros
+        line_cap = path_info.get('lineCap')
+        if line_cap is not None:
+            # Puede venir como tuple, list o número
+            if isinstance(line_cap, (tuple, list)):
+                line_cap = int(line_cap[0]) if len(line_cap) > 0 else 0
+            else:
+                line_cap = int(line_cap)
+        else:
+            line_cap = 0
+            
+        line_join = path_info.get('lineJoin')
+        if line_join is not None:
+            # Puede venir como tuple, list o número
+            if isinstance(line_join, (tuple, list)):
+                line_join = int(line_join[0]) if len(line_join) > 0 else 0
+            else:
+                line_join = int(line_join)
+        else:
+            line_join = 0
+        
+        dashes = path_info.get('dashes', '')
+        
+        # Asegurar que las opacidades son float
+        fill_opacity = path_info.get('fill_opacity')
+        fill_opacity = float(fill_opacity) if fill_opacity is not None else 1.0
+        stroke_opacity = path_info.get('stroke_opacity')
+        stroke_opacity = float(stroke_opacity) if stroke_opacity is not None else 1.0
+        
+        closePath = path_info.get('closePath', False)
+        even_odd = path_info.get('even_odd', False)
+        
+        # Aplicar transformación si existe
+        matrix = path_info.get('matrix', None)
+        if matrix:
+            shape.matrix = matrix
+        
+        # Variable para rastrear el punto actual
+        current_point = None
+        
+        # Procesar cada item del path
+        for item in path_info['items']:
+            cmd = item[0]
+            
+            if cmd == 'm':  # Mover (establece punto inicial)
+                current_point = item[1]
+                # No se dibuja nada, solo se mueve el "cursor"
+                
+            elif cmd == 'l':  # Línea recta
+                if current_point is None:
+                    # Si no hay punto previo, el primer punto es el de inicio
+                    current_point = item[1]
+                shape.draw_line(item[1], item[2])
+                current_point = item[2]
+                
+            elif cmd == 'c':  # Curva Bézier cúbica
+                # c tiene 4 puntos: punto_inicial(implícito), ctrl1, ctrl2, punto_final
+                if current_point is None:
+                    current_point = item[1]
+                shape.draw_bezier(item[1], item[2], item[3], item[4])
+                current_point = item[4]
+                
+            elif cmd == 'v':  # Curva Bézier (variante)
+                # v: punto_actual es p0, item[1] es p1 y p2, item[2] es p3
+                if len(item) >= 3:
+                    if current_point is None:
+                        current_point = item[1]
+                    # El primer punto de control se repite
+                    shape.draw_bezier(current_point, item[1], item[1], item[2])
+                    current_point = item[2]
+                    
+            elif cmd == 'y':  # Curva Bézier (variante 2)
+                # y: punto_actual es p0, item[1] es p1, item[2] es p2 y p3
+                if len(item) >= 3:
+                    if current_point is None:
+                        current_point = item[1]
+                    # El segundo punto de control se repite
+                    shape.draw_bezier(current_point, item[1], item[2], item[2])
+                    current_point = item[2]
+                    
+            elif cmd == 're':  # Rectángulo
+                rect = item[1]
+                shape.draw_rect(rect)
+                # Actualizar current_point al primer vértice del rectángulo
+                current_point = fitz.Point(rect.x0, rect.y0)
+                
+            elif cmd == 'qu':  # Cuadrilátero
+                quad = item[1]
+                shape.draw_quad(quad)
+                # Actualizar current_point al primer vértice del quad
+                current_point = quad.ul
+                
+            elif cmd == 'h':  # Cerrar path
+                # Se maneja con closePath al final
+                pass
+        
+        # Construir argumentos para finish()
+        finish_args = {}
+        
+        # Colores
+        if fill_color is not None:
+            finish_args['fill'] = fill_color
+        if stroke_color is not None:
+            finish_args['color'] = stroke_color
+            finish_args['width'] = width
+        
+        # Propiedades de línea
+        if stroke_color is not None:
+            finish_args['lineCap'] = line_cap
+            finish_args['lineJoin'] = line_join
+            # Convertir dashes correctamente
+            if dashes:
+                # dashes puede venir como string "[2 2]" o como lista
+                if isinstance(dashes, str) and dashes.strip():
+                    # PyMuPDF espera formato "[d1 d2 ...]" donde d1, d2 son números
+                    finish_args['dashes'] = dashes
+                elif isinstance(dashes, (list, tuple)) and len(dashes) > 0:
+                    # Convertir lista a string en formato correcto
+                    dashes_str = "[" + " ".join(str(int(d)) for d in dashes) + "]"
+                    finish_args['dashes'] = dashes_str
+        
+        # Opacidades (ya normalizadas arriba)
+        if fill_color is not None and fill_opacity < 1.0:
+            finish_args['fill_opacity'] = fill_opacity
+        if stroke_color is not None and stroke_opacity < 1.0:
+            finish_args['stroke_opacity'] = stroke_opacity
+        
+        # Cerrar path si es necesario
+        if closePath:
+            finish_args['closePath'] = True
+        
+        # Regla de relleno
+        if even_odd:
+            finish_args['even_odd'] = True
+        
+        # Aplicar el path con todas las propiedades
+        shape.finish(**finish_args)
+        
+        # Aplicar área de recorte si existe
+        scissor = path_info.get('scissor', None)
+        if scissor:
+            shape.clip = scissor
+        
+        shape.commit()
+        
+    except Exception as e:
+        print(f"Advertencia: No se pudo recrear un path: {e}")
+        import traceback
+        traceback.print_exc()
+        # Continuar con los demás paths
 
-    # 4. Anotaciones: todas las anotaciones de la página
-    for annot in page.annots():
-        item_rect = annot.rect
-        inter = region_rect & item_rect
-        if not inter.is_empty:
-            if inter.get_area() / item_rect.get_area() >= threshold:
-                found.append(("anotacion", annot.type[1], (item_rect.x0, item_rect.y0, item_rect.x1, item_rect.y1)))
+def create_progressive_pdf(input_pdf_path, output_pdf_path):
+    """
+    Crea un PDF mostrando la construcción progresiva de los paths y texto.
+    Mantiene el orden correcto de dibujo usando seqno.
+    """
+    # Abrir el PDF original
+    doc = fitz.open(input_pdf_path)
+    
+    if len(doc) == 0:
+        print("Error: El PDF no tiene páginas")
+        return
+    
+    # Trabajar con la primera página (puedes modificar para múltiples páginas)
+    original_page = doc[0]
+    page_rect = original_page.rect
+    
+    # Extraer todos los paths
+    print("Extrayendo paths del PDF...")
+    all_paths = extract_paths_from_page(original_page)
+    
+    # Extraer todo el texto
+    print("Extrayendo texto del PDF...")
+    all_text_blocks = extract_text_from_page(original_page)
+    
+    # Verificar valores de seqno antes de ordenar
+    seqno_none_count = sum(1 for p in all_paths if p.get('seqno') is None)
+    if seqno_none_count > 0:
+        print(f"  ⚠️  {seqno_none_count} paths sin seqno - se colocarán al final")
+    
+    # Ordenar paths por número de secuencia (seqno) para mantener orden correcto
+    # Manejar casos donde seqno puede ser None
+    all_paths.sort(key=lambda x: x.get('seqno') if x.get('seqno') is not None else float('inf'))
+    
+    print(f"Se encontraron {len(all_paths)} paths en el documento")
+    print(f"Se encontraron {len(all_text_blocks)} bloques de texto en el documento")
+    
+    # Mostrar información detallada de cada path
+    print("\nDetalles de los paths:")
+    for i, path in enumerate(all_paths):
+        path_type = str(path.get('type', '?'))
+        seqno = path.get('seqno', 'N/A')
+        items_count = len(path.get('items', []))
+        fill = 'Sí' if path.get('fill') else 'No'
+        stroke = 'Sí' if path.get('color') else 'No'
+        dashes = path.get('dashes', '')
+        has_dashes = 'Sí' if dashes else 'No'
+        layer = str(path.get('layer', 'N/A'))
+        print(f"  Path {i}: tipo={path_type}, seqno={seqno}, items={items_count}, fill={fill}, stroke={stroke}, dashes={has_dashes}, layer={layer}")
+    
+    # Crear el nuevo PDF
+    output_doc = fitz.open()
+    
+    # Página 1: Documento original completo
+    print("\n" + "="*60)
+    print("Creando página 1: Documento original completo")
+    print("="*60)
+    new_page = output_doc.new_page(width=page_rect.width, height=page_rect.height)
+    new_page.show_pdf_page(new_page.rect, doc, 0)
+    
+    # Páginas siguientes: construcción progresiva
+    for i in range(len(all_paths)):
+        print(f"Creando página {i+2}: Mostrando paths 0 a {i} (total: {i+1} paths)")
+        new_page = output_doc.new_page(width=page_rect.width, height=page_rect.height)
+        
+        # Primero dibujar todos los paths hasta el índice i (inclusive)
+        for j in range(i + 1):
+            recreate_path_on_page(new_page, all_paths[j])
+        
+        # Luego agregar TODO el texto en cada página
+        for text_block in all_text_blocks:
+            recreate_text_on_page(new_page, text_block)
+    
+    # Guardar el PDF resultante
+    output_doc.save(output_pdf_path)
+    output_doc.close()
+    doc.close()
+    
+    print("\n" + "="*60)
+    print(f"✓ PDF generado exitosamente: {output_pdf_path}")
+    print("="*60)
+    print(f"Total de páginas: {len(all_paths) + 1}")
+    print(f"  - Página 1: Documento original")
+    print(f"  - Páginas 2-{len(all_paths)+1}: Construcción progresiva de paths")
+    print(f"\nCada página muestra la construcción acumulativa de los paths.")
+    print(f"El texto se mantiene en todas las páginas.")
 
-    return found
 
-# --- Uso del ejemplo ---
-# Abrir documento y cargar página
-doc = fitz.open("mi_documento.pdf")
-page = doc.load_page(0)  # página 0
-# Definir región manual (por ejemplo, rectángulo desde (50,100) hasta (300,400))
-region = fitz.Rect(50, 100, 300, 400)
-# Filtrar ítems y mostrar resultados
-items = items_in_region(page, region, threshold=0.8)
-for tipo, info, coord in items:
-    print(tipo, info, coord)
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: python progressive_pdf_paths.py <archivo_entrada.pdf> [archivo_salida.pdf]")
+        print("\nEjemplo:")
+        print("  python progressive_pdf_paths.py documento.pdf documento_progresivo.pdf")
+        sys.exit(1)
+    
+    input_pdf = sys.argv[1]
+    
+    if not os.path.exists(input_pdf):
+        print(f"Error: El archivo '{input_pdf}' no existe")
+        sys.exit(1)
+    
+    # Determinar nombre de salida
+    if len(sys.argv) >= 3:
+        output_pdf = sys.argv[2]
+    else:
+        base_name = os.path.splitext(input_pdf)[0]
+        output_pdf = f"{base_name}_progresivo.pdf"
+    
+    print(f"Procesando: {input_pdf}")
+    print(f"Salida: {output_pdf}")
+    print("-" * 50)
+    
+    try:
+        create_progressive_pdf(input_pdf, output_pdf)
+    except Exception as e:
+        print(f"\nError al procesar el PDF: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
