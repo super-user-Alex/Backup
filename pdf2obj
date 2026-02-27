@@ -3,33 +3,18 @@ import fitz
 doc = fitz.open("archivo.pdf")
 page = doc[0]
 
-# 1. Buscar imágenes inline en el content stream crudo
-content = b""
-for xref in page.get_contents():
-    content += doc.xref_stream(xref)
-
-if b"BI" in content:
-    print("HAY imágenes inline (BI...EI) en el content stream")
-
-# 2. Revisar anotaciones
-for annot in page.annots():
-    print(f"Anotación tipo: {annot.type}, rect: {annot.rect}")
-    # Ver si tiene stream de apariencia
-    xref = annot.xref
-    ap = doc.xref_get_key(xref, "AP")
-    if ap != ("null", "null"):
-        print(f"  → Tiene apariencia (AP stream): {ap}")
-
-# 3. Revisar Form XObjects y sus recursos internos
-for xobj in page.get_xobjects():
-    xref = xobj[0]
-    obj_str = doc.xref_object(xref)
-    if "/Subtype /Form" in obj_str:
-        stream = doc.xref_stream(xref)
-        print(f"Form XObject xref={xref}")
-        if stream and b"BI" in stream:
-            print(f"  → Contiene imágenes inline")
-        # Ver sus recursos internos
-        sub_images = doc.xref_get_key(xref, "Resources/XObject")
-        if sub_images != ("null", "null"):
-            print(f"  → Tiene sub-XObjects: {sub_images}")
+# Inspeccionar esos Form XObjects específicos
+for xref in [122, 123]:
+    print(f"\n=== XObject xref={xref} ===")
+    print(doc.xref_object(xref))  # Ver el diccionario completo
+    
+    stream = doc.xref_stream(xref)
+    if stream:
+        print("\n--- Stream (primeros 500 bytes) ---")
+        print(stream[:500])
+    
+    # Ver si tiene Patterns o Shadings en sus recursos
+    for key in ["Resources/Pattern", "Resources/Shading", "Resources/XObject"]:
+        val = doc.xref_get_key(xref, key)
+        if val != ("null", "null"):
+            print(f"\n{key}: {val}")
