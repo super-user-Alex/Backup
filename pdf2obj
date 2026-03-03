@@ -1,20 +1,36 @@
-import fitz
+import pymupdf
+import re
 
-doc = fitz.open("archivo.pdf")
-page = doc[0]
+def get_swatches(doc):
+    """
+    Extrae colores con nombre (Separation colorspaces) del PDF.
+    Retorna dict: {"NombreSwatch": (c, m, y, k)} o (r, g, b)
+    """
+    swatches = {}
+    
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj_str = doc.xref_object(xref, compressed=False)
+        except:
+            continue
+        
+        # Buscar colorspaces tipo Separation
+        if "/Separation" in obj_str:
+            # Extraer el nombre del swatch
+            match = re.search(r'/Separation\s+/([^\s/\]>]+)', obj_str)
+            if match:
+                name = match.group(1)
+                # Buscar valores CMYK o RGB en la función de conversión
+                # (los valores están como números en la tint transform)
+                values = re.findall(r'\b(0(?:\.\d+)?|1(?:\.0+)?|\.\d+)\b', obj_str)
+                if values:
+                    floats = [float(v) for v in values]
+                    swatches[name] = floats
+    
+    return swatches
 
-# Inspeccionar esos Form XObjects específicos
-for xref in [122, 123]:
-    print(f"\n=== XObject xref={xref} ===")
-    print(doc.xref_object(xref))  # Ver el diccionario completo
-    
-    stream = doc.xref_stream(xref)
-    if stream:
-        print("\n--- Stream (primeros 500 bytes) ---")
-        print(stream[:500])
-    
-    # Ver si tiene Patterns o Shadings en sus recursos
-    for key in ["Resources/Pattern", "Resources/Shading", "Resources/XObject"]:
-        val = doc.xref_get_key(xref, key)
-        if val != ("null", "null"):
-            print(f"\n{key}: {val}")
+# Uso
+doc = pymupdf.open("mi_archivo.pdf")
+swatches = get_swatches(doc)
+print(swatches)
+# Ejemplo: {"Pantone 485 C": [0.0, 0.95, 1.0, 0.0], "Azul Marca": [...]}
