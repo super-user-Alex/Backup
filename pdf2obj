@@ -2,7 +2,7 @@ import pymupdf
 import re
 
 def get_swatches(doc):
-    """Extrae swatches Separation del PDF: {nombre: (c, m, y, k)}"""
+    """Extrae swatches Separation del PDF: {nombre: (C, M, Y, K)}"""
     swatches = {}
     for xref in range(1, doc.xref_length()):
         try:
@@ -11,100 +11,116 @@ def get_swatches(doc):
             continue
         if "/Separation" not in obj_str:
             continue
-        
         match_name = re.search(r'/Separation\s+/([^\s/\]>]+)', obj_str)
-        # Extraer C1 (color al 100%) — 4 valores CMYK
-        match_c1 = re.search(r'/C1\s*\[([^\]]+)\]', obj_str)
-        
+        match_c1   = re.search(r'/C1\s*\[([^\]]+)\]', obj_str)
         if match_name and match_c1:
             name = match_name.group(1)
-            c1_values = [float(v) for v in match_c1.group(1).split()]
-            swatches[name] = tuple(c1_values)  # (C, M, Y, K)
-    
+            c1   = [float(v) for v in match_c1.group(1).split()]
+            swatches[name] = tuple(c1)
     return swatches
 
 
-def add_separation_colorspace(doc, name, cmyk):
+def draw_with_swatch(doc, page, rect, swatch_name, cmyk, tint=1.0):
     """
-    Inserta un colorspace Separation en el PDF con nombre y valores CMYK.
-    Retorna el xref del colorspace creado.
+    Dibuja un rectángulo usando un colorspace Separation,
+    de modo que Illustrator reconozca el nombre del swatch.
     """
     c, m, y, k = cmyk
-    cs_obj = f"""[ /Separation /{name} /DeviceCMYK <<
-    /FunctionType 2
-    /Domain [ 0 1 ]
-    /C0 [ 0 0 0 0 ]
-    /C1 [ {c} {m} {y} {k} ]
-    /N 1
-    /Range [ 0 1 0 1 0 1 0 1 ]
->>]"""
-    xref = doc.get_new_xref()
-    doc.update_object(xref, cs_obj)
-    return xref
 
+    # 1. Crear el objeto colorspace Separation en el PDF
+    cs_obj = (
+        f"[ /Separation /{swatch_name} /DeviceCMYK <<\n"
+        f"  /FunctionType 2\n"
+        f"  /Domain [ 0 1 ]\n"
+        f"  /C0 [ 0 0 0 0 ]\n"
+        f"  /C1 [ {c} {m} {y} {k} ]\n"
+        f"  /N 1\n"
+        f"  /Range [ 0 1 0 1 0 1 0 1 ]\n"
+        f">>]"
+    )
+    cs_xref = doc.get_new_xref()
+    doc.update_object(cs_xref, cs_obj)
 
-def draw_with_swatch(page, rect, swatch_name, cmyk, doc):
-    """
-    Dibuja un rectángulo usando el colorspace Separation del swatch,
-    de modo que Illustrator reconozca el nombre del color.
-    """
-    # Crear el colorspace Separation en el PDF
-    cs_xref = add_separation_colorspace(doc, swatch_name, cmyk)
+    # 2. Registrar el colorspace en /Resources /ColorSpace de la página
+    res_name = f"CS{swatch_name}"  # nombre interno del recurso
 
-    # Registrar el colorspace como recurso de la página
-    # Nombre interno del recurso (sin espacios)
-    cs_resource_name = f"CS_{swatch_name.replace(' ', '_')}"
-    
-    # Obtener recursos actuales de la página
-    page_obj = doc.xref_object(page.xref, compressed=False)
-    
-    # Insertar el colorspace en /Resources /ColorSpace
-    doc.set_page_label  # solo para asegurar que la página está inicializada
-    page._set_resource_property(
-        "ColorSpace", cs_resource_name, f"{cs_xref} 0 R"
+    # Leer recursos actuales de la página
+    page_xref = page.xref
+    page_obj  = doc.xref_object(page_xref, compressed=False)
+
+    if "/Resources" not in page_obj:
+        # Insertar Resources vacío si no existe
+        page_obj = page_obj.replace(">>", "/Resources << >>\n>>")
+        doc.update_object(page_xref, page_obj)
+        page_obj = doc.xref_object(page_xref, compressed=False)
+
+    # Obtener xref del dict Resources (puede ser indirecto)
+    res_match = re.search(r'/Resources\s+(\d+)\s+0\s+R', page_obj)
+    if res_match:
+        res_xref = int(res_match.group(1))
+        res_obj  = doc.xref_object(res_xref, compressed=False)
+    else:
+        # Resources está inline en la página
+        res_xref = None
+        res_obj  = page_obj
+
+    # Agregar /ColorSpace al dict de Resources
+    cs_entry = f"/{res_name} {cs_xref} 0 R"
+    if "/ColorSpace" in res_obj:
+        res_obj = re.sub(
+            r'/ColorSpace\s*<<',
+            f'/ColorSpace << {cs_entry}',
+            res_obj
+        )
+    else:
+        res_obj = res_obj.replace(">>", f"/ColorSpace << {cs_entry} >>\n>>", 1)
+
+    if res_xref:
+        doc.update_object(res_xref, res_obj)
+    else:
+        doc.update_object(page_xref, res_obj)
+
+    # 3. Inyectar el content stream con operadores de color Separation
+    x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
+    h = page.rect.height  # altura de la página para invertir eje Y
+
+    stream = (
+        f"q\n"
+        f"/{res_name} cs\n"       # colorspace de relleno
+        f"{tint} scn\n"           # tint (0=sin tinta, 1=100%)
+        f"/{res_name} CS\n"       # colorspace de trazo
+        f"{tint} SCN\n"
+        f"{x0} {h - y1} {x1 - x0} {y1 - y0} re\n"  # rectángulo
+        f"f\n"                    # fill
+        f"Q\n"
     )
 
-    # Dibujar con content stream usando el colorspace Separation
-    # Tint = 1.0 significa 100% del color
-    tint = 1.0
-    x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
-    # Convertir coordenadas a espacio PDF (origen abajo)
-    h = page.rect.height
-    
-    stream = f"""q
-/{cs_resource_name} CS        % colorspace de relleno
-{tint} SCN                    % tint al 100%
-/{cs_resource_name} cs        % colorspace de trazo
-{tint} scn
-{x0} {h - y1} {x1 - x0} {y1 - y0} re
-f
-Q
-"""
-    page.insert_text((0, 0), "", overlay=False)  # asegurar que page tiene contents
-    # Inyectar el stream directamente
-    doc.update_stream(page.get_contents()[-1], stream.encode(), new=False)
+    # Agregar como nuevo content stream a la página
+    new_xref = doc.get_new_xref()
+    doc.update_stream(new_xref, stream.encode())
+
+    # Vincular el nuevo stream a la página
+    contents = page.get_contents()
+    contents.append(new_xref)
+    page.set_contents(contents)
 
 
 # ── USO ──────────────────────────────────────────────────────────────────────
 
 doc = pymupdf.open("tu_archivo.pdf")
 
-# 1. Extraer swatches del PDF
 swatches = get_swatches(doc)
-print("Swatches encontrados:", swatches)
+print("Swatches:", swatches)
 # → {'LASER': (0.0, 0.0, 0.0, 0.7), ...}
 
-# 2. Dibujar usando el swatch por nombre
 page = doc[0]
-nombre = "LASER"
-cmyk = swatches[nombre]  # (0.0, 0.0, 0.0, 0.7)
-
 draw_with_swatch(
+    doc=doc,
     page=page,
     rect=pymupdf.Rect(50, 50, 200, 150),
-    swatch_name=nombre,
-    cmyk=cmyk,
-    doc=doc
+    swatch_name="LASER",
+    cmyk=swatches["LASER"],
+    tint=1.0  # 1.0 = 100% del color
 )
 
-doc.save("output.pdf")
+doc.save("output.pdf", garbage=4, deflate=True)
