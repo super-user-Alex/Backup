@@ -1,17 +1,22 @@
 """
 =============================================================================
-  Adobe Illustrator — PDF Swatch Generator + Color Replacer
-  ----------------------------------------------------------
-  Sin reportlab · Sin pikepdf · 100% licencias permisivas
+  Adobe Illustrator — PDF Swatch Generator + Color Replacer (v4)
+  ---------------------------------------------------------------
+  Maneja correctamente PDFs guardados desde Illustrator, que contienen:
+
+    1. /Contents        → Content stream PDF estándar (visores normales)
+    2. /AIPrivateData   → Stream nativo de Illustrator (PostScript/AI)
+       /AIMetaData      → Metadatos del documento AI
+
+  Cuando Illustrator abre un PDF que él mismo guardó, IGNORA el /Contents
+  estándar y usa directamente el /AIPrivateData. Por eso los cambios en
+  el content stream eran visibles en visores normales pero no en Illustrator.
+
+  Solución: reemplazar colores en AMBOS streams simultáneamente.
 
   Dependencias:
-    pypdf  5.x  →  BSD-3-Clause  (pip install pypdf)
-    struct, zlib, re, pathlib  →  stdlib Python (sin instalación)
-
-  Archivos generados:
-    • swatch_illustrator.ase         → Muestra de color para Illustrator
-    • output_illustrator_ready.pdf   → PDF con color CMYK aplicado
-    • swatch_preview.pdf             → Previsualización del swatch
+    pypdf  5.x  →  BSD-3-Clause   (pip install pypdf)
+    struct, zlib, re  →  stdlib Python
 =============================================================================
 """
 
@@ -19,7 +24,6 @@ import re
 import struct
 import zlib
 from io import BytesIO
-from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
@@ -32,183 +36,277 @@ from pypdf.generic import (
 
 
 # ─────────────────────────────────────────────────────
-#  CONFIGURACIÓN DEL COLOR
+#  CONFIGURACIÓN
 # ─────────────────────────────────────────────────────
 COLOR_CONFIG = {
     "name": "Azul Corporativo",
-    "cmyk": (85, 50, 0, 10),          # C, M, Y, K  (0–100)
+    "cmyk": (85, 50, 0, 10),
 }
 
-INPUT_PDF       = "input_design.pdf"
-OUTPUT_PDF      = "output_illustrator_ready.pdf"
-OUTPUT_ASE      = "swatch_illustrator.ase"
-PREVIEW_PDF     = "swatch_preview.pdf"
+INPUT_PDF   = "input_design.pdf"
+OUTPUT_PDF  = "output_illustrator_ready.pdf"
+OUTPUT_ASE  = "swatch_illustrator.ase"
+PREVIEW_PDF = "swatch_preview.pdf"
 
 
 # ─────────────────────────────────────────────────────
 #  UTILIDADES DE COLOR
 # ─────────────────────────────────────────────────────
-def normalize(cmyk: tuple) -> tuple:
-    """CMYK (0–100) → flotantes (0.0–1.0)."""
+def normalize(cmyk):
     return tuple(round(v / 100.0, 6) for v in cmyk)
 
-
-def cmyk_to_rgb(c, m, y, k) -> tuple:
-    """CMYK (0–100) → RGB (0–255). Solo referencia visual."""
+def cmyk_to_rgb(c, m, y, k):
     c, m, y, k = c/100, m/100, y/100, k/100
-    return (
-        round(255 * (1-c) * (1-k)),
-        round(255 * (1-m) * (1-k)),
-        round(255 * (1-y) * (1-k)),
-    )
+    return (round(255*(1-c)*(1-k)), round(255*(1-m)*(1-k)), round(255*(1-y)*(1-k)))
 
-
-def rgb_hex(r, g, b) -> str:
+def rgb_hex(r, g, b):
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
 # ─────────────────────────────────────────────────────
-#  1. CREAR ARCHIVO .ASE (Adobe Swatch Exchange)
-#     stdlib pura — struct, sin dependencias externas
+#  1. CREAR .ASE
 # ─────────────────────────────────────────────────────
-def create_ase(color_name: str, cmyk: tuple, path: str) -> None:
-    """
-    Formato ASE binario (Big Endian):
-      'ASEF'  →  firma
-      HH      →  versión 1.0
-      I       →  número de bloques
-      ── Bloque 0x0001: Color Entry ─────────────
-      H       →  tipo bloque
-      I       →  tamaño de datos del bloque
-      H       →  longitud del nombre (chars + null)
-      xB      →  nombre UTF-16 BE + \x00\x00
-      4s      →  modelo: 'CMYK'
-      4f      →  valores C M Y K  (float32 BE, 0.0–1.0)
-      H       →  uso: 0=Global 1=Spot 2=Normal
-    """
+def create_ase(color_name, cmyk, path):
     c, m, y, k = normalize(cmyk)
     name_utf16 = color_name.encode("utf-16-be") + b"\x00\x00"
-    name_len   = len(color_name) + 1
     block_size = 2 + len(name_utf16) + 4 + 16 + 2
-
     with open(path, "wb") as f:
         f.write(b"ASEF")
         f.write(struct.pack(">HH", 1, 0))
         f.write(struct.pack(">I", 1))
         f.write(struct.pack(">H", 0x0001))
         f.write(struct.pack(">I", block_size))
-        f.write(struct.pack(">H", name_len))
+        f.write(struct.pack(">H", len(color_name) + 1))
         f.write(name_utf16)
         f.write(b"CMYK")
         f.write(struct.pack(">ffff", c, m, y, k))
         f.write(struct.pack(">H", 2))
-
     rgb = cmyk_to_rgb(*cmyk)
-    print(f"  ✔ Swatch .ASE creado   →  {path}")
-    print(f"     Nombre : {color_name}")
-    print(f"     CMYK   : C={cmyk[0]}  M={cmyk[1]}  Y={cmyk[2]}  K={cmyk[3]}")
-    print(f"     RGB    : {rgb_hex(*rgb)}")
+    print(f"  ✔ Swatch .ASE          →  {path}")
+    print(f"     CMYK: C={cmyk[0]} M={cmyk[1]} Y={cmyk[2]} K={cmyk[3]}  |  HEX: {rgb_hex(*rgb)}")
 
 
 # ─────────────────────────────────────────────────────
-#  2. REEMPLAZAR COLORES EN PDF  (pypdf — BSD-3)
+#  2. REEMPLAZAR COLORES EN PDF CONTENT STREAM
+#     (pypdf ContentStream — para el stream PDF estándar)
 # ─────────────────────────────────────────────────────
-"""
-Operadores de color relevantes en PDF:
-  rg / RG   →  fill / stroke  RGB    (3 operandos: r g b)
-  k  / K    →  fill / stroke  CMYK   (4 operandos: c m y k)
-  g  / G    →  fill / stroke  Gray   (1 operando: gray)
-  sc / SC   →  fill / stroke  en espacio de color activo
-  scn/ SCN  →  igual, con soporte de patrones y separación
-
-Estrategia: recorrer las operaciones del ContentStream y
-sustituir TODOS los operadores de color por k / K en CMYK.
-"""
-
-# Operadores que establecen color de relleno o trazo
 FILL_OPS   = {b"rg", b"k",  b"g",  b"sc",  b"scn"}
 STROKE_OPS = {b"RG", b"K",  b"G",  b"SC",  b"SCN"}
-COLOR_OPS  = FILL_OPS | STROKE_OPS
 
-
-def replace_colors_in_stream(
-    content_stream: ContentStream,
-    c: float, m: float, y: float, k: float,
-) -> list:
-    """
-    Devuelve la lista de operaciones con todos los colores
-    reemplazados por el CMYK indicado.
-    No toca: texto (Tf, Td, Tj…), imágenes, transformaciones.
-    """
-    new_ops = []
+def replace_pdf_stream(stream_obj, reader, c, m, y, k):
+    """Reemplaza colores en un content stream PDF usando pypdf."""
+    cs = ContentStream(stream_obj, reader)
     cmyk_vals = [FloatObject(c), FloatObject(m), FloatObject(y), FloatObject(k)]
-
-    for operands, operator in content_stream.operations:
+    new_ops = []
+    for operands, operator in cs.operations:
         if operator in FILL_OPS:
-            new_ops.append((cmyk_vals, b"k"))
+            new_ops.append((list(cmyk_vals), b"k"))
         elif operator in STROKE_OPS:
-            new_ops.append((cmyk_vals, b"K"))
+            new_ops.append((list(cmyk_vals), b"K"))
         else:
             new_ops.append((operands, operator))
+    cs.operations = new_ops
+    new_bytes = cs.get_data()
+    compressed = zlib.compress(new_bytes, level=9)
+    # Modificar IN-PLACE para evitar objetos huérfanos
+    stream_obj._data = compressed
+    stream_obj[NameObject("/Filter")] = NameObject("/FlateDecode")
+    stream_obj[NameObject("/Length")] = NumberObject(len(compressed))
+    for old_key in ("/DecodeParms", "/Columns", "/Predictor"):
+        if old_key in stream_obj:
+            del stream_obj[old_key]
 
-    return new_ops
+
+# ─────────────────────────────────────────────────────
+#  3. REEMPLAZAR COLORES EN AIPRIVATEDATA
+#     (PostScript/AI nativo — procesado con regex sobre texto)
+# ─────────────────────────────────────────────────────
+"""
+El AIPrivateData contiene comandos PostScript/AI. Los operadores de color
+que aparecen ahí son diferentes al PDF estándar:
+
+  PDF estándar:
+    r g b rg          → RGB fill
+    c m y k k         → CMYK fill
+
+  PostScript / AI nativo:
+    r g b setrgbcolor
+    c m y k setcmykcolor
+    r g b rg          (también usa operadores PDF directos)
+    c m y k k
+
+  Formato específico de Illustrator (.AI / EPS embebido):
+    C M Y K Xa        → fill con tinta de proceso (Xa = color command)
+    C M Y K Xb        → stroke
+    C M Y K XA        → variante
+    r g b Xr          → RGB fill
+"""
+
+# Regex para operadores de color en PostScript/AI
+_N    = r"[-+]?\d*\.?\d+"          # número flotante
+_SP   = r"\s+"                      # espacios/saltos
+
+AI_COLOR_PATTERNS = [
+    # PostScript estándar
+    (re.compile(rf"({_N}{_SP}){3}setrgbcolor"),   "rgb_ps"),
+    (re.compile(rf"({_N}{_SP}){4}setcmykcolor"),  "cmyk_ps"),
+    (re.compile(rf"({_N}{_SP}){1}setgray"),       "gray_ps"),
+    # PDF operators dentro del stream AI
+    (re.compile(rf"({_N}\s+){{3}}rg\b"),          "rgb_fill"),
+    (re.compile(rf"({_N}\s+){{3}}RG\b"),          "rgb_stroke"),
+    (re.compile(rf"({_N}\s+){{4}}k\b"),           "cmyk_fill"),
+    (re.compile(rf"({_N}\s+){{4}}K\b"),           "cmyk_stroke"),
+    (re.compile(rf"({_N}\s+){{1}}g\b"),           "gray_fill"),
+    (re.compile(rf"({_N}\s+){{1}}G\b"),           "gray_stroke"),
+    # Comandos propietarios de Illustrator
+    (re.compile(rf"({_N}{_SP}){4}Xa\b"),          "ai_fill"),
+    (re.compile(rf"({_N}{_SP}){4}Xb\b"),          "ai_stroke"),
+    (re.compile(rf"({_N}{_SP}){4}XA\b"),          "ai_fill_alt"),
+    (re.compile(rf"({_N}{_SP}){3}Xr\b"),          "ai_rgb"),
+]
 
 
-def apply_color_to_pdf(
-    input_path: str,
-    output_path: str,
-    color_name: str,
-    cmyk: tuple,
-) -> None:
+def replace_ai_stream_colors(text, c, m, y, k):
     """
-    Abre el PDF, reemplaza todos los colores en sus content streams
-    y guarda el resultado. Usa únicamente pypdf (BSD-3-Clause).
+    Reemplaza todos los operadores de color en texto PostScript/AI
+    con el color CMYK dado. Devuelve el texto modificado.
+    """
+    cf = f"{c:.4f}"
+    mf = f"{m:.4f}"
+    yf = f"{y:.4f}"
+    kf = f"{k:.4f}"
 
-    Estrategia: modificar el stream EN EL MISMO OBJETO (in-place).
-    Esto evita que el stream original quede como objeto huérfano en
-    el PDF — lo que causa que Illustrator lo encuentre y lo use en
-    lugar del stream modificado, mostrando los colores originales.
+    cmyk_pdf_fill   = f"{cf} {mf} {yf} {kf} k"
+    cmyk_pdf_stroke = f"{cf} {mf} {yf} {kf} K"
+    cmyk_ps         = f"{cf} {mf} {yf} {kf} setcmykcolor"
+    cmyk_ai_fill    = f"{cf} {mf} {yf} {kf} Xa"
+    cmyk_ai_stroke  = f"{cf} {mf} {yf} {kf} Xb"
+
+    replacements = {
+        "rgb_ps":      cmyk_ps,
+        "cmyk_ps":     cmyk_ps,
+        "gray_ps":     cmyk_ps,
+        "rgb_fill":    cmyk_pdf_fill,
+        "rgb_stroke":  cmyk_pdf_stroke,
+        "cmyk_fill":   cmyk_pdf_fill,
+        "cmyk_stroke": cmyk_pdf_stroke,
+        "gray_fill":   cmyk_pdf_fill,
+        "gray_stroke": cmyk_pdf_stroke,
+        "ai_fill":     cmyk_ai_fill,
+        "ai_stroke":   cmyk_ai_stroke,
+        "ai_fill_alt": cmyk_ai_fill,
+        "ai_rgb":      cmyk_pdf_fill,
+    }
+
+    for pattern, kind in AI_COLOR_PATTERNS:
+        text = pattern.sub(replacements[kind], text)
+
+    return text
+
+
+def process_ai_stream(stream_obj, c, m, y, k):
+    """
+    Lee, decodifica, modifica colores y recomprime el AIPrivateData.
+    Maneja: FlateDecode, ASCII85Decode, y combinaciones.
+    """
+    try:
+        raw = stream_obj.get_data()  # pypdf decodifica automáticamente
+    except Exception:
+        return False  # No decodificable, omitir
+
+    try:
+        text = raw.decode("latin-1")
+    except Exception:
+        return False
+
+    original = text
+    text = replace_ai_stream_colors(text, c, m, y, k)
+
+    if text == original:
+        return False  # Sin cambios
+
+    new_bytes = text.encode("latin-1")
+    compressed = zlib.compress(new_bytes, level=9)
+
+    stream_obj._data = compressed
+    stream_obj[NameObject("/Filter")] = NameObject("/FlateDecode")
+    stream_obj[NameObject("/Length")] = NumberObject(len(compressed))
+    for old_key in ("/DecodeParms", "/Columns", "/Predictor"):
+        if old_key in stream_obj:
+            del stream_obj[old_key]
+
+    return True
+
+
+# ─────────────────────────────────────────────────────
+#  4. FUNCIÓN PRINCIPAL: APPLY COLOR TO PDF
+# ─────────────────────────────────────────────────────
+
+# Claves donde Illustrator puede guardar streams de datos propios
+AI_STREAM_KEYS = [
+    "/AIPrivateData",
+    "/AIMetaData",
+    "/AIPriv",
+]
+
+
+def apply_color_to_pdf(input_path, output_path, color_name, cmyk):
+    """
+    Reemplaza colores en:
+      - /Contents       → content stream PDF estándar (visores normales)
+      - /AIPrivateData  → stream nativo de Illustrator (cuando el PDF lo tiene)
+      - /AIMetaData     → metadatos Illustrator
+
+    Modificación siempre in-place para evitar objetos huérfanos.
     """
     c, m, y, k = normalize(cmyk)
     reader = PdfReader(input_path)
     writer = PdfWriter()
-    pages_ok = 0
+
+    pages_ok      = 0
+    pdf_streams   = 0
+    ai_streams    = 0
 
     for page_num, page in enumerate(reader.pages):
         writer.add_page(page)
-
-        if "/Contents" not in page:
-            continue
-
         new_page = writer.pages[page_num]
 
-        # Obtener la referencia indirecta al stream YA COPIADO en el writer
-        contents_indirect = new_page.raw_get("/Contents")
-        contents_obj = writer.get_object(contents_indirect)
+        # ── A. Content stream PDF estándar ──
+        if "/Contents" in new_page:
+            contents_obj = writer.get_object(new_page.raw_get("/Contents"))
+            stream_list = (
+                [writer.get_object(r) for r in contents_obj]
+                if isinstance(contents_obj, ArrayObject)
+                else [contents_obj]
+            )
+            for s in stream_list:
+                replace_pdf_stream(s, reader, c, m, y, k)
+                pdf_streams += 1
 
-        # Soportar tanto stream único como array de streams
-        if isinstance(contents_obj, ArrayObject):
-            stream_list = [writer.get_object(ref) for ref in contents_obj]
-        else:
-            stream_list = [contents_obj]
-
-        for stream_obj in stream_list:
-            # Parsear y reemplazar operadores de color
-            cs = ContentStream(stream_obj, reader)
-            cs.operations = replace_colors_in_stream(cs, c, m, y, k)
-            new_bytes = cs.get_data()
-
-            # Sobreescribir el objeto IN-PLACE con FlateDecode
-            # (mismo número de objeto → no queda stream huérfano)
-            compressed = zlib.compress(new_bytes, level=9)
-            stream_obj._data = compressed
-            stream_obj[NameObject("/Filter")]  = NameObject("/FlateDecode")
-            stream_obj[NameObject("/Length")]  = NumberObject(len(compressed))
-            for old_key in ("/DecodeParms", "/Columns", "/Predictor"):
-                if old_key in stream_obj:
-                    del stream_obj[old_key]
+        # ── B. Streams nativos de Illustrator ──
+        for ai_key in AI_STREAM_KEYS:
+            if ai_key in new_page:
+                ai_obj = writer.get_object(new_page.raw_get(ai_key))
+                if process_ai_stream(ai_obj, c, m, y, k):
+                    ai_streams += 1
 
         pages_ok += 1
+
+    # ── C. Buscar AIPrivateData también en objetos globales del PDF ──
+    # (Illustrator a veces los guarda fuera de la página)
+    for obj_num in range(len(reader.xref)):
+        try:
+            obj = writer.get_object(obj_num)
+            if not hasattr(obj, "keys"):
+                continue
+            for ai_key in AI_STREAM_KEYS:
+                if ai_key in obj:
+                    ai_ref = obj.raw_get(ai_key)
+                    ai_obj = writer.get_object(ai_ref)
+                    if process_ai_stream(ai_obj, c, m, y, k):
+                        ai_streams += 1
+        except Exception:
+            continue
 
     writer.add_metadata({
         "/Subject":  f"Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})",
@@ -219,223 +317,102 @@ def apply_color_to_pdf(
         writer.write(f)
 
     print(f"  ✔ PDF procesado        →  {output_path}")
-    print(f"     Páginas modificadas : {pages_ok}")
-    print(f"     (stream modificado in-place — sin objetos huérfanos)")
+    print(f"     Páginas            : {pages_ok}")
+    print(f"     Streams PDF        : {pdf_streams}  (visores normales)")
+    print(f"     Streams AI nativos : {ai_streams}  (Illustrator)")
+
+    if ai_streams == 0:
+        print()
+        print("  ⚠  No se encontró AIPrivateData.")
+        print("     Si el PDF fue guardado con 'Preservar capacidades de edición de Illustrator',")
+        print("     el AIPrivateData puede estar cifrado o usar un formato no accesible.")
+        print("     → Solución recomendada: ver instrucciones al final del script.")
 
 
 # ─────────────────────────────────────────────────────
-#  3. CREAR PDF DE PREVISUALIZACIÓN
-#     stdlib pura — sin librerías de terceros
+#  5. SWATCH PREVIEW PDF (stdlib pura)
 # ─────────────────────────────────────────────────────
-def _pdf_stream(ops: str) -> bytes:
-    """Comprime un content stream PDF con zlib."""
-    return zlib.compress(ops.encode("latin-1"), level=6)
-
-
-def create_swatch_preview(color_name: str, cmyk: tuple, path: str) -> None:
-    """
-    Genera un PDF de previsualización del swatch usando únicamente
-    la stdlib de Python (zlib, struct) — sin reportlab ni pikepdf.
-
-    Técnica: escritura directa del formato PDF 1.4:
-      Objetos → XRef table → Trailer
-    """
+def create_swatch_preview(color_name, cmyk, path):
     c, m, y, k = normalize(cmyk)
     rgb = cmyk_to_rgb(*cmyk)
     hex_col = rgb_hex(*rgb)
+    W, H = 595, 842
 
-    # ── Helpers de construcción PDF ──────────────────
-    W, H = 595, 842   # A4 en puntos (pt)
-
-    def pdf_str(s: str) -> str:
-        """Escapa una cadena para literal PDF."""
+    def esc(s):
         return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-    # ── Content stream ────────────────────────────────
-    name_safe = pdf_str(color_name)
-    cx, mx, yx, kx = c, m, y, k
-
     content = f"""
-% === Fondo blanco ===
 0 0 0 0 k
 0 0 {W} {H} re f
-
-% === Bloque de color principal ===
-{cx:.4f} {mx:.4f} {yx:.4f} {kx:.4f} k
+{c:.4f} {m:.4f} {y:.4f} {k:.4f} k
 60 {H-260} 220 160 re f
-
-% === Borde gris ===
 0 0 0 0.25 K
 0.5 w
 60 {H-260} 220 160 re S
-
-% === Nombre del color ===
 0 0 0 1 k
-BT
-/F1 18 Tf
-60 {H-298} Td
-({name_safe}) Tj
-ET
-
-% === Etiqueta CMYK ===
-BT
-/F1 10 Tf
-0 0 0 0.8 k
-60 {H-324} Td
-(CMYK:  C={cmyk[0]}%   M={cmyk[1]}%   Y={cmyk[2]}%   K={cmyk[3]}%) Tj
-ET
-
-% === Etiqueta RGB ===
-BT
-/F1 10 Tf
-60 {H-342} Td
-(RGB:   R={rgb[0]}   G={rgb[1]}   B={rgb[2]}) Tj
-ET
-
-% === Etiqueta HEX ===
-BT
-/F1 10 Tf
-60 {H-360} Td
-(HEX:   {hex_col}) Tj
-ET
-
-% === Título escala de tintas ===
+BT /F1 18 Tf 60 {H-298} Td ({esc(color_name)}) Tj ET
+BT /F1 10 Tf 0 0 0 0.8 k 60 {H-324} Td (CMYK:  C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%) Tj ET
+BT /F1 10 Tf 60 {H-342} Td (RGB:   R={rgb[0]}  G={rgb[1]}  B={rgb[2]}) Tj ET
+BT /F1 10 Tf 60 {H-360} Td (HEX:   {hex_col}) Tj ET
 0 0 0 1 k
-BT
-/F1 11 Tf
-60 {H-428} Td
-(Composicion de tintas:) Tj
-ET
-
-% === Barras de cada tinta ===
-% Cyan
+BT /F1 11 Tf 60 {H-420} Td (Composicion de tintas:) Tj ET
 1 0 0 0 k
-60 {H-490} {int(90 * cmyk[0]/100) if cmyk[0] else 1} 24 re f
-0 0 0 0.3 K
-0.3 w
-60 {H-490} 90 24 re S
-0 0 0 1 k
-BT /F1 8 Tf 60 {H-504} Td (Cyan: {cmyk[0]}%) Tj ET
-
-% Magenta
+60 {H-480} {max(1,int(90*cmyk[0]/100))} 24 re f
+0 0 0 0.3 K 60 {H-480} 90 24 re S
+0 0 0 1 k BT /F1 8 Tf 60 {H-494} Td (Cyan: {cmyk[0]}%) Tj ET
 0 1 0 0 k
-170 {H-490} {int(90 * cmyk[1]/100) if cmyk[1] else 1} 24 re f
-0 0 0 0.3 K
-170 {H-490} 90 24 re S
-0 0 0 1 k
-BT /F1 8 Tf 170 {H-504} Td (Magenta: {cmyk[1]}%) Tj ET
-
-% Yellow
+170 {H-480} {max(1,int(90*cmyk[1]/100))} 24 re f
+0 0 0 0.3 K 170 {H-480} 90 24 re S
+0 0 0 1 k BT /F1 8 Tf 170 {H-494} Td (Magenta: {cmyk[1]}%) Tj ET
 0 0 1 0 k
-280 {H-490} {int(90 * cmyk[2]/100) if cmyk[2] else 1} 24 re f
-0 0 0 0.3 K
-280 {H-490} 90 24 re S
+280 {H-480} {max(1,int(90*cmyk[2]/100))} 24 re f
+0 0 0 0.3 K 280 {H-480} 90 24 re S
+0 0 0 1 k BT /F1 8 Tf 280 {H-494} Td (Yellow: {cmyk[2]}%) Tj ET
 0 0 0 1 k
-BT /F1 8 Tf 280 {H-504} Td (Yellow: {cmyk[2]}%) Tj ET
-
-% Black
-0 0 0 1 k
-390 {H-490} {int(90 * cmyk[3]/100) if cmyk[3] else 1} 24 re f
-0 0 0 0.3 K
-390 {H-490} 90 24 re S
-BT /F1 8 Tf 390 {H-504} Td (Black: {cmyk[3]}%) Tj ET
-
-% === Nota pie de página ===
+390 {H-480} {max(1,int(90*cmyk[3]/100))} 24 re f
+0 0 0 0.3 K 390 {H-480} 90 24 re S
+BT /F1 8 Tf 390 {H-494} Td (Black: {cmyk[3]}%) Tj ET
 0 0 0 0.5 k
-BT
-/F1 7.5 Tf
-60 52 Td
-(Para importar en Illustrator: Ventana > Muestras > Menu > Abrir biblioteca de muestras > Otro...) Tj
-ET
-""".strip()
+BT /F1 7.5 Tf 60 52 Td (Importar: Ventana > Muestras > Menu > Abrir biblioteca de muestras) Tj ET
+""".strip().encode("latin-1")
 
-    cs_bytes   = _pdf_stream(content)
-    cs_length  = len(cs_bytes)
+    cs = zlib.compress(content, level=6)
+    buf = BytesIO()
+    xrefs = []
 
-    # ── Construir objetos PDF ─────────────────────────
-    buf    = BytesIO()
-    xrefs  = []
-
-    def write(data: bytes) -> int:
-        pos = buf.tell()
-        buf.write(data)
-        return pos
-
-    def obj(n: int, body: str) -> None:
+    def obj(n, body):
         xrefs.append(buf.tell())
-        buf.write(f"{n} 0 obj\n".encode())
-        buf.write(body.encode())
-        buf.write(b"\nendobj\n")
+        buf.write(f"{n} 0 obj\n".encode() + body + b"\nendobj\n")
 
-    # Header
-    write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-
-    # 1: Catalog
-    obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
-
-    # 2: Pages
-    obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-
-    # 3: Page
-    obj(3, (
-        f"<< /Type /Page /Parent 2 0 R\n"
-        f"   /MediaBox [0 0 {W} {H}]\n"
-        f"   /Contents 4 0 R\n"
-        f"   /Resources << /Font << /F1 5 0 R >> >> >>"
-    ))
-
-    # 4: Content stream
+    buf.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    obj(3, (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {W} {H}] "
+            f"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>").encode())
     xrefs.append(buf.tell())
-    buf.write(b"4 0 obj\n")
-    buf.write(
-        f"<< /Length {cs_length} /Filter /FlateDecode >>\n"
-        f"stream\n".encode()
-    )
-    buf.write(cs_bytes)
+    buf.write(f"4 0 obj\n<< /Length {len(cs)} /Filter /FlateDecode >>\nstream\n".encode())
+    buf.write(cs)
     buf.write(b"\nendstream\nendobj\n")
+    obj(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
 
-    # 5: Font (Helvetica)
-    obj(5, (
-        "<< /Type /Font /Subtype /Type1\n"
-        "   /BaseFont /Helvetica\n"
-        "   /Encoding /WinAnsiEncoding >>"
-    ))
-
-    # 6: Info
-    obj(6, (
-        f"<< /Title ({pdf_str('Swatch Preview')})\n"
-        f"   /Subject ({pdf_str(f'Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})')})\n"
-        f"   /Creator (pdf_swatch_generator.py) >>"
-    ))
-
-    # ── Cross-Reference Table ─────────────────────────
     xref_pos = buf.tell()
-    n_objs   = 7   # objetos 0..6
-
-    buf.write(f"xref\n0 {n_objs}\n".encode())
-    buf.write(b"0000000000 65535 f \n")   # objeto 0 (free)
-    for ref in xrefs:
-        buf.write(f"{ref:010d} 00000 n \n".encode())
-
-    # ── Trailer ──────────────────────────────────────
-    buf.write(
-        f"trailer\n<< /Size {n_objs} /Root 1 0 R /Info 6 0 R >>\n"
-        f"startxref\n{xref_pos}\n%%EOF\n".encode()
-    )
+    buf.write(f"xref\n0 6\n0000000000 65535 f \n".encode())
+    for r in xrefs:
+        buf.write(f"{r:010d} 00000 n \n".encode())
+    buf.write(f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode())
 
     with open(path, "wb") as f:
         f.write(buf.getvalue())
-
-    print(f"  ✔ Preview PDF creado   →  {path}")
+    print(f"  ✔ Preview PDF          →  {path}")
 
 
 # ─────────────────────────────────────────────────────
 #  PUNTO DE ENTRADA
 # ─────────────────────────────────────────────────────
 def main():
-    print("\n" + "="*60)
-    print("  PDF Swatch Generator  —  pypdf (BSD-3) + stdlib")
-    print("="*60)
+    print("\n" + "="*62)
+    print("  PDF Swatch Generator v4  —  pypdf (BSD-3) + stdlib")
+    print("="*62)
 
     name = COLOR_CONFIG["name"]
     cmyk = COLOR_CONFIG["cmyk"]
@@ -450,21 +427,28 @@ def main():
     print("\n[3/3] Generando PDF de previsualización…")
     create_swatch_preview(name, cmyk, PREVIEW_PDF)
 
-    print("\n" + "="*60)
-    print("  RESUMEN")
-    print("="*60)
-    print(f"  📄 {OUTPUT_PDF}   →  Abrir en Illustrator")
-    print(f"  🎨 {OUTPUT_ASE}   →  Ventana › Muestras › ☰ › Abrir biblioteca")
-    print(f"  🖼  {PREVIEW_PDF}       →  Visualización del swatch")
-    print()
+    print("\n" + "="*62)
+    print("  RESULTADO")
+    print("="*62)
     print(f"  Color : {name}")
     print(f"  CMYK  : C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%")
     print(f"  RGB   : R={rgb[0]}  G={rgb[1]}  B={rgb[2]}")
     print()
-    print("  Licencias:")
-    print("    pypdf  →  BSD-3-Clause")
-    print("    stdlib →  Python Software Foundation License")
-    print("="*60)
+    print("  ─── Si Illustrator aún muestra los colores originales ───")
+    print()
+    print("  El PDF fue guardado con 'Preservar capacidades de edición'.")
+    print("  El AIPrivateData puede estar cifrado o en formato binario")
+    print("  no accesible. Soluciones:")
+    print()
+    print("  Opción A (recomendada) — Guardar sin datos AI:")
+    print("    Illustrator → Archivo → Guardar una copia → PDF")
+    print("    Deshabilitar: 'Preservar capacidades de edición de Illustrator'")
+    print("    → El PDF resultante es 100% manipulable con este script.")
+    print()
+    print("  Opción B — Opción nativa de Illustrator:")
+    print("    Edición → Buscar y reemplazar color (o usar panel Muestras)")
+    print("    → Más preciso para archivos complejos con transparencias.")
+    print("="*62)
 
 
 if __name__ == "__main__":
