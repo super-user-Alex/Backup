@@ -1,3 +1,20 @@
+"""
+=============================================================================
+  Adobe Illustrator — PDF Swatch Generator + Color Replacer
+  ----------------------------------------------------------
+  Sin reportlab · Sin pikepdf · 100% licencias permisivas
+
+  Dependencias:
+    pypdf  5.x  →  BSD-3-Clause  (pip install pypdf)
+    struct, zlib, re, pathlib  →  stdlib Python (sin instalación)
+
+  Archivos generados:
+    • swatch_illustrator.ase         → Muestra de color para Illustrator
+    • output_illustrator_ready.pdf   → PDF con color CMYK aplicado
+    • swatch_preview.pdf             → Previsualización del swatch
+=============================================================================
+"""
+
 import re
 import struct
 import zlib
@@ -22,11 +39,8 @@ COLOR_CONFIG = {
     "cmyk": (85, 50, 0, 10),          # C, M, Y, K  (0–100)
 }
 
-# INPUT_PDF       = "input_design.pdf"
-# OUTPUT_PDF      = "output_illustrator_ready.pdf"
-# INPUT_PDF       = r"C:\Users\aleja\Downloads\input_illustrator_ready_v2.pdf"
-INPUT_PDF       = r"C:\Users\aleja\Downloads\prueba_color.pdf"
-OUTPUT_PDF      = r"C:\Users\aleja\Downloads\output_illustrator_ready.pdf"
+INPUT_PDF       = "input_design.pdf"
+OUTPUT_PDF      = "output_illustrator_ready.pdf"
 OUTPUT_ASE      = "swatch_illustrator.ase"
 PREVIEW_PDF     = "swatch_preview.pdf"
 
@@ -97,7 +111,7 @@ def create_ase(color_name: str, cmyk: tuple, path: str) -> None:
 
 
 # ─────────────────────────────────────────────────────
-#  2. REEMPLAZAR COLORES EN PDF
+#  2. REEMPLAZAR COLORES EN PDF  (pypdf — BSD-3)
 # ─────────────────────────────────────────────────────
 """
 Operadores de color relevantes en PDF:
@@ -148,48 +162,56 @@ def apply_color_to_pdf(
 ) -> None:
     """
     Abre el PDF, reemplaza todos los colores en sus content streams
-    y guarda el resultado.
+    y guarda el resultado. Usa únicamente pypdf (BSD-3-Clause).
+
+    Estrategia: modificar el stream EN EL MISMO OBJETO (in-place).
+    Esto evita que el stream original quede como objeto huérfano en
+    el PDF — lo que causa que Illustrator lo encuentre y lo use en
+    lugar del stream modificado, mostrando los colores originales.
     """
     c, m, y, k = normalize(cmyk)
-    reader  = PdfReader(input_path)
-    writer  = PdfWriter()
-
+    reader = PdfReader(input_path)
+    writer = PdfWriter()
     pages_ok = 0
 
     for page_num, page in enumerate(reader.pages):
+        writer.add_page(page)
+
         if "/Contents" not in page:
-            writer.add_page(page)
             continue
 
-        # Parsear el content stream con pypdf
-        contents_obj = page["/Contents"].get_object()
-        cs = ContentStream(contents_obj, reader)
-
-        # Reemplazar operadores de color
-        new_operations = replace_colors_in_stream(cs, c, m, y, k)
-        cs.operations = new_operations
-
-        # Serializar el stream modificado
-        new_bytes = cs.get_data()
-
-        # Comprimir con zlib (FlateDecode) — reduce tamaño del PDF
-        compressed = zlib.compress(new_bytes, level=6)
-
-        # Reconstruir el stream en el writer
-        writer.add_page(page)
         new_page = writer.pages[page_num]
 
-        # Reconstruir como DecodedStreamObject (pypdf maneja compresión)
-        from pypdf.generic import DecodedStreamObject
-        stream_obj = DecodedStreamObject()
-        stream_obj.set_data(new_bytes)
+        # Obtener la referencia indirecta al stream YA COPIADO en el writer
+        contents_indirect = new_page.raw_get("/Contents")
+        contents_obj = writer.get_object(contents_indirect)
 
-        new_page[NameObject("/Contents")] = writer._add_object(stream_obj)
+        # Soportar tanto stream único como array de streams
+        if isinstance(contents_obj, ArrayObject):
+            stream_list = [writer.get_object(ref) for ref in contents_obj]
+        else:
+            stream_list = [contents_obj]
+
+        for stream_obj in stream_list:
+            # Parsear y reemplazar operadores de color
+            cs = ContentStream(stream_obj, reader)
+            cs.operations = replace_colors_in_stream(cs, c, m, y, k)
+            new_bytes = cs.get_data()
+
+            # Sobreescribir el objeto IN-PLACE con FlateDecode
+            # (mismo número de objeto → no queda stream huérfano)
+            compressed = zlib.compress(new_bytes, level=9)
+            stream_obj._data = compressed
+            stream_obj[NameObject("/Filter")]  = NameObject("/FlateDecode")
+            stream_obj[NameObject("/Length")]  = NumberObject(len(compressed))
+            for old_key in ("/DecodeParms", "/Columns", "/Predictor"):
+                if old_key in stream_obj:
+                    del stream_obj[old_key]
+
         pages_ok += 1
 
-    # Añadir metadatos del swatch
     writer.add_metadata({
-        "/Subject": f"Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})",
+        "/Subject":  f"Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})",
         "/Keywords": f"CMYK swatch Illustrator {color_name}",
     })
 
@@ -198,10 +220,12 @@ def apply_color_to_pdf(
 
     print(f"  ✔ PDF procesado        →  {output_path}")
     print(f"     Páginas modificadas : {pages_ok}")
+    print(f"     (stream modificado in-place — sin objetos huérfanos)")
 
 
 # ─────────────────────────────────────────────────────
 #  3. CREAR PDF DE PREVISUALIZACIÓN
+#     stdlib pura — sin librerías de terceros
 # ─────────────────────────────────────────────────────
 def _pdf_stream(ops: str) -> bytes:
     """Comprime un content stream PDF con zlib."""
@@ -429,13 +453,17 @@ def main():
     print("\n" + "="*60)
     print("  RESUMEN")
     print("="*60)
-    print(f" {OUTPUT_PDF}   →  Abrir en Illustrator")
-    print(f" {OUTPUT_ASE}   →  Ventana › Muestras › ☰ › Abrir biblioteca")
-    print(f"  {PREVIEW_PDF}       →  Visualización del swatch")
+    print(f"  📄 {OUTPUT_PDF}   →  Abrir en Illustrator")
+    print(f"  🎨 {OUTPUT_ASE}   →  Ventana › Muestras › ☰ › Abrir biblioteca")
+    print(f"  🖼  {PREVIEW_PDF}       →  Visualización del swatch")
     print()
     print(f"  Color : {name}")
     print(f"  CMYK  : C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%")
     print(f"  RGB   : R={rgb[0]}  G={rgb[1]}  B={rgb[2]}")
+    print()
+    print("  Licencias:")
+    print("    pypdf  →  BSD-3-Clause")
+    print("    stdlib →  Python Software Foundation License")
     print("="*60)
 
 
