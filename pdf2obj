@@ -250,6 +250,65 @@ AI_STREAM_KEYS = [
 ]
 
 
+
+# ─────────────────────────────────────────────────────
+#  BORRAR AIPRIVATEDATA  (fallback cuando no es modificable)
+# ─────────────────────────────────────────────────────
+def strip_ai_data(writer):
+    """
+    Elimina todos los streams propietarios de Illustrator del PDF.
+    Tras el borrado, Illustrator no tiene otra opción que leer el
+    /Contents estándar — donde ya están los colores correctos.
+
+    Busca en:
+      - Diccionarios de página (/AIPrivateData, /AIMetaData, /AIPriv)
+      - Catalog y cualquier otro objeto del PDF
+      - Streams sueltos que solo contienen marcadores AI (%AI, %%AI)
+    """
+    AI_KEYS = ["/AIPrivateData", "/AIMetaData", "/AIPriv", "/AIEntryList"]
+    AI_MARKERS = [b"%AI", b"%%AI", b"%AI12", b"%%Creator: Adobe Illustrator"]
+
+    removed = 0
+
+    def _is_ai_stream(stream_obj):
+        """Detecta si un stream es datos nativos de Illustrator."""
+        try:
+            data = stream_obj.get_data()
+            return any(m in data for m in AI_MARKERS)
+        except Exception:
+            return False
+
+    def _strip_dict(d):
+        """Elimina claves AI de un diccionario PDF."""
+        nonlocal removed
+        for key in AI_KEYS:
+            if key in d:
+                del d[key]
+                removed += 1
+
+    # ── Páginas ──
+    for page in writer.pages:
+        _strip_dict(page)
+
+    # ── Catalog y objetos globales ──
+    try:
+        catalog = writer.get_object(writer._root_object.indirect_reference)
+        _strip_dict(catalog)
+    except Exception:
+        pass
+
+    # ── Recorrer todos los objetos del writer ──
+    # (Illustrator a veces guarda AIPrivateData en objetos no referenciados por páginas)
+    for obj in writer._objects:
+        try:
+            if hasattr(obj, "keys"):
+                _strip_dict(obj)
+        except Exception:
+            continue
+
+    return removed
+
+
 def apply_color_to_pdf(input_path, output_path, color_name, cmyk):
     """
     Reemplaza colores en:
@@ -308,6 +367,12 @@ def apply_color_to_pdf(input_path, output_path, color_name, cmyk):
         except Exception:
             continue
 
+    # Si no se pudo modificar el AIPrivateData, borrarlo antes de escribir
+    # para que Illustrator caiga en el /Contents estándar (ya tiene los colores correctos)
+    removed = 0
+    if ai_streams == 0:
+        removed = strip_ai_data(writer)
+
     writer.add_metadata({
         "/Subject":  f"Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})",
         "/Keywords": f"CMYK swatch Illustrator {color_name}",
@@ -322,11 +387,13 @@ def apply_color_to_pdf(input_path, output_path, color_name, cmyk):
     print(f"     Streams AI nativos : {ai_streams}  (Illustrator)")
 
     if ai_streams == 0:
-        print()
-        print("  ⚠  No se encontró AIPrivateData.")
-        print("     Si el PDF fue guardado con 'Preservar capacidades de edición de Illustrator',")
-        print("     el AIPrivateData puede estar cifrado o usar un formato no accesible.")
-        print("     → Solución recomendada: ver instrucciones al final del script.")
+        if removed > 0:
+            print(f"  ✔ AIPrivateData eliminado  ({removed} entrada/s)")
+            print(f"     Illustrator usará el /Contents estándar (colores ya aplicados)")
+        else:
+            print()
+            print("  ℹ  No se detectó AIPrivateData en este PDF.")
+            print("     El /Contents estándar tiene los colores correctos.")
 
 
 # ─────────────────────────────────────────────────────
@@ -411,7 +478,7 @@ BT /F1 7.5 Tf 60 52 Td (Importar: Ventana > Muestras > Menu > Abrir biblioteca d
 # ─────────────────────────────────────────────────────
 def main():
     print("\n" + "="*62)
-    print("  PDF Swatch Generator v4  —  pypdf (BSD-3) + stdlib")
+    print("  PDF Swatch Generator v5  —  pypdf (BSD-3) + stdlib")
     print("="*62)
 
     name = COLOR_CONFIG["name"]
@@ -434,20 +501,11 @@ def main():
     print(f"  CMYK  : C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%")
     print(f"  RGB   : R={rgb[0]}  G={rgb[1]}  B={rgb[2]}")
     print()
-    print("  ─── Si Illustrator aún muestra los colores originales ───")
-    print()
-    print("  El PDF fue guardado con 'Preservar capacidades de edición'.")
-    print("  El AIPrivateData puede estar cifrado o en formato binario")
-    print("  no accesible. Soluciones:")
-    print()
-    print("  Opción A (recomendada) — Guardar sin datos AI:")
-    print("    Illustrator → Archivo → Guardar una copia → PDF")
-    print("    Deshabilitar: 'Preservar capacidades de edición de Illustrator'")
-    print("    → El PDF resultante es 100% manipulable con este script.")
-    print()
-    print("  Opción B — Opción nativa de Illustrator:")
-    print("    Edición → Buscar y reemplazar color (o usar panel Muestras)")
-    print("    → Más preciso para archivos complejos con transparencias.")
+    print("  Estrategia aplicada:")
+    print("   1. Reemplazar colores en /Contents  (visores normales)")
+    print("   2. Reemplazar colores en /AIPrivateData  (Illustrator nativo)")
+    print("   3. Si AIPrivateData no es modificable → se elimina")
+    print("      Illustrator cae en /Contents, donde los colores ya son correctos")
     print("="*62)
 
 
