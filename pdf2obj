@@ -1,85 +1,443 @@
-import pymupdf
 import re
+import struct
+import zlib
+from io import BytesIO
+from pathlib import Path
 
-def get_swatches(doc):
-    swatches = {}
-    for xref in range(1, doc.xref_length()):
-        try:
-            obj_str = doc.xref_object(xref, compressed=False)
-        except:
-            continue
-        if "/Separation" not in obj_str:
-            continue
-        match_name = re.search(r'/Separation\s+/([^\s/\]>]+)', obj_str)
-        match_c1   = re.search(r'/C1\s*\[([^\]]+)\]', obj_str)
-        if match_name and match_c1:
-            name = match_name.group(1)
-            c1   = [float(v) for v in match_c1.group(1).split()]
-            swatches[name] = tuple(c1)
-    return swatches
-
-
-def draw_with_swatch(doc, page, rect, swatch_name, cmyk, tint=1.0):
-    c, m, y, k = cmyk
-
-    # 1. Crear el colorspace Separation
-    cs_obj = (
-        f"[ /Separation /{swatch_name} /DeviceCMYK <<\n"
-        f"  /FunctionType 2\n"
-        f"  /Domain [ 0 1 ]\n"
-        f"  /C0 [ 0 0 0 0 ]\n"
-        f"  /C1 [ {c} {m} {y} {k} ]\n"
-        f"  /N 1\n"
-        f"  /Range [ 0 1 0 1 0 1 0 1 ]\n"
-        f">>]"
-    )
-    cs_xref = doc.get_new_xref()
-    doc.update_object(cs_xref, cs_obj)
-
-    # 2. Registrar el colorspace en Resources de la página usando xref_set_key
-    #    (más estable que manipular el string del objeto)
-    res_name = f"CS{swatch_name}"
-    doc.xref_set_key(page.xref, f"Resources/ColorSpace/{res_name}", f"{cs_xref} 0 R")
-
-    # 3. Crear el content stream  ← CORRECCIÓN: update_object primero, luego new=True
-    x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
-    h = page.rect.height
-
-    stream = (
-        f"q\n"
-        f"/{res_name} cs\n"
-        f"{tint} scn\n"
-        f"/{res_name} CS\n"
-        f"{tint} SCN\n"
-        f"{x0} {h - y1} {x1 - x0} {y1 - y0} re\n"
-        f"f\n"
-        f"Q\n"
-    ).encode()
-
-    new_xref = doc.get_new_xref()
-    doc.update_object(new_xref, "<<>>")        # ← inicializar como dict PDF
-    doc.update_stream(new_xref, stream, new=True)  # ← new=True convierte a stream
-
-    # 4. Agregar el stream a los contents de la página
-    contents = page.get_contents()
-    contents.append(new_xref)
-    page.set_contents(contents)
-
-
-# ── USO ──────────────────────────────────────────────────────────────────────
-
-doc = pymupdf.open("tu_archivo.pdf")
-swatches = get_swatches(doc)
-print("Swatches:", swatches)
-
-page = doc[0]
-draw_with_swatch(
-    doc=doc,
-    page=page,
-    rect=pymupdf.Rect(50, 50, 200, 150),
-    swatch_name="LASER",
-    cmyk=swatches["LASER"],
-    tint=1.0
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import (
+    ArrayObject,
+    ContentStream,
+    FloatObject,
+    NameObject,
+    NumberObject,
 )
 
-doc.save("output.pdf", garbage=4, deflate=True)
+
+# ─────────────────────────────────────────────────────
+#  CONFIGURACIÓN DEL COLOR
+# ─────────────────────────────────────────────────────
+COLOR_CONFIG = {
+    "name": "Azul Corporativo",
+    "cmyk": (85, 50, 0, 10),          # C, M, Y, K  (0–100)
+}
+
+# INPUT_PDF       = "input_design.pdf"
+# OUTPUT_PDF      = "output_illustrator_ready.pdf"
+# INPUT_PDF       = r"C:\Users\aleja\Downloads\input_illustrator_ready_v2.pdf"
+INPUT_PDF       = r"C:\Users\aleja\Downloads\prueba_color.pdf"
+OUTPUT_PDF      = r"C:\Users\aleja\Downloads\output_illustrator_ready.pdf"
+OUTPUT_ASE      = "swatch_illustrator.ase"
+PREVIEW_PDF     = "swatch_preview.pdf"
+
+
+# ─────────────────────────────────────────────────────
+#  UTILIDADES DE COLOR
+# ─────────────────────────────────────────────────────
+def normalize(cmyk: tuple) -> tuple:
+    """CMYK (0–100) → flotantes (0.0–1.0)."""
+    return tuple(round(v / 100.0, 6) for v in cmyk)
+
+
+def cmyk_to_rgb(c, m, y, k) -> tuple:
+    """CMYK (0–100) → RGB (0–255). Solo referencia visual."""
+    c, m, y, k = c/100, m/100, y/100, k/100
+    return (
+        round(255 * (1-c) * (1-k)),
+        round(255 * (1-m) * (1-k)),
+        round(255 * (1-y) * (1-k)),
+    )
+
+
+def rgb_hex(r, g, b) -> str:
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+# ─────────────────────────────────────────────────────
+#  1. CREAR ARCHIVO .ASE (Adobe Swatch Exchange)
+#     stdlib pura — struct, sin dependencias externas
+# ─────────────────────────────────────────────────────
+def create_ase(color_name: str, cmyk: tuple, path: str) -> None:
+    """
+    Formato ASE binario (Big Endian):
+      'ASEF'  →  firma
+      HH      →  versión 1.0
+      I       →  número de bloques
+      ── Bloque 0x0001: Color Entry ─────────────
+      H       →  tipo bloque
+      I       →  tamaño de datos del bloque
+      H       →  longitud del nombre (chars + null)
+      xB      →  nombre UTF-16 BE + \x00\x00
+      4s      →  modelo: 'CMYK'
+      4f      →  valores C M Y K  (float32 BE, 0.0–1.0)
+      H       →  uso: 0=Global 1=Spot 2=Normal
+    """
+    c, m, y, k = normalize(cmyk)
+    name_utf16 = color_name.encode("utf-16-be") + b"\x00\x00"
+    name_len   = len(color_name) + 1
+    block_size = 2 + len(name_utf16) + 4 + 16 + 2
+
+    with open(path, "wb") as f:
+        f.write(b"ASEF")
+        f.write(struct.pack(">HH", 1, 0))
+        f.write(struct.pack(">I", 1))
+        f.write(struct.pack(">H", 0x0001))
+        f.write(struct.pack(">I", block_size))
+        f.write(struct.pack(">H", name_len))
+        f.write(name_utf16)
+        f.write(b"CMYK")
+        f.write(struct.pack(">ffff", c, m, y, k))
+        f.write(struct.pack(">H", 2))
+
+    rgb = cmyk_to_rgb(*cmyk)
+    print(f"  ✔ Swatch .ASE creado   →  {path}")
+    print(f"     Nombre : {color_name}")
+    print(f"     CMYK   : C={cmyk[0]}  M={cmyk[1]}  Y={cmyk[2]}  K={cmyk[3]}")
+    print(f"     RGB    : {rgb_hex(*rgb)}")
+
+
+# ─────────────────────────────────────────────────────
+#  2. REEMPLAZAR COLORES EN PDF
+# ─────────────────────────────────────────────────────
+"""
+Operadores de color relevantes en PDF:
+  rg / RG   →  fill / stroke  RGB    (3 operandos: r g b)
+  k  / K    →  fill / stroke  CMYK   (4 operandos: c m y k)
+  g  / G    →  fill / stroke  Gray   (1 operando: gray)
+  sc / SC   →  fill / stroke  en espacio de color activo
+  scn/ SCN  →  igual, con soporte de patrones y separación
+
+Estrategia: recorrer las operaciones del ContentStream y
+sustituir TODOS los operadores de color por k / K en CMYK.
+"""
+
+# Operadores que establecen color de relleno o trazo
+FILL_OPS   = {b"rg", b"k",  b"g",  b"sc",  b"scn"}
+STROKE_OPS = {b"RG", b"K",  b"G",  b"SC",  b"SCN"}
+COLOR_OPS  = FILL_OPS | STROKE_OPS
+
+
+def replace_colors_in_stream(
+    content_stream: ContentStream,
+    c: float, m: float, y: float, k: float,
+) -> list:
+    """
+    Devuelve la lista de operaciones con todos los colores
+    reemplazados por el CMYK indicado.
+    No toca: texto (Tf, Td, Tj…), imágenes, transformaciones.
+    """
+    new_ops = []
+    cmyk_vals = [FloatObject(c), FloatObject(m), FloatObject(y), FloatObject(k)]
+
+    for operands, operator in content_stream.operations:
+        if operator in FILL_OPS:
+            new_ops.append((cmyk_vals, b"k"))
+        elif operator in STROKE_OPS:
+            new_ops.append((cmyk_vals, b"K"))
+        else:
+            new_ops.append((operands, operator))
+
+    return new_ops
+
+
+def apply_color_to_pdf(
+    input_path: str,
+    output_path: str,
+    color_name: str,
+    cmyk: tuple,
+) -> None:
+    """
+    Abre el PDF, reemplaza todos los colores en sus content streams
+    y guarda el resultado.
+    """
+    c, m, y, k = normalize(cmyk)
+    reader  = PdfReader(input_path)
+    writer  = PdfWriter()
+
+    pages_ok = 0
+
+    for page_num, page in enumerate(reader.pages):
+        if "/Contents" not in page:
+            writer.add_page(page)
+            continue
+
+        # Parsear el content stream con pypdf
+        contents_obj = page["/Contents"].get_object()
+        cs = ContentStream(contents_obj, reader)
+
+        # Reemplazar operadores de color
+        new_operations = replace_colors_in_stream(cs, c, m, y, k)
+        cs.operations = new_operations
+
+        # Serializar el stream modificado
+        new_bytes = cs.get_data()
+
+        # Comprimir con zlib (FlateDecode) — reduce tamaño del PDF
+        compressed = zlib.compress(new_bytes, level=6)
+
+        # Reconstruir el stream en el writer
+        writer.add_page(page)
+        new_page = writer.pages[page_num]
+
+        # Reconstruir como DecodedStreamObject (pypdf maneja compresión)
+        from pypdf.generic import DecodedStreamObject
+        stream_obj = DecodedStreamObject()
+        stream_obj.set_data(new_bytes)
+
+        new_page[NameObject("/Contents")] = writer._add_object(stream_obj)
+        pages_ok += 1
+
+    # Añadir metadatos del swatch
+    writer.add_metadata({
+        "/Subject": f"Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})",
+        "/Keywords": f"CMYK swatch Illustrator {color_name}",
+    })
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    print(f"  ✔ PDF procesado        →  {output_path}")
+    print(f"     Páginas modificadas : {pages_ok}")
+
+
+# ─────────────────────────────────────────────────────
+#  3. CREAR PDF DE PREVISUALIZACIÓN
+# ─────────────────────────────────────────────────────
+def _pdf_stream(ops: str) -> bytes:
+    """Comprime un content stream PDF con zlib."""
+    return zlib.compress(ops.encode("latin-1"), level=6)
+
+
+def create_swatch_preview(color_name: str, cmyk: tuple, path: str) -> None:
+    """
+    Genera un PDF de previsualización del swatch usando únicamente
+    la stdlib de Python (zlib, struct) — sin reportlab ni pikepdf.
+
+    Técnica: escritura directa del formato PDF 1.4:
+      Objetos → XRef table → Trailer
+    """
+    c, m, y, k = normalize(cmyk)
+    rgb = cmyk_to_rgb(*cmyk)
+    hex_col = rgb_hex(*rgb)
+
+    # ── Helpers de construcción PDF ──────────────────
+    W, H = 595, 842   # A4 en puntos (pt)
+
+    def pdf_str(s: str) -> str:
+        """Escapa una cadena para literal PDF."""
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    # ── Content stream ────────────────────────────────
+    name_safe = pdf_str(color_name)
+    cx, mx, yx, kx = c, m, y, k
+
+    content = f"""
+% === Fondo blanco ===
+0 0 0 0 k
+0 0 {W} {H} re f
+
+% === Bloque de color principal ===
+{cx:.4f} {mx:.4f} {yx:.4f} {kx:.4f} k
+60 {H-260} 220 160 re f
+
+% === Borde gris ===
+0 0 0 0.25 K
+0.5 w
+60 {H-260} 220 160 re S
+
+% === Nombre del color ===
+0 0 0 1 k
+BT
+/F1 18 Tf
+60 {H-298} Td
+({name_safe}) Tj
+ET
+
+% === Etiqueta CMYK ===
+BT
+/F1 10 Tf
+0 0 0 0.8 k
+60 {H-324} Td
+(CMYK:  C={cmyk[0]}%   M={cmyk[1]}%   Y={cmyk[2]}%   K={cmyk[3]}%) Tj
+ET
+
+% === Etiqueta RGB ===
+BT
+/F1 10 Tf
+60 {H-342} Td
+(RGB:   R={rgb[0]}   G={rgb[1]}   B={rgb[2]}) Tj
+ET
+
+% === Etiqueta HEX ===
+BT
+/F1 10 Tf
+60 {H-360} Td
+(HEX:   {hex_col}) Tj
+ET
+
+% === Título escala de tintas ===
+0 0 0 1 k
+BT
+/F1 11 Tf
+60 {H-428} Td
+(Composicion de tintas:) Tj
+ET
+
+% === Barras de cada tinta ===
+% Cyan
+1 0 0 0 k
+60 {H-490} {int(90 * cmyk[0]/100) if cmyk[0] else 1} 24 re f
+0 0 0 0.3 K
+0.3 w
+60 {H-490} 90 24 re S
+0 0 0 1 k
+BT /F1 8 Tf 60 {H-504} Td (Cyan: {cmyk[0]}%) Tj ET
+
+% Magenta
+0 1 0 0 k
+170 {H-490} {int(90 * cmyk[1]/100) if cmyk[1] else 1} 24 re f
+0 0 0 0.3 K
+170 {H-490} 90 24 re S
+0 0 0 1 k
+BT /F1 8 Tf 170 {H-504} Td (Magenta: {cmyk[1]}%) Tj ET
+
+% Yellow
+0 0 1 0 k
+280 {H-490} {int(90 * cmyk[2]/100) if cmyk[2] else 1} 24 re f
+0 0 0 0.3 K
+280 {H-490} 90 24 re S
+0 0 0 1 k
+BT /F1 8 Tf 280 {H-504} Td (Yellow: {cmyk[2]}%) Tj ET
+
+% Black
+0 0 0 1 k
+390 {H-490} {int(90 * cmyk[3]/100) if cmyk[3] else 1} 24 re f
+0 0 0 0.3 K
+390 {H-490} 90 24 re S
+BT /F1 8 Tf 390 {H-504} Td (Black: {cmyk[3]}%) Tj ET
+
+% === Nota pie de página ===
+0 0 0 0.5 k
+BT
+/F1 7.5 Tf
+60 52 Td
+(Para importar en Illustrator: Ventana > Muestras > Menu > Abrir biblioteca de muestras > Otro...) Tj
+ET
+""".strip()
+
+    cs_bytes   = _pdf_stream(content)
+    cs_length  = len(cs_bytes)
+
+    # ── Construir objetos PDF ─────────────────────────
+    buf    = BytesIO()
+    xrefs  = []
+
+    def write(data: bytes) -> int:
+        pos = buf.tell()
+        buf.write(data)
+        return pos
+
+    def obj(n: int, body: str) -> None:
+        xrefs.append(buf.tell())
+        buf.write(f"{n} 0 obj\n".encode())
+        buf.write(body.encode())
+        buf.write(b"\nendobj\n")
+
+    # Header
+    write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+    # 1: Catalog
+    obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+
+    # 2: Pages
+    obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+
+    # 3: Page
+    obj(3, (
+        f"<< /Type /Page /Parent 2 0 R\n"
+        f"   /MediaBox [0 0 {W} {H}]\n"
+        f"   /Contents 4 0 R\n"
+        f"   /Resources << /Font << /F1 5 0 R >> >> >>"
+    ))
+
+    # 4: Content stream
+    xrefs.append(buf.tell())
+    buf.write(b"4 0 obj\n")
+    buf.write(
+        f"<< /Length {cs_length} /Filter /FlateDecode >>\n"
+        f"stream\n".encode()
+    )
+    buf.write(cs_bytes)
+    buf.write(b"\nendstream\nendobj\n")
+
+    # 5: Font (Helvetica)
+    obj(5, (
+        "<< /Type /Font /Subtype /Type1\n"
+        "   /BaseFont /Helvetica\n"
+        "   /Encoding /WinAnsiEncoding >>"
+    ))
+
+    # 6: Info
+    obj(6, (
+        f"<< /Title ({pdf_str('Swatch Preview')})\n"
+        f"   /Subject ({pdf_str(f'Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})')})\n"
+        f"   /Creator (pdf_swatch_generator.py) >>"
+    ))
+
+    # ── Cross-Reference Table ─────────────────────────
+    xref_pos = buf.tell()
+    n_objs   = 7   # objetos 0..6
+
+    buf.write(f"xref\n0 {n_objs}\n".encode())
+    buf.write(b"0000000000 65535 f \n")   # objeto 0 (free)
+    for ref in xrefs:
+        buf.write(f"{ref:010d} 00000 n \n".encode())
+
+    # ── Trailer ──────────────────────────────────────
+    buf.write(
+        f"trailer\n<< /Size {n_objs} /Root 1 0 R /Info 6 0 R >>\n"
+        f"startxref\n{xref_pos}\n%%EOF\n".encode()
+    )
+
+    with open(path, "wb") as f:
+        f.write(buf.getvalue())
+
+    print(f"  ✔ Preview PDF creado   →  {path}")
+
+
+# ─────────────────────────────────────────────────────
+#  PUNTO DE ENTRADA
+# ─────────────────────────────────────────────────────
+def main():
+    print("\n" + "="*60)
+    print("  PDF Swatch Generator  —  pypdf (BSD-3) + stdlib")
+    print("="*60)
+
+    name = COLOR_CONFIG["name"]
+    cmyk = COLOR_CONFIG["cmyk"]
+    rgb  = cmyk_to_rgb(*cmyk)
+
+    print("\n[1/3] Creando archivo de muestra .ASE…")
+    create_ase(name, cmyk, OUTPUT_ASE)
+
+    print(f"\n[2/3] Reemplazando colores en {INPUT_PDF}…")
+    apply_color_to_pdf(INPUT_PDF, OUTPUT_PDF, name, cmyk)
+
+    print("\n[3/3] Generando PDF de previsualización…")
+    create_swatch_preview(name, cmyk, PREVIEW_PDF)
+
+    print("\n" + "="*60)
+    print("  RESUMEN")
+    print("="*60)
+    print(f" {OUTPUT_PDF}   →  Abrir en Illustrator")
+    print(f" {OUTPUT_ASE}   →  Ventana › Muestras › ☰ › Abrir biblioteca")
+    print(f"  {PREVIEW_PDF}       →  Visualización del swatch")
+    print()
+    print(f"  Color : {name}")
+    print(f"  CMYK  : C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%")
+    print(f"  RGB   : R={rgb[0]}  G={rgb[1]}  B={rgb[2]}")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()
