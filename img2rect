@@ -1,0 +1,348 @@
+"""
+Recursive Grid Subdivision for Binary Images
+=============================================
+Divide una imagen binaria en una cuadrícula m×n y subdivide recursivamente
+las celdas que contienen más de un componente conectado.
+"""
+
+import numpy as np
+import cv2
+from scipy import ndimage
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.colors as mcolors
+
+
+# ---------------------------------------------------------------------------
+# Tipos de datos
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Cell:
+    """Representa una celda final de la cuadrícula."""
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
+    depth: int = 0                          # nivel de subdivisión
+    component_ids: List[int] = field(default_factory=list)  # componentes que intersectan
+
+    @property
+    def bbox(self) -> Tuple[int, int, int, int]:
+        return (self.x_min, self.y_min, self.x_max, self.y_max)
+
+    @property
+    def width(self) -> int:
+        return self.x_max - self.x_min
+
+    @property
+    def height(self) -> int:
+        return self.y_max - self.y_min
+
+
+# ---------------------------------------------------------------------------
+# Función principal
+# ---------------------------------------------------------------------------
+
+def recursive_grid_subdivision(
+    binary_image: np.ndarray,
+    m: int = 2,
+    n: int = 2,
+    max_depth: int = 10,
+    connectivity: int = 8,
+) -> Tuple[np.ndarray, List[Cell]]:
+    """
+    Subdivide recursivamente una imagen binaria en una cuadrícula m×n hasta
+    que cada celda contenga como máximo un componente conectado.
+
+    Parámetros
+    ----------
+    binary_image : np.ndarray
+        Imagen binaria (dtype uint8, valores 0 y 255; o bool).
+        Filas → eje Y, columnas → eje X.
+    m : int
+        Número de filas de la cuadrícula en cada subdivisión.
+    n : int
+        Número de columnas de la cuadrícula en cada subdivisión.
+    max_depth : int
+        Profundidad máxima de recursión (salvaguarda ante celdas muy pequeñas).
+    connectivity : int
+        Conectividad para etiquetar componentes: 4 u 8.
+
+    Retorna
+    -------
+    annotated_image : np.ndarray
+        Imagen BGR con las cuadrículas dibujadas sobre la imagen original.
+    final_cells : List[Cell]
+        Lista de todas las celdas finales (hoja del árbol de subdivisión).
+        Cada celda almacena su bounding box en coordenadas de la imagen original.
+    """
+    # ── 1. Normalizar imagen ────────────────────────────────────────────────
+    img = _normalize(binary_image)
+    H, W = img.shape
+
+    # ── 2. Etiquetar componentes conectados en la imagen completa ───────────
+    label_map, num_components = _label_components(img, connectivity)
+
+    # ── 3. Recursión ────────────────────────────────────────────────────────
+    final_cells: List[Cell] = []
+    _subdivide(
+        label_map=label_map,
+        x_min=0, y_min=0, x_max=W, y_max=H,
+        m=m, n=n,
+        depth=0, max_depth=max_depth,
+        final_cells=final_cells,
+    )
+
+    # ── 4. Dibujar cuadrículas sobre la imagen original ─────────────────────
+    annotated = _draw_grid(img, final_cells)
+
+    return annotated, final_cells
+
+
+# ---------------------------------------------------------------------------
+# Helpers internos
+# ---------------------------------------------------------------------------
+
+def _normalize(image: np.ndarray) -> np.ndarray:
+    """Convierte la imagen a uint8 binaria (0 / 255)."""
+    img = np.array(image, dtype=np.uint8)
+    if img.max() <= 1:
+        img = img * 255
+    # Binarizar por si acaso hay grises residuales
+    _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+    return img
+
+
+def _label_components(
+    binary: np.ndarray,
+    connectivity: int,
+) -> Tuple[np.ndarray, int]:
+    """Etiqueta componentes conectados; retorna (mapa de etiquetas, cantidad)."""
+    structure = (
+        np.ones((3, 3), dtype=int) if connectivity == 8
+        else ndimage.generate_binary_structure(2, 1)
+    )
+    labeled, n = ndimage.label(binary > 0, structure=structure)
+    return labeled, n
+
+
+def _components_in_cell(
+    label_map: np.ndarray,
+    x_min: int, y_min: int,
+    x_max: int, y_max: int,
+) -> List[int]:
+    """Retorna los IDs de componentes (excluyendo fondo=0) que tocan la celda."""
+    roi = label_map[y_min:y_max, x_min:x_max]
+    unique = np.unique(roi)
+    return [int(v) for v in unique if v != 0]
+
+
+def _subdivide(
+    label_map: np.ndarray,
+    x_min: int, y_min: int,
+    x_max: int, y_max: int,
+    m: int, n: int,
+    depth: int, max_depth: int,
+    final_cells: List[Cell],
+) -> None:
+    """
+    Subdivide la región [x_min:x_max, y_min:y_max] en m×n celdas.
+    Las celdas con ≤1 componente se guardan como finales; las demás se subdividen.
+    """
+    # Dimensiones actuales de la región
+    cell_w = x_max - x_min
+    cell_h = y_max - y_min
+
+    # ── Crear la cuadrícula m×n dentro de esta región ───────────────────────
+    # Bordes en X (columnas) y en Y (filas)
+    xs = np.linspace(x_min, x_max, n + 1, dtype=int)
+    ys = np.linspace(y_min, y_max, m + 1, dtype=int)
+
+    for row in range(m):
+        for col in range(n):
+            cx0, cx1 = int(xs[col]), int(xs[col + 1])
+            cy0, cy1 = int(ys[row]), int(ys[row + 1])
+
+            # Saltar celdas degeneradas
+            if cx1 <= cx0 or cy1 <= cy0:
+                continue
+
+            comp_ids = _components_in_cell(label_map, cx0, cy0, cx1, cy1)
+
+            if len(comp_ids) <= 1 or depth >= max_depth:
+                # Celda terminal
+                final_cells.append(
+                    Cell(
+                        x_min=cx0, y_min=cy0,
+                        x_max=cx1, y_max=cy1,
+                        depth=depth,
+                        component_ids=comp_ids,
+                    )
+                )
+            else:
+                # Subdividir recursivamente
+                _subdivide(
+                    label_map=label_map,
+                    x_min=cx0, y_min=cy0,
+                    x_max=cx1, y_max=cy1,
+                    m=m, n=n,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    final_cells=final_cells,
+                )
+
+
+def _depth_color(depth: int) -> Tuple[int, int, int]:
+    """Asigna un color BGR según el nivel de profundidad."""
+    palette = [
+        (255,  80,  80),   # nivel 0 → rojo
+        ( 80, 200,  80),   # nivel 1 → verde
+        ( 80,  80, 255),   # nivel 2 → azul
+        (255, 200,   0),   # nivel 3 → amarillo
+        (200,   0, 200),   # nivel 4 → magenta
+        (  0, 200, 200),   # nivel 5 → cian
+    ]
+    return palette[depth % len(palette)]
+
+
+def _draw_grid(binary: np.ndarray, cells: List[Cell]) -> np.ndarray:
+    """Dibuja las celdas finales sobre la imagen con color según profundidad."""
+    # Convertir a BGR para pintar en color
+    canvas = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    for cell in cells:
+        color = _depth_color(cell.depth)
+        cv2.rectangle(
+            canvas,
+            (cell.x_min, cell.y_min),
+            (cell.x_max - 1, cell.y_max - 1),
+            color=color,
+            thickness=1,
+        )
+
+    return canvas
+
+
+# ---------------------------------------------------------------------------
+# Visualización con Matplotlib
+# ---------------------------------------------------------------------------
+
+def visualize_result(
+    annotated_image: np.ndarray,
+    final_cells: List[Cell],
+    title: str = "Recursive Grid Subdivision",
+) -> plt.Figure:
+    """
+    Genera una figura con:
+      - Izquierda : imagen anotada con las cuadrículas coloreadas por profundidad.
+      - Derecha   : mapa de profundidades de las celdas finales.
+    """
+    max_depth = max((c.depth for c in final_cells), default=0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor="#0f0f0f")
+    fig.suptitle(title, color="white", fontsize=14, fontweight="bold", y=1.01)
+
+    # ── Panel izquierdo: imagen anotada ─────────────────────────────────────
+    ax_img = axes[0]
+    ax_img.imshow(cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB))
+    ax_img.set_title("Imagen con cuadrículas", color="white", fontsize=11)
+    ax_img.axis("off")
+    ax_img.set_facecolor("#0f0f0f")
+
+    # ── Panel derecho: mapa de profundidad ──────────────────────────────────
+    ax_map = axes[1]
+    H, W = annotated_image.shape[:2]
+    depth_map = np.full((H, W), np.nan)
+    for cell in final_cells:
+        depth_map[cell.y_min:cell.y_max, cell.x_min:cell.x_max] = cell.depth
+
+    cmap = plt.cm.plasma
+    im = ax_map.imshow(depth_map, cmap=cmap, vmin=0, vmax=max(max_depth, 1))
+    ax_map.set_title("Mapa de profundidad de subdivisión", color="white", fontsize=11)
+    ax_map.axis("off")
+    ax_map.set_facecolor("#0f0f0f")
+
+    cbar = fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
+    cbar.set_label("Nivel de subdivisión", color="white")
+    cbar.ax.yaxis.set_tick_params(color="white")
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+
+    # ── Leyenda de colores por profundidad ──────────────────────────────────
+    legend_handles = []
+    for d in range(max_depth + 1):
+        bgr = _depth_color(d)
+        rgb_norm = (bgr[0] / 255, bgr[1] / 255, bgr[2] / 255)
+        patch = patches.Patch(facecolor=rgb_norm, label=f"Nivel {d}")
+        legend_handles.append(patch)
+
+    ax_img.legend(
+        handles=legend_handles,
+        loc="lower right",
+        fontsize=8,
+        framealpha=0.6,
+        facecolor="#1a1a1a",
+        labelcolor="white",
+    )
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
+def _create_demo_image() -> np.ndarray:
+    """Genera una imagen binaria de prueba con varios componentes separados."""
+    img = np.zeros((256, 256), dtype=np.uint8)
+
+    # Componente 1: círculo superior-izquierdo
+    cv2.circle(img, (50, 50), 28, 255, -1)
+
+    # Componente 2: rectángulo superior-derecho
+    cv2.rectangle(img, (160, 20), (230, 80), 255, -1)
+
+    # Componente 3: elipse inferior-izquierda
+    cv2.ellipse(img, (60, 190), (35, 22), 30, 0, 360, 255, -1)
+
+    # Componente 4: triángulo inferior-derecho
+    pts = np.array([[200, 230], [240, 160], [240, 240]], np.int32)
+    cv2.fillPoly(img, [pts], 255)
+
+    # Componente 5: cruz central
+    cv2.line(img, (118, 108), (138, 148), 255, 8)
+    cv2.line(img, (108, 128), (148, 128), 255, 8)
+
+    return img
+
+
+if __name__ == "__main__":
+    # ── Crear imagen de prueba ───────────────────────────────────────────────
+    demo_img = _create_demo_image()
+
+    # ── Ejecutar subdivisión ────────────────────────────────────────────────
+    annotated, cells = recursive_grid_subdivision(
+        binary_image=demo_img,
+        m=2, n=2,
+        max_depth=8,
+        connectivity=8,
+    )
+
+    # ── Mostrar estadísticas ────────────────────────────────────────────────
+    depths = [c.depth for c in cells]
+    print(f"Total de celdas finales   : {len(cells)}")
+    print(f"Profundidad máxima alcanzada: {max(depths)}")
+    print(f"Profundidad mínima         : {min(depths)}")
+    print()
+    print("Primeras 10 celdas (x_min, y_min, x_max, y_max, depth, componentes):")
+    for c in cells[:10]:
+        print(f"  {c.bbox}  depth={c.depth}  comps={c.component_ids}")
+
+    # ── Visualizar ──────────────────────────────────────────────────────────
+    fig = visualize_result(annotated, cells, title="Demo – Subdivisión recursiva 2×2")
+    fig.savefig("/mnt/user-data/outputs/demo_recursive_grid.png", dpi=150,
+                bbox_inches="tight", facecolor="#0f0f0f")
+    print("\nFigura guardada en outputs/demo_recursive_grid.png")
