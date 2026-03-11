@@ -3,13 +3,15 @@ Recursive Grid Subdivision for Binary Images
 =============================================
 Divide una imagen binaria en una cuadrícula m×n y subdivide recursivamente
 las celdas que contienen más de un componente conectado.
+Incluye `compute_object_bboxes` para obtener un único bbox por objeto
+combinando todas las celdas que lo tocan en todos los niveles.
 """
 
 import numpy as np
 import cv2
 from scipy import ndimage
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.colors as mcolors
@@ -227,65 +229,243 @@ def _draw_grid(binary: np.ndarray, cells: List[Cell]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Bounding box unificado por objeto
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ObjectBBox:
+    """
+    Bounding box final de un objeto (componente conectado),
+    calculado como la unión de todas las celdas de la cuadrícula
+    recursiva que lo contienen (en cualquier nivel de profundidad).
+    """
+    component_id: int
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
+    contributing_cells: int = 0   # cuántas celdas aportaron a este bbox
+    depth_range: Tuple[int, int] = (0, 0)  # (min_depth, max_depth) de las celdas
+
+    @property
+    def bbox(self) -> Tuple[int, int, int, int]:
+        return (self.x_min, self.y_min, self.x_max, self.y_max)
+
+    @property
+    def width(self) -> int:
+        return self.x_max - self.x_min
+
+    @property
+    def height(self) -> int:
+        return self.y_max - self.y_min
+
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
+
+def compute_object_bboxes(final_cells: List[Cell]) -> Dict[int, ObjectBBox]:
+    """
+    Calcula el bounding box unificado por objeto combinando TODAS las celdas
+    finales (de cualquier nivel de profundidad) que contienen ese componente.
+
+    La unión se define como:
+        x_min = min de todos los x_min de las celdas que tocan el componente
+        y_min = min de todos los y_min
+        x_max = max de todos los x_max
+        y_max = max de todos los y_max
+
+    Este bbox es el "máximo grid" que envuelve al objeto usando la información
+    de todos los niveles del árbol de subdivisión.
+
+    Parámetros
+    ----------
+    final_cells : List[Cell]
+        Celdas finales devueltas por `recursive_grid_subdivision`.
+
+    Retorna
+    -------
+    Dict[int, ObjectBBox]
+        Diccionario  component_id → ObjectBBox.
+        Solo incluye componentes reales (id > 0, excluyendo el fondo).
+    """
+    # Acumuladores por componente
+    accum: Dict[int, dict] = {}
+
+    for cell in final_cells:
+        for cid in cell.component_ids:
+            if cid == 0:
+                continue
+            if cid not in accum:
+                accum[cid] = {
+                    "x_min": cell.x_min,
+                    "y_min": cell.y_min,
+                    "x_max": cell.x_max,
+                    "y_max": cell.y_max,
+                    "count": 0,
+                    "depths": [],
+                }
+            a = accum[cid]
+            a["x_min"] = min(a["x_min"], cell.x_min)
+            a["y_min"] = min(a["y_min"], cell.y_min)
+            a["x_max"] = max(a["x_max"], cell.x_max)
+            a["y_max"] = max(a["y_max"], cell.y_max)
+            a["count"] += 1
+            a["depths"].append(cell.depth)
+
+    result: Dict[int, ObjectBBox] = {}
+    for cid, a in accum.items():
+        result[cid] = ObjectBBox(
+            component_id=cid,
+            x_min=a["x_min"],
+            y_min=a["y_min"],
+            x_max=a["x_max"],
+            y_max=a["y_max"],
+            contributing_cells=a["count"],
+            depth_range=(min(a["depths"]), max(a["depths"])),
+        )
+
+    return result
+
+
+def draw_object_bboxes(
+    base_image: np.ndarray,
+    object_bboxes: Dict[int, ObjectBBox],
+    thickness: int = 3,
+    font_scale: float = 0.55,
+) -> np.ndarray:
+    """
+    Dibuja un bbox de color único por objeto sobre `base_image` (BGR o gris).
+    Añade etiqueta con el ID del componente y su tamaño (w×h).
+    """
+    if len(base_image.shape) == 2:
+        canvas = cv2.cvtColor(base_image, cv2.COLOR_GRAY2BGR)
+    else:
+        canvas = base_image.copy()
+
+    # Paleta de colores vivos, uno por objeto
+    palette_rgb = [
+        (255,  60,  60),
+        ( 60, 220,  60),
+        ( 60, 120, 255),
+        (255, 200,   0),
+        (230,  60, 230),
+        (  0, 220, 220),
+        (255, 140,   0),
+        (100, 255, 140),
+    ]
+
+    sorted_ids = sorted(object_bboxes.keys())
+    for idx, cid in enumerate(sorted_ids):
+        obj = object_bboxes[cid]
+        color = palette_rgb[idx % len(palette_rgb)]
+
+        # Bounding box principal
+        cv2.rectangle(
+            canvas,
+            (obj.x_min, obj.y_min),
+            (obj.x_max, obj.y_max),
+            color=color,
+            thickness=thickness,
+        )
+
+        # Esquinas decorativas (L-shapes) para estética más limpia
+        corner = 12
+        for (cx, cy), (dx, dy) in [
+            ((obj.x_min, obj.y_min), ( 1,  1)),
+            ((obj.x_max, obj.y_min), (-1,  1)),
+            ((obj.x_min, obj.y_max), ( 1, -1)),
+            ((obj.x_max, obj.y_max), (-1, -1)),
+        ]:
+            cv2.line(canvas, (cx, cy), (cx + dx * corner, cy), color, thickness + 1)
+            cv2.line(canvas, (cx, cy), (cx, cy + dy * corner), color, thickness + 1)
+
+        # Etiqueta
+        label = f"ID:{cid}  {obj.width}x{obj.height}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        tx = obj.x_min + 4
+        ty = max(obj.y_min - 6, th + 4)
+
+        # Fondo de la etiqueta
+        cv2.rectangle(
+            canvas,
+            (tx - 2, ty - th - 3),
+            (tx + tw + 2, ty + 3),
+            color, -1,
+        )
+        cv2.putText(
+            canvas, label, (tx, ty),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+            (10, 10, 10), 1, cv2.LINE_AA,
+        )
+
+    return canvas
+
+
+# ---------------------------------------------------------------------------
 # Visualización con Matplotlib
 # ---------------------------------------------------------------------------
 
 def visualize_result(
-    annotated_image: np.ndarray,
+    binary_image: np.ndarray,
+    annotated_grid: np.ndarray,
     final_cells: List[Cell],
+    object_bboxes: Dict[int, ObjectBBox],
     title: str = "Recursive Grid Subdivision",
 ) -> plt.Figure:
     """
-    Genera una figura con:
-      - Izquierda : imagen anotada con las cuadrículas coloreadas por profundidad.
-      - Derecha   : mapa de profundidades de las celdas finales.
+    Figura de 3 paneles:
+      1. Cuadrículas recursivas (coloreadas por nivel de profundidad).
+      2. BBoxes unificados por objeto sobre la imagen original.
+      3. Mapa de profundidad de subdivisión (heatmap).
     """
+    BG = "#0d0d0d"
     max_depth = max((c.depth for c in final_cells), default=0)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor="#0f0f0f")
-    fig.suptitle(title, color="white", fontsize=14, fontweight="bold", y=1.01)
+    fig = plt.figure(figsize=(18, 6), facecolor=BG)
+    fig.suptitle(title, color="white", fontsize=15, fontweight="bold", y=1.02)
 
-    # ── Panel izquierdo: imagen anotada ─────────────────────────────────────
-    ax_img = axes[0]
-    ax_img.imshow(cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB))
-    ax_img.set_title("Imagen con cuadrículas", color="white", fontsize=11)
-    ax_img.axis("off")
-    ax_img.set_facecolor("#0f0f0f")
+    gs = fig.add_gridspec(1, 3, wspace=0.06)
+    axes = [fig.add_subplot(gs[i]) for i in range(3)]
 
-    # ── Panel derecho: mapa de profundidad ──────────────────────────────────
-    ax_map = axes[1]
-    H, W = annotated_image.shape[:2]
-    depth_map = np.full((H, W), np.nan)
-    for cell in final_cells:
-        depth_map[cell.y_min:cell.y_max, cell.x_min:cell.x_max] = cell.depth
+    subtitles = [
+        "① Cuadrículas recursivas",
+        "② BBox unificado por objeto",
+        "③ Mapa de profundidad",
+    ]
 
-    cmap = plt.cm.plasma
-    im = ax_map.imshow(depth_map, cmap=cmap, vmin=0, vmax=max(max_depth, 1))
-    ax_map.set_title("Mapa de profundidad de subdivisión", color="white", fontsize=11)
-    ax_map.axis("off")
-    ax_map.set_facecolor("#0f0f0f")
-
-    cbar = fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
-    cbar.set_label("Nivel de subdivisión", color="white")
-    cbar.ax.yaxis.set_tick_params(color="white")
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
-
-    # ── Leyenda de colores por profundidad ──────────────────────────────────
+    # ── Panel 1: cuadrículas coloreadas ──────────────────────────────────────
+    axes[0].imshow(cv2.cvtColor(annotated_grid, cv2.COLOR_BGR2RGB))
     legend_handles = []
     for d in range(max_depth + 1):
         bgr = _depth_color(d)
         rgb_norm = (bgr[0] / 255, bgr[1] / 255, bgr[2] / 255)
-        patch = patches.Patch(facecolor=rgb_norm, label=f"Nivel {d}")
-        legend_handles.append(patch)
-
-    ax_img.legend(
-        handles=legend_handles,
-        loc="lower right",
-        fontsize=8,
-        framealpha=0.6,
-        facecolor="#1a1a1a",
-        labelcolor="white",
+        legend_handles.append(patches.Patch(facecolor=rgb_norm, label=f"Nivel {d}"))
+    axes[0].legend(
+        handles=legend_handles, loc="lower right", fontsize=8,
+        framealpha=0.65, facecolor="#1a1a1a", labelcolor="white",
     )
+
+    # ── Panel 2: bboxes unificados ───────────────────────────────────────────
+    bbox_canvas = draw_object_bboxes(binary_image, object_bboxes, thickness=2)
+    axes[1].imshow(cv2.cvtColor(bbox_canvas, cv2.COLOR_BGR2RGB))
+
+    # ── Panel 3: mapa de profundidad ─────────────────────────────────────────
+    H, W = binary_image.shape[:2]
+    depth_map = np.full((H, W), np.nan)
+    for cell in final_cells:
+        depth_map[cell.y_min:cell.y_max, cell.x_min:cell.x_max] = cell.depth
+    im = axes[2].imshow(depth_map, cmap="plasma", vmin=0, vmax=max(max_depth, 1))
+    cbar = fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.03)
+    cbar.set_label("Nivel", color="white", fontsize=9)
+    cbar.ax.yaxis.set_tick_params(color="white", labelsize=7)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+
+    # ── Estilo global ────────────────────────────────────────────────────────
+    for ax, sub in zip(axes, subtitles):
+        ax.set_title(sub, color="#c8c8c8", fontsize=10, pad=6)
+        ax.axis("off")
+        ax.set_facecolor(BG)
 
     plt.tight_layout()
     return fig
@@ -298,51 +478,57 @@ def visualize_result(
 def _create_demo_image() -> np.ndarray:
     """Genera una imagen binaria de prueba con varios componentes separados."""
     img = np.zeros((256, 256), dtype=np.uint8)
-
-    # Componente 1: círculo superior-izquierdo
     cv2.circle(img, (50, 50), 28, 255, -1)
-
-    # Componente 2: rectángulo superior-derecho
     cv2.rectangle(img, (160, 20), (230, 80), 255, -1)
-
-    # Componente 3: elipse inferior-izquierda
     cv2.ellipse(img, (60, 190), (35, 22), 30, 0, 360, 255, -1)
-
-    # Componente 4: triángulo inferior-derecho
     pts = np.array([[200, 230], [240, 160], [240, 240]], np.int32)
     cv2.fillPoly(img, [pts], 255)
-
-    # Componente 5: cruz central
     cv2.line(img, (118, 108), (138, 148), 255, 8)
     cv2.line(img, (108, 128), (148, 128), 255, 8)
-
     return img
 
 
 if __name__ == "__main__":
-    # ── Crear imagen de prueba ───────────────────────────────────────────────
+    # ── Crear imagen de prueba ────────────────────────────────────────────────
     demo_img = _create_demo_image()
 
-    # ── Ejecutar subdivisión ────────────────────────────────────────────────
+    # ── Subdivisión recursiva ─────────────────────────────────────────────────
     annotated, cells = recursive_grid_subdivision(
-        binary_image=demo_img,
-        m=2, n=2,
-        max_depth=8,
-        connectivity=8,
+        binary_image=demo_img, m=2, n=2, max_depth=8, connectivity=8,
     )
 
-    # ── Mostrar estadísticas ────────────────────────────────────────────────
-    depths = [c.depth for c in cells]
-    print(f"Total de celdas finales   : {len(cells)}")
-    print(f"Profundidad máxima alcanzada: {max(depths)}")
-    print(f"Profundidad mínima         : {min(depths)}")
-    print()
-    print("Primeras 10 celdas (x_min, y_min, x_max, y_max, depth, componentes):")
-    for c in cells[:10]:
-        print(f"  {c.bbox}  depth={c.depth}  comps={c.component_ids}")
+    # ── BBoxes unificados por objeto ──────────────────────────────────────────
+    object_bboxes = compute_object_bboxes(cells)
 
-    # ── Visualizar ──────────────────────────────────────────────────────────
-    fig = visualize_result(annotated, cells, title="Demo – Subdivisión recursiva 2×2")
-    fig.savefig("/mnt/user-data/outputs/demo_recursive_grid.png", dpi=150,
-                bbox_inches="tight", facecolor="#0f0f0f")
+    # ── Estadísticas ──────────────────────────────────────────────────────────
+    depths = [c.depth for c in cells]
+    print(f"Total de celdas finales      : {len(cells)}")
+    print(f"Profundidad máxima alcanzada : {max(depths)}")
+    print(f"Profundidad mínima           : {min(depths)}")
+    print(f"Objetos detectados           : {len(object_bboxes)}")
+    print()
+    print(f"{'ID':>4}  {'BBox (x0,y0,x1,y1)':>26}  {'W×H':>10}  {'Área':>8}  "
+          f"{'Celdas':>7}  {'Niveles':>10}")
+    print("─" * 76)
+    for cid, obj in sorted(object_bboxes.items()):
+        print(
+            f"  {cid:>2}  {str(obj.bbox):>26}  "
+            f"{obj.width:>4}×{obj.height:<4}  "
+            f"{obj.area:>8}  "
+            f"{obj.contributing_cells:>7}  "
+            f"  {obj.depth_range[0]}–{obj.depth_range[1]}"
+        )
+
+    # ── Visualizar ────────────────────────────────────────────────────────────
+    fig = visualize_result(
+        binary_image=demo_img,
+        annotated_grid=annotated,
+        final_cells=cells,
+        object_bboxes=object_bboxes,
+        title="Recursive Grid Subdivision  ·  BBox unificado por objeto",
+    )
+    fig.savefig(
+        "/mnt/user-data/outputs/demo_recursive_grid.png",
+        dpi=150, bbox_inches="tight", facecolor="#0d0d0d",
+    )
     print("\nFigura guardada en outputs/demo_recursive_grid.png")
