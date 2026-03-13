@@ -13,14 +13,13 @@ Uso:
 """
 
 import sys
-import io
+import re
 import zlib
 import argparse
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
-    ContentStream, NameObject, IndirectObject,
-    EncodedStreamObject,
+    NameObject, IndirectObject, EncodedStreamObject, ArrayObject,
 )
 
 
@@ -30,13 +29,16 @@ from pypdf.generic import (
 
 def get_ocgs(reader: PdfReader) -> list[dict]:
     """Retorna [{'name': str, 'idnum': int}, ...] con los OCGs del catálogo."""
-    root = reader.trailer['/Root']
-    if '/OCProperties' not in root:
+    try:
+        root = reader.trailer['/Root']
+        if '/OCProperties' not in root:
+            return []
+        return [
+            {'name': str(ref.get_object()['/Name']), 'idnum': ref.idnum}
+            for ref in root['/OCProperties']['/OCGs']
+        ]
+    except Exception:
         return []
-    return [
-        {'name': str(ref.get_object()['/Name']), 'idnum': ref.idnum}
-        for ref in root['/OCProperties']['/OCGs']
-    ]
 
 
 def get_prop_map(page) -> dict:
@@ -48,110 +50,179 @@ def get_prop_map(page) -> dict:
                 obj = obj.get_object()
             if obj.get('/Type') == NameObject('/OCG'):
                 prop_map[key] = str(obj['/Name'])
-    except (KeyError, AttributeError):
+    except (KeyError, AttributeError, Exception):
         pass
     return prop_map
 
 
+def ocg_name_to_prop_key(prop_map: dict, name: str) -> bytes | None:
+    """Dado un nombre de OCG, retorna el b'/PropKey' del stream."""
+    for k, v in prop_map.items():
+        if v == name:
+            return k.encode() if isinstance(k, str) else k
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Content stream filtering
+# Filtrado a nivel de bytes
+#
+# No usa ContentStream de pypdf — evita PdfReadError con streams binarios
+# (imágenes inline, fuentes Type3, encodings no estándar, etc.)
 # ---------------------------------------------------------------------------
 
-def _visible(stack: list, target: str, include_common: bool) -> bool:
-    if not stack:
+# Patterns compilados una vez
+_OC_BDC = re.compile(rb'/OC\s+(/[^\s/\[\]<>()]+)\s+BDC')
+_BDC    = re.compile(rb'BDC|BMC')
+_EMC    = re.compile(rb'EMC')
+_OC_PRE = re.compile(rb'/OC\s+/[^\s/\[\]<>()]+\s*$')
+
+
+def filter_stream_bytes(data: bytes,
+                        target_prop: bytes,
+                        include_common: bool = True) -> bytes:
+    """
+    Filtra un content stream (bytes decodificados) manteniendo solo:
+      - El bloque /OC <target_prop> BDC … EMC
+      - Si include_common=True: bytes fuera de cualquier bloque OC
+
+    Trabaja con regex sobre bytes crudos — no parsea tokens PDF.
+    Maneja anidamiento de BDC/EMC.
+    """
+    events = []
+
+    for m in _OC_BDC.finditer(data):
+        events.append((m.start(), 'oc_bdc', m.group(1), m.end()))
+
+    for m in _BDC.finditer(data):
+        # Saltar si ya fue capturado como parte de /OC ... BDC
+        pre = data[max(0, m.start() - 50): m.start()]
+        if _OC_PRE.search(pre):
+            continue
+        events.append((m.start(), 'bdc', None, m.end()))
+
+    for m in _EMC.finditer(data):
+        events.append((m.start(), 'emc', None, m.end()))
+
+    events.sort(key=lambda e: e[0])
+
+    stack = []  # ('oc', prop_bytes) | ('other',)
+
+    def visible() -> bool:
+        if not stack:
+            return include_common
+        for frame in reversed(stack):
+            if frame[0] == 'oc':
+                return frame[1] == target_prop
         return include_common
-    for frame in reversed(stack):
-        if frame[0] == 'oc':
-            return frame[1] == target
-    return include_common
 
+    result = bytearray()
+    pos = 0
 
-def filter_ops(ops: list, prop_map: dict,
-               target_name: str, include_common: bool) -> list:
-    """
-    Retiene solo las instrucciones del bloque OC de `target_name`
-    y, opcionalmente, el contenido fuera de cualquier capa.
-    """
-    result, stack = [], []
+    for tok_start, etype, prop, tok_end in events:
+        if visible():
+            result += data[pos:tok_start]
 
-    for operands, operator in ops:
-        op = operator if isinstance(operator, str) else operator.decode()
+        if etype == 'oc_bdc':
+            stack.append(('oc', prop))
+            if prop == target_prop:
+                result += data[tok_start:tok_end]
 
-        if op in ('BDC', 'BMC'):
-            is_oc = len(operands) >= 2 and str(operands[0]) == '/OC'
-            if is_oc:
-                layer = prop_map.get(str(operands[1]))
-                stack.append(('oc', layer))
-                if layer == target_name:
-                    result.append((operands, operator))
+        elif etype == 'bdc':
+            stack.append(('other',))
+            if visible():
+                result += data[tok_start:tok_end]
+
+        elif etype == 'emc':
+            if stack:
+                top = stack[-1]
+                was = visible()
+                stack.pop()
+                if (top[0] == 'oc' and top[1] == target_prop) \
+                        or (top[0] == 'other' and was):
+                    result += data[tok_start:tok_end]
             else:
-                stack.append(('other',))
-                if _visible(stack, target_name, include_common):
-                    result.append((operands, operator))
+                result += data[tok_start:tok_end]
 
-        elif op == 'EMC':
-            if not stack:
-                result.append((operands, operator))
-                continue
-            top = stack[-1]
-            was = _visible(stack, target_name, include_common)
-            stack.pop()
-            if (top[0] == 'oc' and top[1] == target_name) \
-                    or (top[0] == 'other' and was):
-                result.append((operands, operator))
+        pos = tok_end
 
-        else:
-            if _visible(stack, target_name, include_common):
-                result.append((operands, operator))
+    if visible():
+        result += data[pos:]
 
-    return result
+    return bytes(result)
 
 
 # ---------------------------------------------------------------------------
-# Stream replacement
+# Utilidades de stream
 # ---------------------------------------------------------------------------
+
+def get_stream_data(obj) -> bytes | None:
+    """
+    Extrae los bytes decodificados de un objeto stream.
+    Retorna None si el objeto no es un stream o falla al decodificar.
+    """
+    try:
+        if isinstance(obj, ArrayObject):
+            # /Contents como array: concatenar todos los sub-streams
+            parts = []
+            for item in obj:
+                sub = item.get_object() if isinstance(item, IndirectObject) else item
+                if hasattr(sub, 'get_data'):
+                    parts.append(sub.get_data() or b'')
+            return b'\n'.join(parts) if parts else None
+        if hasattr(obj, 'get_data'):
+            return obj.get_data()
+    except Exception:
+        pass
+    return None
+
 
 def find_content_stream_indices(w: PdfWriter) -> list[int]:
     """
-    Localiza índices en w._objects que corresponden a content streams
-    (contienen operadores PDF como BT, BDC, etc.).
+    Localiza índices en w._objects que son content streams PDF
+    (contienen operadores BT, BDC, Do, etc.).
     """
     indices = []
     for i, obj in enumerate(w._objects):
         if obj is None:
             continue
-        if hasattr(obj, 'get_data'):
-            try:
-                data = obj.get_data()
-                if data and (b'BT' in data or b'BDC' in data or b'Do' in data):
-                    indices.append(i)
-            except Exception:
-                pass
+        data = get_stream_data(obj)
+        if data and (b'BT' in data or b'BDC' in data or b'Do' in data):
+            indices.append(i)
     return indices
 
 
 def make_encoded_stream(raw_bytes: bytes, old_obj) -> EncodedStreamObject:
-    """Crea un EncodedStreamObject (FlateDecode) con los bytes dados."""
+    """Crea un EncodedStreamObject (FlateDecode) preservando la referencia indirecta."""
     new_obj = EncodedStreamObject()
     new_obj[NameObject('/Filter')] = NameObject('/FlateDecode')
-    new_obj._data = zlib.compress(raw_bytes)
-    # Preservar indirect_reference para que el xref siga siendo válido
+    new_obj._data = zlib.compress(raw_bytes) if raw_bytes else zlib.compress(b'')
     if hasattr(old_obj, 'indirect_reference'):
         new_obj.indirect_reference = old_obj.indirect_reference
     return new_obj
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Función principal
 # ---------------------------------------------------------------------------
 
-def ocg_to_pages(input_path: str, output_path: str,
+def ocg_to_pages(input_path: str,
+                 output_path: str,
                  include_common: bool = True,
                  verbose: bool = False) -> bool:
 
-    probe = PdfReader(input_path)
-    ocgs  = get_ocgs(probe)
+    # Verificar que el PDF se puede abrir
+    try:
+        probe = PdfReader(input_path)
+    except Exception as e:
+        print(f"Error al abrir el PDF: {e}")
+        return False
 
+    # Verificar encriptación
+    if probe.is_encrypted:
+        print("El PDF está encriptado. Desencriptalo primero.")
+        return False
+
+    ocgs = get_ocgs(probe)
     if not ocgs:
         print("El PDF no tiene Optional Content Groups (capas).")
         return False
@@ -164,49 +235,85 @@ def ocg_to_pages(input_path: str, output_path: str,
         print()
 
     final = PdfWriter()
+    pages_written = 0
 
     for ocg in ocgs:
         name = ocg['name']
         if verbose:
             print(f"Procesando: {name}")
 
-        # PdfWriter fresco por cada OCG para aislar los objetos
-        w = PdfWriter()
-        w.append(PdfReader(input_path))
+        # PdfWriter fresco por cada OCG para aislar objetos entre iteraciones
+        try:
+            w = PdfWriter()
+            w.append(PdfReader(input_path))
+        except Exception as e:
+            print(f"  [!] Error al cargar PDF para capa '{name}': {e}")
+            continue
 
         indices = find_content_stream_indices(w)
+        if not indices and verbose:
+            print(f"  [!] No se encontraron content streams en el PDF")
 
         for pnum, wpage in enumerate(w.pages):
-            prop_map = get_prop_map(wpage)
+            prop_map    = get_prop_map(wpage)
+            target_prop = ocg_name_to_prop_key(prop_map, name)
+
+            if target_prop is None and not include_common:
+                if verbose:
+                    print(f"  pagina {pnum+1}: OCG no encontrado, omitida")
+                continue
 
             for idx in indices:
                 old_obj = w._objects[idx]
-                cs      = ContentStream(old_obj, w)
-                filtered = filter_ops(list(cs.operations),
-                                      prop_map, name, include_common)
-                cs.operations = filtered
-                w._objects[idx] = make_encoded_stream(cs.get_data(), old_obj)
+                raw_data = get_stream_data(old_obj)
+                if raw_data is None:
+                    if verbose:
+                        print(f"  [!] Stream {idx} no pudo decodificarse, se conserva sin filtrar")
+                    continue
+                try:
+                    filtered = filter_stream_bytes(
+                        raw_data,
+                        target_prop or b'__nonexistent__',
+                        include_common
+                    )
+                    w._objects[idx] = make_encoded_stream(filtered, old_obj)
+                except Exception as e:
+                    if verbose:
+                        print(f"  [!] Error filtrando stream {idx}: {e}. Conservando sin filtrar.")
 
             final.add_page(wpage)
+            pages_written += 1
             if verbose:
-                print(f"  pagina fuente {pnum + 1} -> pagina output {len(final.pages)}")
+                print(f"  pagina fuente {pnum+1} -> pagina output {pages_written}")
+
+    if pages_written == 0:
+        print("No se generaron páginas.")
+        return False
 
     if '/OCProperties' in final._root_object:
         del final._root_object['/OCProperties']
 
-    with open(output_path, 'wb') as f:
-        final.write(f)
+    try:
+        with open(output_path, 'wb') as f:
+            final.write(f)
+    except Exception as e:
+        print(f"Error al guardar '{output_path}': {e}")
+        return False
 
     print(f"\nGuardado : {output_path}")
     print(f"  OCGs          : {len(ocgs)}")
     print(f"  Paginas fuente: {len(probe.pages)}")
-    print(f"  Paginas output: {len(final.pages)}")
+    print(f"  Paginas output: {pages_written}")
     return True
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     p = argparse.ArgumentParser(
-        description="Una pagina por cada OCG del PDF.",
+        description="Una pagina por cada OCG/capa del PDF.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
