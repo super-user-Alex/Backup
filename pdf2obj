@@ -1,513 +1,226 @@
 """
-=============================================================================
-  Adobe Illustrator — PDF Swatch Generator + Color Replacer (v4)
-  ---------------------------------------------------------------
-  Maneja correctamente PDFs guardados desde Illustrator, que contienen:
+ocg_to_pages.py
+---------------
+Toma cada Optional Content Group (OCG / capa) de un PDF
+y lo coloca en una página separada del documento de salida.
 
-    1. /Contents        → Content stream PDF estándar (visores normales)
-    2. /AIPrivateData   → Stream nativo de Illustrator (PostScript/AI)
-       /AIMetaData      → Metadatos del documento AI
+Solo requiere pikepdf:
+    pip install pikepdf
 
-  Cuando Illustrator abre un PDF que él mismo guardó, IGNORA el /Contents
-  estándar y usa directamente el /AIPrivateData. Por eso los cambios en
-  el content stream eran visibles en visores normales pero no en Illustrator.
+Uso:
+    python ocg_to_pages.py input.pdf output.pdf [opciones]
 
-  Solución: reemplazar colores en AMBOS streams simultáneamente.
-
-  Dependencias:
-    pypdf  5.x  →  BSD-3-Clause   (pip install pypdf)
-    struct, zlib, re  →  stdlib Python
-=============================================================================
+Opciones:
+    --no-common    Excluir contenido sin OCG de cada página.
+    --verbose, -v  Mostrar detalles del proceso.
 """
 
-import re
-import struct
-import zlib
-from io import BytesIO
-
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (
-    ArrayObject,
-    ContentStream,
-    FloatObject,
-    NameObject,
-    NumberObject,
+import sys
+import io
+import argparse
+import pikepdf
+from pikepdf import (
+    Pdf, Page, Dictionary, Array, Name, String, Stream,
+    parse_content_stream, unparse_content_stream,
 )
 
 
-# ─────────────────────────────────────────────────────
-#  CONFIGURACIÓN
-# ─────────────────────────────────────────────────────
-COLOR_CONFIG = {
-    "name": "Azul Corporativo",
-    "cmyk": (85, 50, 0, 10),
-}
+# ---------------------------------------------------------------------------
+# Inspección de OCGs
+# ---------------------------------------------------------------------------
 
-INPUT_PDF   = "input_design.pdf"
-OUTPUT_PDF  = "output_illustrator_ready.pdf"
-OUTPUT_ASE  = "swatch_illustrator.ase"
-PREVIEW_PDF = "swatch_preview.pdf"
+def get_document_ocgs(pdf):
+    """
+    Retorna lista de dicts:
+        [{'name': str, 'objgen': tuple}, ...]
+    ordenada según /OCProperties/OCGs del PDF.
+    """
+    if '/OCProperties' not in pdf.Root:
+        return []
 
-
-# ─────────────────────────────────────────────────────
-#  UTILIDADES DE COLOR
-# ─────────────────────────────────────────────────────
-def normalize(cmyk):
-    return tuple(round(v / 100.0, 6) for v in cmyk)
-
-def cmyk_to_rgb(c, m, y, k):
-    c, m, y, k = c/100, m/100, y/100, k/100
-    return (round(255*(1-c)*(1-k)), round(255*(1-m)*(1-k)), round(255*(1-y)*(1-k)))
-
-def rgb_hex(r, g, b):
-    return f"#{r:02X}{g:02X}{b:02X}"
+    result = []
+    for ref in pdf.Root.OCProperties.OCGs:
+        name = str(ref.get('/Name', String('')))
+        result.append({'name': name, 'objgen': ref.objgen})
+    return result
 
 
-# ─────────────────────────────────────────────────────
-#  1. CREAR .ASE
-# ─────────────────────────────────────────────────────
-def create_ase(color_name, cmyk, path):
-    c, m, y, k = normalize(cmyk)
-    name_utf16 = color_name.encode("utf-16-be") + b"\x00\x00"
-    block_size = 2 + len(name_utf16) + 4 + 16 + 2
-    with open(path, "wb") as f:
-        f.write(b"ASEF")
-        f.write(struct.pack(">HH", 1, 0))
-        f.write(struct.pack(">I", 1))
-        f.write(struct.pack(">H", 0x0001))
-        f.write(struct.pack(">I", block_size))
-        f.write(struct.pack(">H", len(color_name) + 1))
-        f.write(name_utf16)
-        f.write(b"CMYK")
-        f.write(struct.pack(">ffff", c, m, y, k))
-        f.write(struct.pack(">H", 2))
-    rgb = cmyk_to_rgb(*cmyk)
-    print(f"  ✔ Swatch .ASE          →  {path}")
-    print(f"     CMYK: C={cmyk[0]} M={cmyk[1]} Y={cmyk[2]} K={cmyk[3]}  |  HEX: {rgb_hex(*rgb)}")
+def get_prop_map(page_obj):
+    """
+    Devuelve { '/PropName': objgen_tuple } para cada OCG
+    referenciado en Resources/Properties de la página.
+    """
+    prop_map = {}
+    try:
+        props = page_obj.Resources.Properties
+        for key in props.keys():
+            ocg_obj = props[key]
+            if '/Type' in ocg_obj and str(ocg_obj.Type) == '/OCG':
+                prop_map[key] = ocg_obj.objgen
+    except AttributeError:
+        pass
+    return prop_map
 
 
-# ─────────────────────────────────────────────────────
-#  2. REEMPLAZAR COLORES EN PDF CONTENT STREAM
-#     (pypdf ContentStream — para el stream PDF estándar)
-# ─────────────────────────────────────────────────────
-FILL_OPS   = {b"rg", b"k",  b"g",  b"sc",  b"scn"}
-STROKE_OPS = {b"RG", b"K",  b"G",  b"SC",  b"SCN"}
+# ---------------------------------------------------------------------------
+# Filtrado del content stream
+# ---------------------------------------------------------------------------
 
-def replace_pdf_stream(stream_obj, reader, c, m, y, k):
-    """Reemplaza colores en un content stream PDF usando pypdf."""
-    cs = ContentStream(stream_obj, reader)
-    cmyk_vals = [FloatObject(c), FloatObject(m), FloatObject(y), FloatObject(k)]
-    new_ops = []
-    for operands, operator in cs.operations:
-        if operator in FILL_OPS:
-            new_ops.append((list(cmyk_vals), b"k"))
-        elif operator in STROKE_OPS:
-            new_ops.append((list(cmyk_vals), b"K"))
+def _visible(stack, target, include_common):
+    """¿Debe incluirse una instrucción dado el stack actual?"""
+    if not stack:
+        return include_common
+    for frame in reversed(stack):
+        if frame[0] == 'oc':
+            return frame[1] == target
+    return include_common
+
+
+def filter_stream(instructions, prop_map, target_objgen, include_common):
+    """
+    Filtra las instrucciones dejando solo el contenido del target_objgen
+    (y opcionalmente el contenido sin OCG).
+    """
+    result = []
+    stack = []  # ('oc', objgen) | ('other',)
+
+    for instr in instructions:
+        op = str(instr.operator)
+        ops = list(instr.operands)
+
+        if op in ('BDC', 'BMC'):
+            is_oc = len(ops) >= 2 and str(ops[0]) == '/OC'
+            if is_oc:
+                objgen = prop_map.get(str(ops[1]))
+                stack.append(('oc', objgen))
+                if objgen == target_objgen:
+                    result.append(instr)
+            else:
+                stack.append(('other',))
+                if _visible(stack, target_objgen, include_common):
+                    result.append(instr)
+
+        elif op == 'EMC':
+            if not stack:
+                result.append(instr)
+                continue
+            top = stack[-1]
+            was_visible = _visible(stack, target_objgen, include_common)
+            stack.pop()
+            if top[0] == 'oc':
+                if top[1] == target_objgen:
+                    result.append(instr)
+            else:
+                if was_visible:
+                    result.append(instr)
         else:
-            new_ops.append((operands, operator))
-    cs.operations = new_ops
-    new_bytes = cs.get_data()
-    compressed = zlib.compress(new_bytes, level=9)
-    # Modificar IN-PLACE para evitar objetos huérfanos
-    stream_obj._data = compressed
-    stream_obj[NameObject("/Filter")] = NameObject("/FlateDecode")
-    stream_obj[NameObject("/Length")] = NumberObject(len(compressed))
-    for old_key in ("/DecodeParms", "/Columns", "/Predictor"):
-        if old_key in stream_obj:
-            del stream_obj[old_key]
+            if _visible(stack, target_objgen, include_common):
+                result.append(instr)
+
+    return result
 
 
-# ─────────────────────────────────────────────────────
-#  3. REEMPLAZAR COLORES EN AIPRIVATEDATA
-#     (PostScript/AI nativo — procesado con regex sobre texto)
-# ─────────────────────────────────────────────────────
-"""
-El AIPrivateData contiene comandos PostScript/AI. Los operadores de color
-que aparecen ahí son diferentes al PDF estándar:
+# ---------------------------------------------------------------------------
+# Construcción de la página filtrada
+# ---------------------------------------------------------------------------
 
-  PDF estándar:
-    r g b rg          → RGB fill
-    c m y k k         → CMYK fill
-
-  PostScript / AI nativo:
-    r g b setrgbcolor
-    c m y k setcmykcolor
-    r g b rg          (también usa operadores PDF directos)
-    c m y k k
-
-  Formato específico de Illustrator (.AI / EPS embebido):
-    C M Y K Xa        → fill con tinta de proceso (Xa = color command)
-    C M Y K Xb        → stroke
-    C M Y K XA        → variante
-    r g b Xr          → RGB fill
-"""
-
-# Regex para operadores de color en PostScript/AI
-_N    = r"[-+]?\d*\.?\d+"          # número flotante
-_SP   = r"\s+"                      # espacios/saltos
-
-AI_COLOR_PATTERNS = [
-    # PostScript estándar
-    (re.compile(rf"({_N}{_SP}){3}setrgbcolor"),   "rgb_ps"),
-    (re.compile(rf"({_N}{_SP}){4}setcmykcolor"),  "cmyk_ps"),
-    (re.compile(rf"({_N}{_SP}){1}setgray"),       "gray_ps"),
-    # PDF operators dentro del stream AI
-    (re.compile(rf"({_N}\s+){{3}}rg\b"),          "rgb_fill"),
-    (re.compile(rf"({_N}\s+){{3}}RG\b"),          "rgb_stroke"),
-    (re.compile(rf"({_N}\s+){{4}}k\b"),           "cmyk_fill"),
-    (re.compile(rf"({_N}\s+){{4}}K\b"),           "cmyk_stroke"),
-    (re.compile(rf"({_N}\s+){{1}}g\b"),           "gray_fill"),
-    (re.compile(rf"({_N}\s+){{1}}G\b"),           "gray_stroke"),
-    # Comandos propietarios de Illustrator
-    (re.compile(rf"({_N}{_SP}){4}Xa\b"),          "ai_fill"),
-    (re.compile(rf"({_N}{_SP}){4}Xb\b"),          "ai_stroke"),
-    (re.compile(rf"({_N}{_SP}){4}XA\b"),          "ai_fill_alt"),
-    (re.compile(rf"({_N}{_SP}){3}Xr\b"),          "ai_rgb"),
-]
-
-
-def replace_ai_stream_colors(text, c, m, y, k):
+def make_filtered_page(src_bytes, src_page_num, target_pdf, target_objgen, include_common):
     """
-    Reemplaza todos los operadores de color en texto PostScript/AI
-    con el color CMYK dado. Devuelve el texto modificado.
+    Abre una copia fresca del PDF fuente (para evitar el cacheo de copy_foreign),
+    filtra el content stream y retorna una Page lista para el PDF destino.
     """
-    cf = f"{c:.4f}"
-    mf = f"{m:.4f}"
-    yf = f"{y:.4f}"
-    kf = f"{k:.4f}"
+    fresh = Pdf.open(io.BytesIO(src_bytes))
+    src_page = fresh.pages[src_page_num]
+    prop_map = get_prop_map(src_page.obj)
 
-    cmyk_pdf_fill   = f"{cf} {mf} {yf} {kf} k"
-    cmyk_pdf_stroke = f"{cf} {mf} {yf} {kf} K"
-    cmyk_ps         = f"{cf} {mf} {yf} {kf} setcmykcolor"
-    cmyk_ai_fill    = f"{cf} {mf} {yf} {kf} Xa"
-    cmyk_ai_stroke  = f"{cf} {mf} {yf} {kf} Xb"
+    instructions = parse_content_stream(src_page)
+    filtered = filter_stream(instructions, prop_map, target_objgen, include_common)
+    stream_data = unparse_content_stream(filtered)
 
-    replacements = {
-        "rgb_ps":      cmyk_ps,
-        "cmyk_ps":     cmyk_ps,
-        "gray_ps":     cmyk_ps,
-        "rgb_fill":    cmyk_pdf_fill,
-        "rgb_stroke":  cmyk_pdf_stroke,
-        "cmyk_fill":   cmyk_pdf_fill,
-        "cmyk_stroke": cmyk_pdf_stroke,
-        "gray_fill":   cmyk_pdf_fill,
-        "gray_stroke": cmyk_pdf_stroke,
-        "ai_fill":     cmyk_ai_fill,
-        "ai_stroke":   cmyk_ai_stroke,
-        "ai_fill_alt": cmyk_ai_fill,
-        "ai_rgb":      cmyk_pdf_fill,
-    }
+    new_page_obj = target_pdf.copy_foreign(src_page.obj)
+    new_page_obj['/Contents'] = target_pdf.make_indirect(
+        Stream(target_pdf, stream_data)
+    )
 
-    for pattern, kind in AI_COLOR_PATTERNS:
-        text = pattern.sub(replacements[kind], text)
-
-    return text
+    fresh.close()
+    return Page(new_page_obj)
 
 
-def process_ai_stream(stream_obj, c, m, y, k):
+# ---------------------------------------------------------------------------
+# Función principal
+# ---------------------------------------------------------------------------
+
+def ocg_to_pages(input_path, output_path, include_common=True, verbose=False):
     """
-    Lee, decodifica, modifica colores y recomprime el AIPrivateData.
-    Maneja: FlateDecode, ASCII85Decode, y combinaciones.
+    Lee input_path, crea una página por cada OCG en output_path.
     """
-    try:
-        raw = stream_obj.get_data()  # pypdf decodifica automáticamente
-    except Exception:
-        return False  # No decodificable, omitir
+    with open(input_path, 'rb') as f:
+        src_bytes = f.read()
 
-    try:
-        text = raw.decode("latin-1")
-    except Exception:
+    src = Pdf.open(io.BytesIO(src_bytes))
+    ocgs = get_document_ocgs(src)
+    num_src_pages = len(src.pages)
+    src.close()
+
+    if not ocgs:
+        print("El PDF no contiene Optional Content Groups (capas).")
         return False
 
-    original = text
-    text = replace_ai_stream_colors(text, c, m, y, k)
+    if verbose:
+        print(f"Entrada : {input_path}")
+        print(f"OCGs encontrados ({len(ocgs)}):")
+        for ocg in ocgs:
+            print(f"  - {ocg['name']}  (objgen={ocg['objgen']})")
+        print()
 
-    if text == original:
-        return False  # Sin cambios
+    out = Pdf.new()
+    total = 0
 
-    new_bytes = text.encode("latin-1")
-    compressed = zlib.compress(new_bytes, level=9)
+    for ocg in ocgs:
+        name   = ocg['name']
+        objgen = ocg['objgen']
+        if verbose:
+            print(f"Procesando: {name}")
 
-    stream_obj._data = compressed
-    stream_obj[NameObject("/Filter")] = NameObject("/FlateDecode")
-    stream_obj[NameObject("/Length")] = NumberObject(len(compressed))
-    for old_key in ("/DecodeParms", "/Columns", "/Predictor"):
-        if old_key in stream_obj:
-            del stream_obj[old_key]
+        for pnum in range(num_src_pages):
+            if verbose:
+                print(f"  pagina fuente {pnum+1} -> pagina output {total+1}")
+            page = make_filtered_page(src_bytes, pnum, out, objgen, include_common)
+            out.pages.append(page)
+            total += 1
 
+    if '/OCProperties' in out.Root:
+        del out.Root['/OCProperties']
+
+    out.save(output_path, fix_metadata_version=True)
+
+    print(f"\nGuardado: {output_path}")
+    print(f"  OCGs         : {len(ocgs)}")
+    print(f"  Paginas fuente: {num_src_pages}")
+    print(f"  Paginas output: {total}")
     return True
 
 
-# ─────────────────────────────────────────────────────
-#  4. FUNCIÓN PRINCIPAL: APPLY COLOR TO PDF
-# ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-# Claves donde Illustrator puede guardar streams de datos propios
-AI_STREAM_KEYS = [
-    "/AIPrivateData",
-    "/AIMetaData",
-    "/AIPriv",
-]
-
-
-
-# ─────────────────────────────────────────────────────
-#  BORRAR AIPRIVATEDATA  (fallback cuando no es modificable)
-# ─────────────────────────────────────────────────────
-def strip_ai_data(writer):
-    """
-    Elimina todos los streams propietarios de Illustrator del PDF.
-    Tras el borrado, Illustrator no tiene otra opción que leer el
-    /Contents estándar — donde ya están los colores correctos.
-
-    Busca en:
-      - Diccionarios de página (/AIPrivateData, /AIMetaData, /AIPriv)
-      - Catalog y cualquier otro objeto del PDF
-      - Streams sueltos que solo contienen marcadores AI (%AI, %%AI)
-    """
-    AI_KEYS = ["/AIPrivateData", "/AIMetaData", "/AIPriv", "/AIEntryList"]
-    AI_MARKERS = [b"%AI", b"%%AI", b"%AI12", b"%%Creator: Adobe Illustrator"]
-
-    removed = 0
-
-    def _is_ai_stream(stream_obj):
-        """Detecta si un stream es datos nativos de Illustrator."""
-        try:
-            data = stream_obj.get_data()
-            return any(m in data for m in AI_MARKERS)
-        except Exception:
-            return False
-
-    def _strip_dict(d):
-        """Elimina claves AI de un diccionario PDF."""
-        nonlocal removed
-        for key in AI_KEYS:
-            if key in d:
-                del d[key]
-                removed += 1
-
-    # ── Páginas ──
-    for page in writer.pages:
-        _strip_dict(page)
-
-    # ── Catalog y objetos globales ──
-    try:
-        catalog = writer.get_object(writer._root_object.indirect_reference)
-        _strip_dict(catalog)
-    except Exception:
-        pass
-
-    # ── Recorrer todos los objetos del writer ──
-    # (Illustrator a veces guarda AIPrivateData en objetos no referenciados por páginas)
-    for obj in writer._objects:
-        try:
-            if hasattr(obj, "keys"):
-                _strip_dict(obj)
-        except Exception:
-            continue
-
-    return removed
-
-
-def apply_color_to_pdf(input_path, output_path, color_name, cmyk):
-    """
-    Reemplaza colores en:
-      - /Contents       → content stream PDF estándar (visores normales)
-      - /AIPrivateData  → stream nativo de Illustrator (cuando el PDF lo tiene)
-      - /AIMetaData     → metadatos Illustrator
-
-    Modificación siempre in-place para evitar objetos huérfanos.
-    """
-    c, m, y, k = normalize(cmyk)
-    reader = PdfReader(input_path)
-    writer = PdfWriter()
-
-    pages_ok      = 0
-    pdf_streams   = 0
-    ai_streams    = 0
-
-    for page_num, page in enumerate(reader.pages):
-        writer.add_page(page)
-        new_page = writer.pages[page_num]
-
-        # ── A. Content stream PDF estándar ──
-        if "/Contents" in new_page:
-            contents_obj = writer.get_object(new_page.raw_get("/Contents"))
-            stream_list = (
-                [writer.get_object(r) for r in contents_obj]
-                if isinstance(contents_obj, ArrayObject)
-                else [contents_obj]
-            )
-            for s in stream_list:
-                replace_pdf_stream(s, reader, c, m, y, k)
-                pdf_streams += 1
-
-        # ── B. Streams nativos de Illustrator ──
-        for ai_key in AI_STREAM_KEYS:
-            if ai_key in new_page:
-                ai_obj = writer.get_object(new_page.raw_get(ai_key))
-                if process_ai_stream(ai_obj, c, m, y, k):
-                    ai_streams += 1
-
-        pages_ok += 1
-
-    # ── C. Buscar AIPrivateData también en objetos globales del PDF ──
-    # (Illustrator a veces los guarda fuera de la página)
-    for obj_num in range(len(reader.xref)):
-        try:
-            obj = writer.get_object(obj_num)
-            if not hasattr(obj, "keys"):
-                continue
-            for ai_key in AI_STREAM_KEYS:
-                if ai_key in obj:
-                    ai_ref = obj.raw_get(ai_key)
-                    ai_obj = writer.get_object(ai_ref)
-                    if process_ai_stream(ai_obj, c, m, y, k):
-                        ai_streams += 1
-        except Exception:
-            continue
-
-    # Si no se pudo modificar el AIPrivateData, borrarlo antes de escribir
-    # para que Illustrator caiga en el /Contents estándar (ya tiene los colores correctos)
-    removed = 0
-    if ai_streams == 0:
-        removed = strip_ai_data(writer)
-
-    writer.add_metadata({
-        "/Subject":  f"Swatch: {color_name} CMYK({cmyk[0]},{cmyk[1]},{cmyk[2]},{cmyk[3]})",
-        "/Keywords": f"CMYK swatch Illustrator {color_name}",
-    })
-
-    with open(output_path, "wb") as f:
-        writer.write(f)
-
-    print(f"  ✔ PDF procesado        →  {output_path}")
-    print(f"     Páginas            : {pages_ok}")
-    print(f"     Streams PDF        : {pdf_streams}  (visores normales)")
-    print(f"     Streams AI nativos : {ai_streams}  (Illustrator)")
-
-    if ai_streams == 0:
-        if removed > 0:
-            print(f"  ✔ AIPrivateData eliminado  ({removed} entrada/s)")
-            print(f"     Illustrator usará el /Contents estándar (colores ya aplicados)")
-        else:
-            print()
-            print("  ℹ  No se detectó AIPrivateData en este PDF.")
-            print("     El /Contents estándar tiene los colores correctos.")
-
-
-# ─────────────────────────────────────────────────────
-#  5. SWATCH PREVIEW PDF (stdlib pura)
-# ─────────────────────────────────────────────────────
-def create_swatch_preview(color_name, cmyk, path):
-    c, m, y, k = normalize(cmyk)
-    rgb = cmyk_to_rgb(*cmyk)
-    hex_col = rgb_hex(*rgb)
-    W, H = 595, 842
-
-    def esc(s):
-        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-
-    content = f"""
-0 0 0 0 k
-0 0 {W} {H} re f
-{c:.4f} {m:.4f} {y:.4f} {k:.4f} k
-60 {H-260} 220 160 re f
-0 0 0 0.25 K
-0.5 w
-60 {H-260} 220 160 re S
-0 0 0 1 k
-BT /F1 18 Tf 60 {H-298} Td ({esc(color_name)}) Tj ET
-BT /F1 10 Tf 0 0 0 0.8 k 60 {H-324} Td (CMYK:  C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%) Tj ET
-BT /F1 10 Tf 60 {H-342} Td (RGB:   R={rgb[0]}  G={rgb[1]}  B={rgb[2]}) Tj ET
-BT /F1 10 Tf 60 {H-360} Td (HEX:   {hex_col}) Tj ET
-0 0 0 1 k
-BT /F1 11 Tf 60 {H-420} Td (Composicion de tintas:) Tj ET
-1 0 0 0 k
-60 {H-480} {max(1,int(90*cmyk[0]/100))} 24 re f
-0 0 0 0.3 K 60 {H-480} 90 24 re S
-0 0 0 1 k BT /F1 8 Tf 60 {H-494} Td (Cyan: {cmyk[0]}%) Tj ET
-0 1 0 0 k
-170 {H-480} {max(1,int(90*cmyk[1]/100))} 24 re f
-0 0 0 0.3 K 170 {H-480} 90 24 re S
-0 0 0 1 k BT /F1 8 Tf 170 {H-494} Td (Magenta: {cmyk[1]}%) Tj ET
-0 0 1 0 k
-280 {H-480} {max(1,int(90*cmyk[2]/100))} 24 re f
-0 0 0 0.3 K 280 {H-480} 90 24 re S
-0 0 0 1 k BT /F1 8 Tf 280 {H-494} Td (Yellow: {cmyk[2]}%) Tj ET
-0 0 0 1 k
-390 {H-480} {max(1,int(90*cmyk[3]/100))} 24 re f
-0 0 0 0.3 K 390 {H-480} 90 24 re S
-BT /F1 8 Tf 390 {H-494} Td (Black: {cmyk[3]}%) Tj ET
-0 0 0 0.5 k
-BT /F1 7.5 Tf 60 52 Td (Importar: Ventana > Muestras > Menu > Abrir biblioteca de muestras) Tj ET
-""".strip().encode("latin-1")
-
-    cs = zlib.compress(content, level=6)
-    buf = BytesIO()
-    xrefs = []
-
-    def obj(n, body):
-        xrefs.append(buf.tell())
-        buf.write(f"{n} 0 obj\n".encode() + body + b"\nendobj\n")
-
-    buf.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
-    obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-    obj(3, (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {W} {H}] "
-            f"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>").encode())
-    xrefs.append(buf.tell())
-    buf.write(f"4 0 obj\n<< /Length {len(cs)} /Filter /FlateDecode >>\nstream\n".encode())
-    buf.write(cs)
-    buf.write(b"\nendstream\nendobj\n")
-    obj(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
-
-    xref_pos = buf.tell()
-    buf.write(f"xref\n0 6\n0000000000 65535 f \n".encode())
-    for r in xrefs:
-        buf.write(f"{r:010d} 00000 n \n".encode())
-    buf.write(f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode())
-
-    with open(path, "wb") as f:
-        f.write(buf.getvalue())
-    print(f"  ✔ Preview PDF          →  {path}")
-
-
-# ─────────────────────────────────────────────────────
-#  PUNTO DE ENTRADA
-# ─────────────────────────────────────────────────────
 def main():
-    print("\n" + "="*62)
-    print("  PDF Swatch Generator v5  —  pypdf (BSD-3) + stdlib")
-    print("="*62)
+    parser = argparse.ArgumentParser(
+        description="Extrae cada OCG/capa de un PDF a una pagina separada."
+    )
+    parser.add_argument("input",  help="PDF de entrada")
+    parser.add_argument("output", help="PDF de salida")
+    parser.add_argument("--no-common", action="store_true",
+                        help="Excluir contenido sin capa de cada pagina.")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
 
-    name = COLOR_CONFIG["name"]
-    cmyk = COLOR_CONFIG["cmyk"]
-    rgb  = cmyk_to_rgb(*cmyk)
-
-    print("\n[1/3] Creando archivo de muestra .ASE…")
-    create_ase(name, cmyk, OUTPUT_ASE)
-
-    print(f"\n[2/3] Reemplazando colores en {INPUT_PDF}…")
-    apply_color_to_pdf(INPUT_PDF, OUTPUT_PDF, name, cmyk)
-
-    print("\n[3/3] Generando PDF de previsualización…")
-    create_swatch_preview(name, cmyk, PREVIEW_PDF)
-
-    print("\n" + "="*62)
-    print("  RESULTADO")
-    print("="*62)
-    print(f"  Color : {name}")
-    print(f"  CMYK  : C={cmyk[0]}%  M={cmyk[1]}%  Y={cmyk[2]}%  K={cmyk[3]}%")
-    print(f"  RGB   : R={rgb[0]}  G={rgb[1]}  B={rgb[2]}")
-    print()
-    print("  Estrategia aplicada:")
-    print("   1. Reemplazar colores en /Contents  (visores normales)")
-    print("   2. Reemplazar colores en /AIPrivateData  (Illustrator nativo)")
-    print("   3. Si AIPrivateData no es modificable → se elimina")
-    print("      Illustrator cae en /Contents, donde los colores ya son correctos")
-    print("="*62)
+    ok = ocg_to_pages(args.input, args.output,
+                      include_common=not args.no_common,
+                      verbose=args.verbose)
+    sys.exit(0 if ok else 1)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
