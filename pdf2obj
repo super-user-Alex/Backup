@@ -1,77 +1,63 @@
 """
 ocg_to_pages_pypdf.py
 ---------------------
-Toma cada Optional Content Group (OCG / capa) de un PDF
-y lo coloca en una página separada del documento de salida.
+Extrae cada Optional Content Group (OCG / capa) de un PDF
+y genera una página separada por cada uno.
 
-Solo requiere pypdf:
+Requiere solo pypdf:
     pip install pypdf
 
 Uso:
-    python ocg_to_pages_pypdf.py input.pdf output.pdf [opciones]
-
-Opciones:
-    --no-common    Excluir contenido sin OCG (común) de cada página.
-    --verbose, -v  Mostrar detalles del proceso.
+    python ocg_to_pages_pypdf.py input.pdf output.pdf
+    python ocg_to_pages_pypdf.py input.pdf output.pdf --no-common --verbose
 """
 
 import sys
+import io
+import zlib
 import argparse
+
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ContentStream, NameObject, IndirectObject
+from pypdf.generic import (
+    ContentStream, NameObject, IndirectObject,
+    EncodedStreamObject,
+)
 
 
 # ---------------------------------------------------------------------------
-# Inspección de OCGs
+# OCG helpers
 # ---------------------------------------------------------------------------
 
-def get_document_ocgs(reader: PdfReader) -> list[dict]:
-    """
-    Retorna lista de dicts:
-        [{'name': str, 'idnum': int}, ...]
-    con todos los OCGs del catálogo del PDF.
-    """
+def get_ocgs(reader: PdfReader) -> list[dict]:
+    """Retorna [{'name': str, 'idnum': int}, ...] con los OCGs del catálogo."""
     root = reader.trailer['/Root']
     if '/OCProperties' not in root:
         return []
-
-    result = []
-    for ref in root['/OCProperties']['/OCGs']:
-        obj = ref.get_object()
-        result.append({'name': str(obj['/Name']), 'idnum': ref.idnum})
-    return result
+    return [
+        {'name': str(ref.get_object()['/Name']), 'idnum': ref.idnum}
+        for ref in root['/OCProperties']['/OCGs']
+    ]
 
 
-def get_prop_map(page, root) -> dict:
-    """
-    Devuelve { '/PropName': idnum } para cada OCG referenciado
-    en Resources/Properties de la página.
-    """
+def get_prop_map(page) -> dict:
+    """Devuelve { '/PropName': 'OCG Name' } desde Resources/Properties."""
     prop_map = {}
     try:
-        props = page['/Resources']['/Properties']
-    except KeyError:
-        return prop_map
-
-    for key in props:
-        obj = props[key]
-        if isinstance(obj, IndirectObject):
-            obj = obj.get_object()
-        if obj.get('/Type') == NameObject('/OCG'):
-            # Buscar el idnum en los OCGs del catálogo
-            for ref in root['/OCProperties']['/OCGs']:
-                if str(ref.get_object()['/Name']) == str(obj['/Name']):
-                    prop_map[key] = ref.idnum
-                    break
+        for key, obj in page['/Resources']['/Properties'].items():
+            if isinstance(obj, IndirectObject):
+                obj = obj.get_object()
+            if obj.get('/Type') == NameObject('/OCG'):
+                prop_map[key] = str(obj['/Name'])
+    except (KeyError, AttributeError):
+        pass
     return prop_map
 
 
 # ---------------------------------------------------------------------------
-# Filtrado del content stream
+# Content stream filtering
 # ---------------------------------------------------------------------------
 
-def _visible(stack: list, target: int, include_common: bool) -> bool:
-    """¿Debe incluirse la instrucción actual según el stack?"""
+def _visible(stack: list, target: str, include_common: bool) -> bool:
     if not stack:
         return include_common
     for frame in reversed(stack):
@@ -80,17 +66,13 @@ def _visible(stack: list, target: int, include_common: bool) -> bool:
     return include_common
 
 
-def filter_ops(ops: list,
-               prop_map: dict,
-               target_idnum: int,
-               include_common: bool = True) -> list:
+def filter_ops(ops: list, prop_map: dict,
+               target_name: str, include_common: bool) -> list:
     """
-    Filtra las operaciones del content stream conservando solo:
-      - El bloque BDC/EMC del OCG objetivo
-      - Si include_common: instrucciones fuera de cualquier OC
+    Retiene solo las instrucciones del bloque OC de `target_name`
+    y, opcionalmente, el contenido fuera de cualquier capa.
     """
-    result = []
-    stack = []  # ('oc', idnum) | ('other',)
+    result, stack = [], []
 
     for operands, operator in ops:
         op = operator if isinstance(operator, str) else operator.decode()
@@ -98,13 +80,13 @@ def filter_ops(ops: list,
         if op in ('BDC', 'BMC'):
             is_oc = len(operands) >= 2 and str(operands[0]) == '/OC'
             if is_oc:
-                idnum = prop_map.get(str(operands[1]))
-                stack.append(('oc', idnum))
-                if idnum == target_idnum:
+                layer = prop_map.get(str(operands[1]))
+                stack.append(('oc', layer))
+                if layer == target_name:
                     result.append((operands, operator))
             else:
                 stack.append(('other',))
-                if _visible(stack, target_idnum, include_common):
+                if _visible(stack, target_name, include_common):
                     result.append((operands, operator))
 
         elif op == 'EMC':
@@ -112,121 +94,136 @@ def filter_ops(ops: list,
                 result.append((operands, operator))
                 continue
             top = stack[-1]
-            was_visible = _visible(stack, target_idnum, include_common)
+            was = _visible(stack, target_name, include_common)
             stack.pop()
-            if top[0] == 'oc':
-                if top[1] == target_idnum:
-                    result.append((operands, operator))
-            else:
-                if was_visible:
-                    result.append((operands, operator))
+            if (top[0] == 'oc' and top[1] == target_name) \
+                    or (top[0] == 'other' and was):
+                result.append((operands, operator))
 
         else:
-            if _visible(stack, target_idnum, include_common):
+            if _visible(stack, target_name, include_common):
                 result.append((operands, operator))
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Función principal
+# Stream replacement
 # ---------------------------------------------------------------------------
 
-def ocg_to_pages(input_path: str,
-                 output_path: str,
+def find_content_stream_indices(w: PdfWriter) -> list[int]:
+    """
+    Localiza índices en w._objects que corresponden a content streams
+    (contienen operadores PDF como BT, BDC, etc.).
+    """
+    indices = []
+    for i, obj in enumerate(w._objects):
+        if obj is None:
+            continue
+        if hasattr(obj, 'get_data'):
+            try:
+                data = obj.get_data()
+                if data and (b'BT' in data or b'BDC' in data or b'Do' in data):
+                    indices.append(i)
+            except Exception:
+                pass
+    return indices
+
+
+def make_encoded_stream(raw_bytes: bytes, old_obj) -> EncodedStreamObject:
+    """Crea un EncodedStreamObject (FlateDecode) con los bytes dados."""
+    new_obj = EncodedStreamObject()
+    new_obj[NameObject('/Filter')] = NameObject('/FlateDecode')
+    new_obj._data = zlib.compress(raw_bytes)
+    # Preservar indirect_reference para que el xref siga siendo válido
+    if hasattr(old_obj, 'indirect_reference'):
+        new_obj.indirect_reference = old_obj.indirect_reference
+    return new_obj
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def ocg_to_pages(input_path: str, output_path: str,
                  include_common: bool = True,
                  verbose: bool = False) -> bool:
-    """
-    Lee input_path y genera una página por OCG en output_path.
-    """
-    # Leer OCGs del PDF una vez (solo para inspeccion)
+
     probe = PdfReader(input_path)
-    ocgs = get_document_ocgs(probe)
+    ocgs  = get_ocgs(probe)
 
     if not ocgs:
-        print("El PDF no contiene Optional Content Groups (capas).")
+        print("El PDF no tiene Optional Content Groups (capas).")
         return False
 
     if verbose:
-        print(f"Entrada: {input_path}")
-        print(f"OCGs encontrados ({len(ocgs)}):")
-        for ocg in ocgs:
-            print(f"  - {ocg['name']}  (idnum={ocg['idnum']})")
+        print(f"Entrada : {input_path}")
+        print(f"OCGs ({len(ocgs)}):")
+        for o in ocgs:
+            print(f"  - {o['name']}")
         print()
 
-    writer = PdfWriter()
-    total = 0
+    final = PdfWriter()
 
     for ocg in ocgs:
-        name   = ocg['name']
-        idnum  = ocg['idnum']
-
+        name = ocg['name']
         if verbose:
             print(f"Procesando: {name}")
 
-        # Abrir una copia fresca del PDF por cada OCG
-        # (evita que replace_contents de una iteracion afecte la siguiente)
-        reader = PdfReader(input_path)
-        root   = reader.trailer['/Root']
+        # PdfWriter fresco por cada OCG para aislar los objetos
+        w = PdfWriter()
+        w.append(PdfReader(input_path))
 
-        for pnum, page in enumerate(reader.pages):
-            prop_map = get_prop_map(page, root)
-            cs       = page.get_contents()
-            ops      = list(cs.operations)
-            filtered = filter_ops(ops, prop_map, idnum, include_common)
+        indices = find_content_stream_indices(w)
 
-            cs.operations = filtered
-            page.replace_contents(cs)
-            writer.add_page(page)
-            total += 1
+        for pnum, wpage in enumerate(w.pages):
+            prop_map = get_prop_map(wpage)
 
+            for idx in indices:
+                old_obj = w._objects[idx]
+                cs      = ContentStream(old_obj, w)
+                filtered = filter_ops(list(cs.operations),
+                                      prop_map, name, include_common)
+                cs.operations = filtered
+                w._objects[idx] = make_encoded_stream(cs.get_data(), old_obj)
+
+            final.add_page(wpage)
             if verbose:
-                print(f"  pagina fuente {pnum+1} -> pagina output {total}")
+                print(f"  pagina fuente {pnum + 1} -> pagina output {len(final.pages)}")
 
-    # Eliminar OCProperties del output (el contenido ya esta separado)
-    if '/OCProperties' in writer._root_object:
-        del writer._root_object['/OCProperties']
+    if '/OCProperties' in final._root_object:
+        del final._root_object['/OCProperties']
 
     with open(output_path, 'wb') as f:
-        writer.write(f)
+        final.write(f)
 
-    print(f"\nGuardado: {output_path}")
+    print(f"\nGuardado : {output_path}")
     print(f"  OCGs          : {len(ocgs)}")
     print(f"  Paginas fuente: {len(probe.pages)}")
-    print(f"  Paginas output: {total}")
+    print(f"  Paginas output: {len(final.pages)}")
     return True
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extrae cada OCG/capa de un PDF a una pagina separada.",
+    p = argparse.ArgumentParser(
+        description="Una pagina por cada OCG del PDF.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
   python ocg_to_pages_pypdf.py planos.pdf salida.pdf
   python ocg_to_pages_pypdf.py planos.pdf salida.pdf --no-common --verbose
-        """
+"""
     )
-    parser.add_argument("input",  help="PDF de entrada con OCGs")
-    parser.add_argument("output", help="PDF de salida")
-    parser.add_argument(
-        "--no-common",
-        action="store_true",
-        help="Excluir contenido sin capa de cada pagina."
-    )
-    parser.add_argument("--verbose", "-v", action="store_true")
-    args = parser.parse_args()
+    p.add_argument("input")
+    p.add_argument("output")
+    p.add_argument("--no-common", action="store_true",
+                   help="Excluir contenido fuera de capas.")
+    p.add_argument("--verbose", "-v", action="store_true")
+    args = p.parse_args()
 
-    ok = ocg_to_pages(
-        input_path=args.input,
-        output_path=args.output,
-        include_common=not args.no_common,
-        verbose=args.verbose,
-    )
+    ok = ocg_to_pages(args.input, args.output,
+                      include_common=not args.no_common,
+                      verbose=args.verbose)
     sys.exit(0 if ok else 1)
 
 
