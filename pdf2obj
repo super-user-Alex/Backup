@@ -1,416 +1,126 @@
 """
-mover_pdf_directo.py
-====================
-Mueve elementos de un PDF de Illustrator manipulando el content stream
-directamente. Sin conversión a SVG ni rasterización.
+SOLUCIÓN: mover_multiples_ocgs
+==============================
+Permite mover /MC0, /MC1, /MC2 (cualquier combinación) de forma
+INDEPENDIENTE, sin necesidad de encadenar llamadas.
 
-Cómo funciona:
-    Illustrator escribe en el content stream alias como /MC0, /MC1:
+Pega esta función al final de tu archivo mover_pdf_directo.py
+(o en un archivo aparte que importe las funciones base).
 
-        /OC /MC0 BDC      <- alias, NO el nombre real del OCG
-            ...paths...
-        EMC
+Problema original
+-----------------
+mover_ocg_directo() abre el PDF original cada vez → si quieres
+mover MC0 + MC1 + MC2, hay que:
+    1. mover_ocg_directo(PDF,    "MC0", dx0, dy0, "tmp1.pdf")
+    2. mover_ocg_directo("tmp1", "MC1", dx1, dy1, "tmp2.pdf")  # depende de tmp1
+    3. mover_ocg_directo("tmp2", "MC2", dx2, dy2, "final.pdf") # depende de tmp2
 
-    El mapeo alias→OCG real vive en /Resources/Properties de la página.
-    Este script lo resuelve antes de buscar en el stream.
-
-    Para mover, envuelve el bloque con q / cm / Q:
-
-        q
-        1 0 0 1 dx dy cm
-        /OC /MC0 BDC
-            ...paths...
-        EMC
-        Q
-
-Dependencias:
-    pip install pikepdf pymupdf
+Solución
+--------
+mover_multiples_ocgs() aplica TODOS los movimientos al mismo PDF
+abierto en memoria y lo guarda una sola vez → sin dependencias.
 """
 
-import re
-import os
-import tempfile
-import fitz
+# ──────────────────────────────────────────────────────────────────────────────
+# Asegúrate de tener importadas las funciones base de mover_pdf_directo.py:
+#   _ocg_objgen_a_nombre, _nombre_ocg_a_alias, _modificar_stream
+# Si usas este archivo de forma autónoma, importa así:
+#
+#   from mover_pdf_directo import (
+#       _ocg_objgen_a_nombre, _nombre_ocg_a_alias, _modificar_stream
+#   )
+# ──────────────────────────────────────────────────────────────────────────────
+
 import pikepdf
-from pikepdf import Pdf, Array
+from pikepdf import Pdf
 
 
-# ─────────────────────────────────────────────────────────────
-# HELPERS — OCG catalog
-# ─────────────────────────────────────────────────────────────
-
-def _ocg_objgen_a_nombre(pdf: Pdf) -> dict:
-    """Devuelve {objgen: nombre_string} para todos los OCGs del catálogo."""
-    resultado = {}
-    try:
-        for ref in pdf.Root["/OCProperties"]["/OCGs"]:
-            resultado[ref.objgen] = str(ref["/Name"])
-    except (KeyError, AttributeError):
-        pass
-    return resultado
-
-
-def _pdf_name_to_str(name: str) -> str:
-    """Decodifica nombres PDF: #20 -> espacio, etc."""
-    return re.sub(
-        r'#([0-9A-Fa-f]{2})',
-        lambda m: chr(int(m.group(1), 16)),
-        str(name)
-    )
-
-
-def _str_to_pdf_name(name: str) -> str:
+def mover_multiples_ocgs(
+    pdf_path: str,
+    movimientos: dict,          # {nombre_ocg: (dx, dy)}
+    output_pdf: str = "resultado.pdf"
+) -> str:
     """
-    Codifica un string a forma de nombre PDF.
-    Espacios -> #20, paréntesis, barras y otros especiales -> #XX.
-    """
-    resultado = ""
-    for ch in name:
-        code = ord(ch)
-        if ch in ' ()/<>[]{}%#' or code > 126 or code < 33:
-            resultado += f"#{code:02X}"
-        else:
-            resultado += ch
-    return resultado
-
-
-def _alias_a_nombre_ocg(page_obj, objgen_a_nombre: dict) -> dict:
-    """
-    Lee /Resources/Properties de la página y devuelve
-    {alias_string: nombre_ocg_string}  ej: {"MC0": "Mi Grupo"}
-    Maneja nombres con espacios (#20) y otros caracteres codificados.
-    """
-    resultado = {}
-    try:
-        props = page_obj["/Resources"]["/Properties"]
-        for key in props.keys():
-            # key viene como "/MC0" — quitamos la barra inicial para alias limpio
-            alias_limpio = key.lstrip("/")
-            try:
-                og = props[key].objgen
-                if og in objgen_a_nombre:
-                    resultado[alias_limpio] = objgen_a_nombre[og]
-            except AttributeError:
-                # Objeto inline — comparar por /Name directamente
-                try:
-                    nombre = _pdf_name_to_str(str(props[key].get("/Name", "")))
-                    for nombre_cat in objgen_a_nombre.values():
-                        if _pdf_name_to_str(nombre_cat) == nombre:
-                            resultado[alias_limpio] = nombre_cat
-                            break
-                except Exception:
-                    pass
-    except (KeyError, AttributeError):
-        pass
-    return resultado
-
-
-def _nombre_ocg_a_alias(page_obj, objgen_a_nombre: dict) -> dict:
-    """Inverso de _alias_a_nombre_ocg → {nombre_ocg: [alias1, alias2, ...]}"""
-    resultado = {}
-    for alias, nombre in _alias_a_nombre_ocg(page_obj, objgen_a_nombre).items():
-        resultado.setdefault(nombre, []).append(alias)
-    return resultado
-
-
-def _leer_estados_originales(pdf: Pdf) -> dict:
-    """Devuelve {nombre: bool} con visibilidad actual de cada OCG."""
-    estados = {}
-    try:
-        oc_props    = pdf.Root["/OCProperties"]
-        off_objgens = set()
-        if "/OFF" in oc_props["/D"]:
-            for r in oc_props["/D"]["/OFF"]:
-                if hasattr(r, "objgen"):
-                    off_objgens.add(r.objgen)
-        for ref in oc_props["/OCGs"]:
-            estados[str(ref["/Name"])] = ref.objgen not in off_objgens
-    except (KeyError, AttributeError):
-        pass
-    return estados
-
-
-def _encender_solo(pdf: Pdf, nombre_ocg: str):
-    """Oculta todos los OCGs y enciende solo el indicado."""
-    try:
-        oc_props = pdf.Root["/OCProperties"]
-        off_list = [
-            ref for ref in oc_props["/OCGs"]
-            if str(ref["/Name"]) != nombre_ocg
-        ]
-        oc_props["/D"]["/OFF"] = Array(off_list)
-    except (KeyError, AttributeError):
-        pass
-
-
-def _restaurar_estados(pdf: Pdf, estados: dict):
-    try:
-        oc_props = pdf.Root["/OCProperties"]
-        off_list = [
-            ref for ref in oc_props["/OCGs"]
-            if not estados.get(str(ref["/Name"]), True)
-        ]
-        oc_props["/D"]["/OFF"] = Array(off_list)
-    except (KeyError, AttributeError):
-        pass
-
-
-def _pdf_temporal(pdf: Pdf) -> str:
-    """Guarda el PDF en un archivo temporal y devuelve la ruta."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-    tmp.close()
-    pdf.save(tmp.name)
-    return tmp.name
-
-
-# ─────────────────────────────────────────────────────────────
-# 1. INSPECCIÓN
-# ─────────────────────────────────────────────────────────────
-
-def listar_ocgs(pdf_path: str) -> dict:
-    """Lista los OCGs con nombre y estado. Devuelve {nombre: visible}."""
-    pdf    = Pdf.open(pdf_path)
-    ogmap  = _ocg_objgen_a_nombre(pdf)
-    estados = _leer_estados_originales(pdf)
-
-    if not ogmap:
-        print("  El PDF no tiene OCGs.")
-        print("  En Illustrator: Guardar como PDF > 'Crear capas de Acrobat'")
-        pdf.close()
-        return {}
-
-    print(f"\n{'=' * 50}")
-    print(f"  PDF: {pdf_path}   OCGs: {len(ogmap)}")
-    print(f"{'=' * 50}")
-    for nombre in ogmap.values():
-        v = estados.get(nombre, True)
-        print(f"  [{'ON ' if v else 'OFF'}]  {nombre}")
-    print()
-    pdf.close()
-    return estados
-
-
-def analizar_ocgs_en_stream(pdf_path: str) -> dict:
-    """
-    Muestra los alias del content stream y a qué OCG corresponden.
-    Devuelve {nombre_ocg: [alias, ...]}
-    """
-    pdf      = Pdf.open(pdf_path)
-    page     = pdf.pages[0]
-    ogmap    = _ocg_objgen_a_nombre(pdf)
-    alias_map = _alias_a_nombre_ocg(page.obj, ogmap)
-
-    contenido = page.obj.get("/Contents")
-    if isinstance(contenido, pikepdf.Array):
-        raw = b"".join(s.read_bytes() for s in contenido)
-    else:
-        raw = contenido.read_bytes()
-
-    # Captura el alias tal cual aparece en el stream (puede tener #20 etc.)
-    patron   = rb'/OC\s+/(\S+)\s+BDC'
-    en_stream = [m.group(1).decode() for m in re.finditer(patron, raw)]
-
-    print(f"\n{'=' * 55}")
-    print("  Alias en stream  →  Nombre OCG real")
-    print(f"{'=' * 55}")
-    resultado = {}
-    for alias_raw in sorted(set(en_stream)):
-        # Decodificar #XX para buscar en alias_map
-        alias_decoded = _pdf_name_to_str(alias_raw)
-        nombre = alias_map.get(alias_decoded,
-                 alias_map.get(alias_raw,
-                 "(sin mapeo en Resources/Properties)"))
-        conteo = en_stream.count(alias_raw)
-        print(f"  /{alias_raw:15s}  →  '{nombre}'  ({conteo} bloque{'s' if conteo>1 else ''})")
-        if nombre != "(sin mapeo en Resources/Properties)":
-            resultado.setdefault(nombre, []).append(alias_decoded)
-    print()
-    pdf.close()
-    return resultado
-
-
-def analizar_estructura_pdf(pdf_path: str) -> dict:
-    """Posición y tamaño de cada OCG. Devuelve {nombre: {bbox, num_elementos}}."""
-    pdf    = Pdf.open(pdf_path)
-    ogmap  = _ocg_objgen_a_nombre(pdf)
-    estados_orig = _leer_estados_originales(pdf)
-    estructura   = {}
-
-    print(f"\n{'=' * 55}")
-    print(f"  Estructura: {pdf_path}")
-    print(f"{'=' * 55}")
-
-    for nombre in ogmap.values():
-        _encender_solo(pdf, nombre)
-        tmp = _pdf_temporal(pdf)
-
-        doc   = fitz.open(tmp)
-        paths = doc[0].get_drawings()
-        doc.close()
-        os.unlink(tmp)
-
-        if paths:
-            x0 = min(p["rect"].x0 for p in paths)
-            y0 = min(p["rect"].y0 for p in paths)
-            x1 = max(p["rect"].x1 for p in paths)
-            y1 = max(p["rect"].y1 for p in paths)
-            bbox = (round(x0,2), round(y0,2), round(x1,2), round(y1,2))
-        else:
-            bbox = None
-
-        estructura[nombre] = {"bbox": bbox, "num_elementos": len(paths)}
-        v = estados_orig.get(nombre, True)
-        print(f"\n  OCG: '{nombre}'  [{'ON' if v else 'OFF'}]")
-        print(f"    Elementos : {len(paths)}")
-        if bbox:
-            print(f"    Posicion  : x={bbox[0]}, y={bbox[1]}  (top-down)")
-            print(f"    Tamano    : {bbox[2]-bbox[0]:.1f} x {bbox[3]-bbox[1]:.1f} pts")
-        else:
-            print(f"    Sin elementos vectoriales detectados")
-
-    _restaurar_estados(pdf, estados_orig)
-    pdf.close()
-    print()
-    return estructura
-
-
-# ─────────────────────────────────────────────────────────────
-# 2. MANIPULACIÓN DEL CONTENT STREAM
-# ─────────────────────────────────────────────────────────────
-
-def _construir_alternativas_alias(aliases: list) -> list:
-    """
-    Para cada alias (string ya decodificado, ej: "MC0" o "Mi Capa"),
-    genera todas las formas en las que puede aparecer en el stream:
-      - Forma literal (bytes directos): b"MC0"
-      - Forma codificada PDF (#20 para espacios, etc.): b"Mi#20Capa"
-
-    Devuelve lista de patrones bytes para usar en regex, sin duplicados.
-    """
-    seen = set()
-    resultado = []
-    for alias in aliases:
-        # Forma 1: literal (tal cual, codificado en bytes)
-        forma_literal = alias.encode("latin-1", errors="replace")
-        # Forma 2: codificada PDF (#XX)
-        forma_pdf = _str_to_pdf_name(alias).encode("ascii")
-
-        for forma in (forma_literal, forma_pdf):
-            escaped = re.escape(forma)
-            if escaped not in seen:
-                seen.add(escaped)
-                resultado.append(escaped)
-    return resultado
-
-
-def _modificar_stream(raw: bytes, aliases: list, dx: float, dy: float) -> bytes:
-    """
-    Envuelve con q/cm/Q cada bloque BDC de cualquiera de los aliases dados.
-
-    aliases : lista de strings YA DECODIFICADOS (sin #XX), ej: ["MC0", "Mi Capa"].
-    dx, dy  : desplazamiento en puntos PDF (dy positivo = arriba).
-
-    El patrón busca:
-        /OC  <espacios>  /<alias>  <espacio o BDC>  BDC
-    y maneja alias con espacios codificados como #20.
-    """
-    alternativas = _construir_alternativas_alias(aliases)
-    if not alternativas:
-        return raw
-
-    # Patrón:  /OC  \s+  /  (alias_forma1 | alias_forma2 | ...)  (\s+BDC | BDC)
-    # Usamos lookahead para no consumir lo que sigue al alias,
-    # así el delimitador queda en la línea original.
-    patron_bdc = re.compile(
-        rb'/OC\s+/(?:' + b'|'.join(alternativas) + rb')(?=\s|BDC)'
-    )
-
-    translate_in  = f"q\n1 0 0 1 {dx:.6f} {dy:.6f} cm\n".encode()
-    translate_out = b"Q\n"
-
-    output = []
-    en_ocg = 0
-
-    for linea in raw.split(b"\n"):
-        stripped = linea.strip()
-
-        if patron_bdc.search(stripped):
-            output.append(translate_in)
-            output.append(linea)
-            en_ocg += 1
-
-        elif stripped == b"EMC" and en_ocg > 0:
-            output.append(linea)
-            output.append(translate_out)
-            en_ocg -= 1
-
-        else:
-            output.append(linea)
-
-    return b"\n".join(output)
-
-
-# ─────────────────────────────────────────────────────────────
-# 3. FUNCIONES PRINCIPALES
-# ─────────────────────────────────────────────────────────────
-
-def mover_ocg_directo(pdf_path: str, nombre_ocg: str,
-                      dx: float, dy: float,
-                      output_pdf: str = "resultado.pdf") -> str:
-    """
-    Mueve un OCG completo por desplazamiento relativo (dx, dy).
+    Mueve varios OCGs en una sola pasada sobre el mismo PDF.
+    No hay dependencias entre capas: puedes mover MC0, MC1 y MC2
+    en cualquier orden o sólo algunos.
 
     Args:
-        nombre_ocg : Nombre del OCG (usar listar_ocgs() para ver los nombres).
-        dx         : Desplazamiento horizontal en pts (positivo = derecha).
-        dy         : Desplazamiento vertical PDF (positivo = arriba, negativo = abajo).
+        pdf_path   : Ruta al PDF de entrada.
+        movimientos: Diccionario  {nombre_ocg: (dx, dy)}
+                     Ejemplo:
+                         {
+                             "MC0": (100, -50),
+                             "MC1": (0,   30),
+                             "MC2": (-20,  0),
+                         }
+        output_pdf : PDF de salida.
+
+    Returns:
+        Ruta del PDF guardado.
+
+    Ejemplo de uso
+    --------------
+    mover_multiples_ocgs(
+        pdf_path   = "diseño.pdf",
+        movimientos = {
+            "MC0": (100, -50),   # 100 pts derecha, 50 pts abajo
+            "MC1": (0,    30),   # solo vertical
+            # MC2 no se mueve → simplemente no lo incluyas
+        },
+        output_pdf = "resultado.pdf"
+    )
     """
     pdf   = Pdf.open(pdf_path)
     ogmap = _ocg_objgen_a_nombre(pdf)
 
+    # Validar que todos los OCGs pedidos existen
     nombres_disponibles = list(ogmap.values())
-    if nombre_ocg not in nombres_disponibles:
-        pdf.close()
-        raise ValueError(
-            f"OCG '{nombre_ocg}' no encontrado.\n"
-            f"Disponibles: {nombres_disponibles}"
-        )
+    for nombre in movimientos:
+        if nombre not in nombres_disponibles:
+            pdf.close()
+            raise ValueError(
+                f"OCG '{nombre}' no encontrado.\n"
+                f"Disponibles: {nombres_disponibles}"
+            )
 
-    movidos = 0
+    streams_modificados = 0
+
     for i, page in enumerate(pdf.pages):
-        # Resolver aliases para esta página (strings decodificados, sin #XX)
+        # Mapa nombre_ocg → [alias, ...] para esta página
         nombre_a_aliases = _nombre_ocg_a_alias(page.obj, ogmap)
-        aliases = nombre_a_aliases.get(nombre_ocg, [])
-
-        if not aliases:
-            print(f"  Pagina {i+1}: OCG '{nombre_ocg}' no tiene alias en esta página, omitida")
-            continue
-
-        print(f"  Pagina {i+1}: aliases encontrados → {['/' + a for a in aliases]}")
 
         contenido = page.obj.get("/Contents")
         if contenido is None:
             continue
 
+        # Leer el stream (puede ser un objeto único o un Array)
         if isinstance(contenido, pikepdf.Array):
-            for stream_obj in contenido:
-                raw = stream_obj.read_bytes()
-                mod = _modificar_stream(raw, aliases, dx, dy)
-                if mod != raw:
-                    stream_obj.write(mod)
-                    movidos += 1
+            objetos_stream = list(contenido)
         else:
-            raw = contenido.read_bytes()
-            mod = _modificar_stream(raw, aliases, dx, dy)
-            if mod != raw:
-                contenido.write(mod)
-                movidos += 1
+            objetos_stream = [contenido]
 
-    if movidos == 0:
-        print(f"  ADVERTENCIA: no se modificó ningún stream.")
+        for stream_obj in objetos_stream:
+            raw = stream_obj.read_bytes()
+            mod = raw
+
+            # Aplicar cada movimiento pedido al mismo bloque de bytes
+            for nombre_ocg, (dx, dy) in movimientos.items():
+                aliases = nombre_a_aliases.get(nombre_ocg, [])
+                if not aliases:
+                    continue
+                mod = _modificar_stream(mod, aliases, dx, dy)
+
+            if mod != raw:
+                stream_obj.write(mod)
+                streams_modificados += 1
+                print(f"  Página {i+1}: stream modificado con {list(movimientos.keys())}")
+
+    if streams_modificados == 0:
+        print("  ADVERTENCIA: no se modificó ningún stream.")
         print(f"  Ejecuta analizar_ocgs_en_stream('{pdf_path}') para diagnosticar.")
     else:
-        print(f"  Streams modificados: {movidos}")
+        print(f"  Total streams modificados: {streams_modificados}")
 
     pdf.save(output_pdf)
     pdf.close()
@@ -418,123 +128,106 @@ def mover_ocg_directo(pdf_path: str, nombre_ocg: str,
     return output_pdf
 
 
-def mover_ocg_a_posicion(pdf_path: str, nombre_ocg: str,
-                          nuevo_x: float, nuevo_y: float,
-                          output_pdf: str = "resultado.pdf") -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+# VARIANTE: mover_multiples_ocgs_absoluto
+# Igual que mover_ocg_a_posicion pero para N capas a la vez.
+# ──────────────────────────────────────────────────────────────────────────────
+
+import os
+import tempfile
+import fitz
+
+
+def mover_multiples_ocgs_absoluto(
+    pdf_path: str,
+    posiciones: dict,           # {nombre_ocg: (nuevo_x, nuevo_y)}  top-down
+    output_pdf: str = "resultado.pdf"
+) -> str:
     """
-    Mueve un OCG a posición absoluta (coordenadas top-down como Illustrator).
+    Mueve varios OCGs a posiciones absolutas (coordenadas top-down
+    como Illustrator) en una sola pasada.
 
     Args:
-        nuevo_x : X destino en pts desde borde izquierdo.
-        nuevo_y : Y destino en pts desde borde SUPERIOR (como Illustrator).
+        posiciones: {nombre_ocg: (nuevo_x, nuevo_y)}
+                    Ejemplo:
+                        {
+                            "MC0": (400, 200),
+                            "MC1": (100,  50),
+                        }
     """
     pdf    = Pdf.open(pdf_path)
     ogmap  = _ocg_objgen_a_nombre(pdf)
     estados_orig = _leer_estados_originales(pdf)
 
-    if nombre_ocg not in ogmap.values():
-        pdf.close()
-        raise ValueError(f"OCG '{nombre_ocg}' no encontrado. Disponibles: {list(ogmap.values())}")
+    movimientos = {}
 
-    _encender_solo(pdf, nombre_ocg)
-    tmp = _pdf_temporal(pdf)
-    _restaurar_estados(pdf, estados_orig)
+    for nombre_ocg, (nuevo_x, nuevo_y) in posiciones.items():
+        if nombre_ocg not in ogmap.values():
+            pdf.close()
+            raise ValueError(
+                f"OCG '{nombre_ocg}' no encontrado.\n"
+                f"Disponibles: {list(ogmap.values())}"
+            )
+
+        # Obtener posición actual con fitz
+        _encender_solo(pdf, nombre_ocg)
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.close()
+        pdf.save(tmp.name)
+        _restaurar_estados(pdf, estados_orig)
+
+        doc   = fitz.open(tmp.name)
+        paths = doc[0].get_drawings()
+        doc.close()
+        os.unlink(tmp.name)
+
+        if not paths:
+            print(f"  AVISO: '{nombre_ocg}' no tiene elementos medibles, se omite.")
+            continue
+
+        x0_actual = min(p["rect"].x0 for p in paths)
+        y0_actual = min(p["rect"].y0 for p in paths)
+
+        dx =  nuevo_x - x0_actual
+        dy = -(nuevo_y - y0_actual)   # invertir Y (PDF: bottom-up)
+
+        print(f"  '{nombre_ocg}' pos actual ({x0_actual:.1f}, {y0_actual:.1f})"
+              f" → destino ({nuevo_x:.1f}, {nuevo_y:.1f})"
+              f"  cm: dx={dx:.1f}, dy={dy:.1f}")
+
+        movimientos[nombre_ocg] = (dx, dy)
+
     pdf.close()
 
-    doc    = fitz.open(tmp)
-    page   = doc[0]
-    paths  = page.get_drawings()
-    doc.close()
-    os.unlink(tmp)
-
-    if not paths:
-        raise ValueError(f"OCG '{nombre_ocg}' no tiene elementos medibles.")
-
-    x0_actual = min(p["rect"].x0 for p in paths)
-    y0_actual = min(p["rect"].y0 for p in paths)   # top-down
-
-    # PDF content stream usa Y bottom-up → invertir desplazamiento vertical
-    dx = nuevo_x - x0_actual
-    dy = -(nuevo_y - y0_actual)
-
-    print(f"\n  Posicion actual : x={x0_actual:.1f}, y={y0_actual:.1f}  (top-down)")
-    print(f"  Posicion destino: x={nuevo_x:.1f},   y={nuevo_y:.1f}  (top-down)")
-    print(f"  Operador cm     : dx={dx:.1f}, dy={dy:.1f}")
-
-    return mover_ocg_directo(pdf_path, nombre_ocg, dx, dy, output_pdf)
+    return mover_multiples_ocgs(pdf_path, movimientos, output_pdf)
 
 
-# ─────────────────────────────────────────────────────────────
-# 4. VERIFICACIÓN
-# ─────────────────────────────────────────────────────────────
-
-def verificar_posicion_ocg(pdf_path: str, nombre_ocg: str):
-    """Muestra la bounding box del OCG en el PDF resultante."""
-    pdf    = Pdf.open(pdf_path)
-    ogmap  = _ocg_objgen_a_nombre(pdf)
-    estados_orig = _leer_estados_originales(pdf)
-
-    if nombre_ocg not in ogmap.values():
-        print(f"  OCG '{nombre_ocg}' no encontrado.")
-        pdf.close()
-        return
-
-    _encender_solo(pdf, nombre_ocg)
-    tmp = _pdf_temporal(pdf)
-    _restaurar_estados(pdf, estados_orig)
-    pdf.close()
-
-    doc   = fitz.open(tmp)
-    paths = doc[0].get_drawings()
-    doc.close()
-    os.unlink(tmp)
-
-    print(f"\n  Verificacion '{nombre_ocg}' en {pdf_path}:")
-    if paths:
-        x0 = min(p["rect"].x0 for p in paths)
-        y0 = min(p["rect"].y0 for p in paths)
-        x1 = max(p["rect"].x1 for p in paths)
-        y1 = max(p["rect"].y1 for p in paths)
-        print(f"  Posicion: x={x0:.1f}, y={y0:.1f}  (top-down)")
-        print(f"  Tamano  : {x1-x0:.1f} x {y1-y0:.1f} pts")
-    else:
-        print("  Sin elementos detectables.")
-
-
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # EJEMPLO DE USO
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    PDF = "diseño.pdf"
 
-    PDF = "diseño.pdf"   # <- cambia por tu archivo
-
-    # 1. Ver capas disponibles
-    listar_ocgs(PDF)
-
-    # 2. Ver cómo están alias en el stream (IMPORTANTE para diagnosticar)
-    analizar_ocgs_en_stream(PDF)
-
-    # 3. Ver posición actual de cada capa
-    analizar_estructura_pdf(PDF)
-
-    # 4a. Mover por desplazamiento relativo
-    mover_ocg_directo(
-        pdf_path=PDF,
-        nombre_ocg="Logo",   # nombre exacto de listar_ocgs()
-        dx=100,              # 100 pts a la derecha
-        dy=-50,              # 50 pts hacia abajo
-        output_pdf="resultado.pdf"
+    # ── Opción A: desplazamiento relativo para varias capas ──────────────────
+    mover_multiples_ocgs(
+        pdf_path    = PDF,
+        movimientos = {
+            "MC0": (100, -50),   # 100 pts derecha, 50 pts abajo
+            "MC1": (  0,  30),   # solo sube 30 pts
+            "MC2": (-20,   0),   # solo a la izquierda
+            # Puedes poner solo las capas que quieres mover.
+            # No hace falta incluir todas.
+        },
+        output_pdf  = "resultado.pdf"
     )
 
-    # 4b. Mover a posición absoluta (coordenadas top-down como Illustrator)
-    # mover_ocg_a_posicion(
-    #     pdf_path=PDF,
-    #     nombre_ocg="Logo",
-    #     nuevo_x=400,
-    #     nuevo_y=200,
-    #     output_pdf="resultado.pdf"
+    # ── Opción B: posición absoluta para varias capas ────────────────────────
+    # mover_multiples_ocgs_absoluto(
+    #     pdf_path   = PDF,
+    #     posiciones = {
+    #         "MC0": (400, 200),
+    #         "MC1": (100,  50),
+    #     },
+    #     output_pdf = "resultado.pdf"
     # )
-
-    # 5. Verificar resultado
-    verificar_posicion_ocg("resultado.pdf", "Logo")
