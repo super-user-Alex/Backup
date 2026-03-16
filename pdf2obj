@@ -59,6 +59,21 @@ def _pdf_name_to_str(name: str) -> str:
     )
 
 
+def _str_to_pdf_name(name: str) -> str:
+    """
+    Codifica un string a forma de nombre PDF.
+    Espacios -> #20, paréntesis, barras y otros especiales -> #XX.
+    """
+    resultado = ""
+    for ch in name:
+        code = ord(ch)
+        if ch in ' ()/<>[]{}%#' or code > 126 or code < 33:
+            resultado += f"#{code:02X}"
+        else:
+            resultado += ch
+    return resultado
+
+
 def _alias_a_nombre_ocg(page_obj, objgen_a_nombre: dict) -> dict:
     """
     Lee /Resources/Properties de la página y devuelve
@@ -69,17 +84,19 @@ def _alias_a_nombre_ocg(page_obj, objgen_a_nombre: dict) -> dict:
     try:
         props = page_obj["/Resources"]["/Properties"]
         for key in props.keys():
+            # key viene como "/MC0" — quitamos la barra inicial para alias limpio
+            alias_limpio = key.lstrip("/")
             try:
                 og = props[key].objgen
                 if og in objgen_a_nombre:
-                    resultado[key] = objgen_a_nombre[og]
+                    resultado[alias_limpio] = objgen_a_nombre[og]
             except AttributeError:
                 # Objeto inline — comparar por /Name directamente
                 try:
                     nombre = _pdf_name_to_str(str(props[key].get("/Name", "")))
                     for nombre_cat in objgen_a_nombre.values():
                         if _pdf_name_to_str(nombre_cat) == nombre:
-                            resultado[key] = nombre_cat
+                            resultado[alias_limpio] = nombre_cat
                             break
                 except Exception:
                     pass
@@ -189,6 +206,7 @@ def analizar_ocgs_en_stream(pdf_path: str) -> dict:
     else:
         raw = contenido.read_bytes()
 
+    # Captura el alias tal cual aparece en el stream (puede tener #20 etc.)
     patron   = rb'/OC\s+/(\S+)\s+BDC'
     en_stream = [m.group(1).decode() for m in re.finditer(patron, raw)]
 
@@ -196,12 +214,16 @@ def analizar_ocgs_en_stream(pdf_path: str) -> dict:
     print("  Alias en stream  →  Nombre OCG real")
     print(f"{'=' * 55}")
     resultado = {}
-    for alias in sorted(set(en_stream)):
-        nombre = alias_map.get(alias, "(sin mapeo en Resources/Properties)")
-        conteo = en_stream.count(alias)
-        print(f"  /{alias:12s}  →  '{nombre}'  ({conteo} bloque{'s' if conteo>1 else ''})")
+    for alias_raw in sorted(set(en_stream)):
+        # Decodificar #XX para buscar en alias_map
+        alias_decoded = _pdf_name_to_str(alias_raw)
+        nombre = alias_map.get(alias_decoded,
+                 alias_map.get(alias_raw,
+                 "(sin mapeo en Resources/Properties)"))
+        conteo = en_stream.count(alias_raw)
+        print(f"  /{alias_raw:15s}  →  '{nombre}'  ({conteo} bloque{'s' if conteo>1 else ''})")
         if nombre != "(sin mapeo en Resources/Properties)":
-            resultado.setdefault(nombre, []).append(alias)
+            resultado.setdefault(nombre, []).append(alias_decoded)
     print()
     pdf.close()
     return resultado
@@ -256,20 +278,28 @@ def analizar_estructura_pdf(pdf_path: str) -> dict:
 # 2. MANIPULACIÓN DEL CONTENT STREAM
 # ─────────────────────────────────────────────────────────────
 
-def _alias_a_bytes_pdf(alias: str) -> bytes:
+def _construir_alternativas_alias(aliases: list) -> list:
     """
-    Convierte un alias string a su forma en bytes tal como aparece
-    en el content stream PDF. Espacios -> #20, etc.
-    El alias (ej: MC0, MC1) generalmente no tiene espacios, pero
-    por seguridad también codificamos caracteres especiales.
+    Para cada alias (string ya decodificado, ej: "MC0" o "Mi Capa"),
+    genera todas las formas en las que puede aparecer en el stream:
+      - Forma literal (bytes directos): b"MC0"
+      - Forma codificada PDF (#20 para espacios, etc.): b"Mi#20Capa"
+
+    Devuelve lista de patrones bytes para usar en regex, sin duplicados.
     """
-    resultado = b""
-    for ch in alias:
-        code = ord(ch)
-        if ch in ' ()/<>[]{}%#' or code > 126 or code < 33:
-            resultado += f"#{code:02X}".encode()
-        else:
-            resultado += ch.encode()
+    seen = set()
+    resultado = []
+    for alias in aliases:
+        # Forma 1: literal (tal cual, codificado en bytes)
+        forma_literal = alias.encode("latin-1", errors="replace")
+        # Forma 2: codificada PDF (#XX)
+        forma_pdf = _str_to_pdf_name(alias).encode("ascii")
+
+        for forma in (forma_literal, forma_pdf):
+            escaped = re.escape(forma)
+            if escaped not in seen:
+                seen.add(escaped)
+                resultado.append(escaped)
     return resultado
 
 
@@ -277,32 +307,29 @@ def _modificar_stream(raw: bytes, aliases: list, dx: float, dy: float) -> bytes:
     """
     Envuelve con q/cm/Q cada bloque BDC de cualquiera de los aliases dados.
 
-    aliases: lista de strings como ["MC0", "MC1"] que corresponden al OCG.
-    Maneja aliases con espacios u otros caracteres especiales codificados.
-    """
-    # Construir patrón con ambas formas: normal y codificada (#20)
-    alternativas_bytes = []
-    for a in aliases:
-        alternativas_bytes.append(re.escape(a.encode()))           # forma literal
-        alternativas_bytes.append(re.escape(_alias_a_bytes_pdf(a))) # forma codificada
-    # Eliminar duplicados manteniendo orden
-    seen = set()
-    alt_unicas = []
-    for b in alternativas_bytes:
-        if b not in seen:
-            seen.add(b)
-            alt_unicas.append(b)
+    aliases : lista de strings YA DECODIFICADOS (sin #XX), ej: ["MC0", "Mi Capa"].
+    dx, dy  : desplazamiento en puntos PDF (dy positivo = arriba).
 
-    alternativas = b"|".join(alt_unicas)
-    patron_bdc   = re.compile(
-        rb'/OC\s+/(' + alternativas + rb')[\s/]'
+    El patrón busca:
+        /OC  <espacios>  /<alias>  <espacio o BDC>  BDC
+    y maneja alias con espacios codificados como #20.
+    """
+    alternativas = _construir_alternativas_alias(aliases)
+    if not alternativas:
+        return raw
+
+    # Patrón:  /OC  \s+  /  (alias_forma1 | alias_forma2 | ...)  (\s+BDC | BDC)
+    # Usamos lookahead para no consumir lo que sigue al alias,
+    # así el delimitador queda en la línea original.
+    patron_bdc = re.compile(
+        rb'/OC\s+/(?:' + b'|'.join(alternativas) + rb')(?=\s|BDC)'
     )
 
-    translate_in  = f"q\n1 0 0 1 {dx} {dy} cm\n".encode()
+    translate_in  = f"q\n1 0 0 1 {dx:.6f} {dy:.6f} cm\n".encode()
     translate_out = b"Q\n"
 
-    output  = []
-    en_ocg  = 0
+    output = []
+    en_ocg = 0
 
     for linea in raw.split(b"\n"):
         stripped = linea.strip()
@@ -338,8 +365,8 @@ def mover_ocg_directo(pdf_path: str, nombre_ocg: str,
         dx         : Desplazamiento horizontal en pts (positivo = derecha).
         dy         : Desplazamiento vertical PDF (positivo = arriba, negativo = abajo).
     """
-    pdf    = Pdf.open(pdf_path)
-    ogmap  = _ocg_objgen_a_nombre(pdf)
+    pdf   = Pdf.open(pdf_path)
+    ogmap = _ocg_objgen_a_nombre(pdf)
 
     nombres_disponibles = list(ogmap.values())
     if nombre_ocg not in nombres_disponibles:
@@ -351,7 +378,7 @@ def mover_ocg_directo(pdf_path: str, nombre_ocg: str,
 
     movidos = 0
     for i, page in enumerate(pdf.pages):
-        # Resolver alias para esta página
+        # Resolver aliases para esta página (strings decodificados, sin #XX)
         nombre_a_aliases = _nombre_ocg_a_alias(page.obj, ogmap)
         aliases = nombre_a_aliases.get(nombre_ocg, [])
 
@@ -426,8 +453,7 @@ def mover_ocg_a_posicion(pdf_path: str, nombre_ocg: str,
     x0_actual = min(p["rect"].x0 for p in paths)
     y0_actual = min(p["rect"].y0 for p in paths)   # top-down
 
-    # PDF content stream usa Y bottom-up
-    # dy en stream = -(desplazamiento_pantalla)
+    # PDF content stream usa Y bottom-up → invertir desplazamiento vertical
     dx = nuevo_x - x0_actual
     dy = -(nuevo_y - y0_actual)
 
