@@ -1,11 +1,23 @@
 """
-ocg_tree.py
-===========
-Muestra el árbol completo de OCGs (Optional Content Groups) de un PDF,
-tal como lo define /OCProperties/D/Order en el catálogo.
+ocg_tree.py  (v2 — corregido para Illustrator)
+===============================================
+Illustrator escribe /Order con esta estructura:
 
-Illustrator y otros programas usan esta estructura para representar
-la jerarquía de capas (grupos dentro de grupos).
+    /Order [
+      OCG_padre_ref          ← referencia suelta
+      [                      ← array siguiente = hijos del anterior
+        OCG_hijo_ref
+        [                    ← idem para nietos
+          OCG_nieto_ref
+        ]
+        OCG_hijo2_ref
+      ]
+      OCG_hoja_ref           ← sin array después → sin hijos
+    ]
+
+La versión anterior asumía que padre e hijos iban dentro del MISMO array.
+Esta versión usa lookahead: cuando el elemento i es un OCG ref y el i+1
+es un Array, ese array contiene los hijos.
 
 Dependencias:
     pip install pikepdf
@@ -14,6 +26,10 @@ Dependencias:
 import pikepdf
 from pikepdf import Pdf
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _leer_estados(pdf: Pdf) -> dict:
     """Devuelve {objgen: bool} → True si el OCG está visible (ON)."""
@@ -32,100 +48,99 @@ def _leer_estados(pdf: Pdf) -> dict:
     return estados
 
 
-def _leer_intent(ref) -> str:
-    """Devuelve el Intent del OCG: View / Design / All (o vacío)."""
+def _es_ocg_ref(item) -> bool:
+    """True si el item es una referencia indirecta a un diccionario OCG."""
+    if not hasattr(item, "objgen"):
+        return False
     try:
-        intent = ref["/Intent"]
-        if isinstance(intent, pikepdf.Array):
-            return ",".join(str(i) for i in intent).replace("/", "")
-        return str(intent).lstrip("/")
-    except (KeyError, AttributeError):
-        return ""
+        t = str(item.get("/Type", ""))
+        return t in ("/OCG", "/OCMD", "")
+    except Exception:
+        return False
 
 
-def _leer_tipo(ref) -> str:
-    """Devuelve el Type del OCG si existe (/OCG o /OCMD)."""
+def _nombre_ocg(ref) -> str:
     try:
-        return str(ref["/Type"]).lstrip("/")
+        return str(ref["/Name"])
     except (KeyError, AttributeError):
-        return "OCG"
+        return "(sin nombre)"
 
 
-def _imprimir_nodo(item, estados: dict, prefijo: str = "", es_ultimo: bool = True):
+# ─────────────────────────────────────────────────────────────────────────────
+# Motor de impresión recursivo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _imprimir_nivel(elementos: list, estados: dict,
+                    alias_por_nombre: dict,
+                    prefijo: str = ""):
     """
-    Imprime recursivamente un nodo del árbol /Order.
-
-    Un nodo puede ser:
-      - Una referencia indirecta a un OCG  → hoja
-      - Un Array                           → grupo (primer elemento puede ser
-                                             un OCG padre, resto son hijos)
-      - Un String PDF                      → etiqueta de grupo sin OCG asociado
+    Recorre una lista de elementos de /Order con lookahead:
+    si el elemento i es un OCG ref (o String) y el i+1 es un Array,
+    ese array contiene los hijos.
     """
-    rama   = "└── " if es_ultimo else "├── "
-    sangria = prefijo + ("    " if es_ultimo else "│   ")
+    i = 0
+    while i < len(elementos):
+        item = elementos[i]
 
-    # ── Caso 1: Array → grupo jerárquico ────────────────────────────────────
-    if isinstance(item, pikepdf.Array):
-        elementos = list(item)
-        if not elementos:
-            return
+        # ¿Tiene hijos? → el siguiente elemento es un Array
+        hijos = None
+        if (i + 1 < len(elementos) and
+                isinstance(elementos[i + 1], pikepdf.Array)):
+            hijos = list(elementos[i + 1])
 
-        primer = elementos[0]
+        # ¿Es el último nodo visible a este nivel?
+        siguiente_visible = i + (2 if hijos is not None else 1)
+        es_ultimo = (siguiente_visible >= len(elementos))
 
-        # El primer elemento puede ser un OCG (padre del grupo) o un String
-        if isinstance(primer, pikepdf.String):
-            # Etiqueta de grupo sin OCG directo
-            etiqueta = str(primer)
-            print(f"{prefijo}{rama}📁 [{etiqueta}]")
-            hijos = elementos[1:]
-        else:
-            # El primer elemento es el OCG padre
-            try:
-                nombre = str(primer["/Name"])
-                on     = estados.get(primer.objgen, True)
-                intent = _leer_intent(primer)
-                tipo   = _leer_tipo(primer)
-                icono  = "🟢" if on else "⚫"
-                extra  = f"  ({intent})" if intent else ""
-                print(f"{prefijo}{rama}{icono} {nombre}{extra}  [{tipo}]")
-            except Exception:
-                print(f"{prefijo}{rama}❓ (nodo no resoluble)")
-            hijos = elementos[1:]
+        rama    = "└── " if es_ultimo else "├── "
+        sangria = prefijo + ("    " if es_ultimo else "│   ")
 
-        for j, hijo in enumerate(hijos):
-            _imprimir_nodo(hijo, estados, sangria, es_ultimo=(j == len(hijos) - 1))
+        # ── Caso A: referencia a OCG ─────────────────────────────────────────
+        if _es_ocg_ref(item):
+            nombre  = _nombre_ocg(item)
+            on      = estados.get(item.objgen, True)
+            icono   = "🟢" if on else "⚫"
+            aliases = alias_por_nombre.get(nombre, [])
+            sufijo  = "  » " + ", ".join(aliases) if aliases else ""
+            carpeta = "📂" if hijos else "  "
+            print(f"{prefijo}{rama}{carpeta} {icono} {nombre}{sufijo}")
+            if hijos:
+                _imprimir_nivel(hijos, estados, alias_por_nombre, sangria)
+                i += 2
+                continue
 
-    # ── Caso 2: Referencia indirecta a un OCG ────────────────────────────────
-    elif hasattr(item, "objgen"):
-        try:
-            nombre = str(item["/Name"])
-            on     = estados.get(item.objgen, True)
-            intent = _leer_intent(item)
-            tipo   = _leer_tipo(item)
-            icono  = "🟢" if on else "⚫"
-            extra  = f"  ({intent})" if intent else ""
-            print(f"{prefijo}{rama}{icono} {nombre}{extra}  [{tipo}]")
-        except Exception:
-            print(f"{prefijo}{rama}❓ (referencia no resoluble)")
+        # ── Caso B: String → etiqueta de grupo ───────────────────────────────
+        elif isinstance(item, pikepdf.String):
+            etiqueta = str(item)
+            print(f"{prefijo}{rama}📁 {etiqueta}")
+            if hijos:
+                _imprimir_nivel(hijos, estados, alias_por_nombre, sangria)
+                i += 2
+                continue
 
-    # ── Caso 3: String → etiqueta suelta ─────────────────────────────────────
-    elif isinstance(item, pikepdf.String):
-        print(f"{prefijo}{rama}📁 [{str(item)}]")
+        # ── Caso C: Array suelto (grupo anónimo sin padre explícito) ─────────
+        elif isinstance(item, pikepdf.Array):
+            print(f"{prefijo}{rama}📁 (grupo anónimo)")
+            _imprimir_nivel(list(item), estados, alias_por_nombre, sangria)
+
+        i += 1
 
 
-def ver_arbol_ocg(pdf_path: str):
+# ─────────────────────────────────────────────────────────────────────────────
+# Función pública
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ver_arbol_ocg(pdf_path: str, mostrar_alias: bool = False):
     """
-    Imprime el árbol completo de OCGs de un PDF.
+    Imprime el árbol completo de OCGs.
 
-    La jerarquía refleja /OCProperties/D/Order del catálogo,
-    que es exactamente lo que muestra Illustrator en el panel de capas.
-
-    Leyenda
-    -------
-    🟢  OCG visible (ON)
-    ⚫  OCG oculto  (OFF)
-    📁  Grupo / carpeta sin OCG propio
-    [View] / [Design] / [All]  → Intent del OCG
+    Args:
+        mostrar_alias : Si True, muestra los alias /MC0, /MC1… junto a
+                        cada OCG (requiere mover_pdf_directo.py en el path).
+    Leyenda:
+        🟢  visible (ON)      ⚫  oculto (OFF)
+        📂  tiene sub-capas   📁  grupo/carpeta sin OCG propio
+        »   alias en stream   (/MC0, /MC1…)
     """
     pdf = Pdf.open(pdf_path)
 
@@ -138,56 +153,53 @@ def ver_arbol_ocg(pdf_path: str):
 
     estados = _leer_estados(pdf)
 
-    # Total de OCGs registrados en /OCGs
-    try:
-        total = len(list(oc_props["/OCGs"]))
-    except (KeyError, TypeError):
-        total = 0
+    # Alias opcionales
+    alias_por_nombre: dict = {}
+    if mostrar_alias:
+        try:
+            from mover_pdf_directo import _alias_a_nombre_ocg, _ocg_objgen_a_nombre
+            ogmap = _ocg_objgen_a_nombre(pdf)
+            page  = pdf.pages[0]
+            for alias, nombre in _alias_a_nombre_ocg(page.obj, ogmap).items():
+                alias_por_nombre.setdefault(nombre, []).append("/" + alias)
+        except ImportError:
+            print("  (mover_pdf_directo.py no encontrado — alias omitidos)\n")
 
-    print(f"\n{'═' * 55}")
-    print(f"  Árbol OCG: {pdf_path}   ({total} OCGs en catálogo)")
-    print(f"{'═' * 55}")
+    total = len(list(oc_props.get("/OCGs", [])))
+    print(f"\n{'═' * 60}")
+    print(f"  Árbol OCG: {pdf_path}   ({total} OCGs)")
+    print(f"{'═' * 60}")
 
-    # /Order puede no existir (PDF sin estructura jerárquica)
     try:
         order = oc_props["/D"]["/Order"]
     except (KeyError, AttributeError):
         order = None
 
-    if order is None or len(list(order)) == 0:
-        # Sin /Order → listar plano desde /OCGs
-        print("  (sin /Order definido — listado plano)\n")
-        try:
-            ocgs = list(oc_props["/OCGs"])
-            for i, ref in enumerate(ocgs):
-                es_ult = (i == len(ocgs) - 1)
-                rama   = "└── " if es_ult else "├── "
-                nombre = str(ref["/Name"])
-                on     = estados.get(ref.objgen, True)
-                icono  = "🟢" if on else "⚫"
-                print(f"  {rama}{icono} {nombre}")
-        except Exception as e:
-            print(f"  Error leyendo /OCGs: {e}")
+    if not order or len(list(order)) == 0:
+        print("  (sin /Order — listado plano)\n")
+        ocgs = list(oc_props.get("/OCGs", []))
+        for i, ref in enumerate(ocgs):
+            rama   = "└── " if i == len(ocgs) - 1 else "├── "
+            nombre = _nombre_ocg(ref)
+            on     = estados.get(ref.objgen, True)
+            print(f"  {rama}{'🟢' if on else '⚫'} {nombre}")
     else:
-        nodos = list(order)
-        for i, nodo in enumerate(nodos):
-            _imprimir_nodo(nodo, estados, prefijo="  ", es_ultimo=(i == len(nodos) - 1))
+        _imprimir_nivel(list(order), estados, alias_por_nombre, prefijo="  ")
 
-    # ── OCGs huérfanos (en /OCGs pero ausentes en /Order) ────────────────────
+    # ── OCGs huérfanos ────────────────────────────────────────────────────────
     try:
-        en_order  = set()
+        en_order: set = set()
         _recopilar_objgens(order, en_order)
         todos     = {ref.objgen for ref in oc_props["/OCGs"]}
         huerfanos = todos - en_order
         if huerfanos:
             print(f"\n  {'─' * 50}")
-            print(f"  ⚠️  OCGs en catálogo pero FUERA de /Order ({len(huerfanos)}):")
+            print(f"  ⚠️  OCGs fuera de /Order ({len(huerfanos)}):")
             for ref in oc_props["/OCGs"]:
                 if ref.objgen in huerfanos:
-                    nombre = str(ref["/Name"])
+                    nombre = _nombre_ocg(ref)
                     on     = estados.get(ref.objgen, True)
-                    icono  = "🟢" if on else "⚫"
-                    print(f"    • {icono} {nombre}")
+                    print(f"    • {'🟢' if on else '⚫'} {nombre}")
     except Exception:
         pass
 
@@ -196,7 +208,6 @@ def ver_arbol_ocg(pdf_path: str):
 
 
 def _recopilar_objgens(item, conjunto: set):
-    """Recorre /Order y acumula los objgen de todos los OCGs referenciados."""
     if item is None:
         return
     if isinstance(item, pikepdf.Array):
@@ -204,109 +215,67 @@ def _recopilar_objgens(item, conjunto: set):
             _recopilar_objgens(sub, conjunto)
     elif hasattr(item, "objgen"):
         try:
-            _ = item["/Name"]   # confirma que es un OCG
+            _ = item["/Name"]
             conjunto.add(item.objgen)
         except (KeyError, AttributeError):
             pass
 
 
-# ─────────────────────────────────────────────────────────────
-# EXTRA: ver también los alias de página (MC0, MC1…) junto al árbol
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Debug: volcar /Order en crudo
+# ─────────────────────────────────────────────────────────────────────────────
 
-def ver_arbol_ocg_con_alias(pdf_path: str):
+def debug_order_raw(pdf_path: str):
     """
-    Como ver_arbol_ocg() pero añade al lado de cada OCG
-    los alias (/MC0, /MC1…) que usa en el content stream de la página 1.
+    Vuelca /Order tal cual, indentado, para ver la estructura real del PDF.
+    Úsala si el árbol no sale bien.
     """
-    from mover_pdf_directo import _alias_a_nombre_ocg, _ocg_objgen_a_nombre
-
-    pdf    = Pdf.open(pdf_path)
-    ogmap  = _ocg_objgen_a_nombre(pdf)
-    page   = pdf.pages[0]
-
-    # Invertir: nombre_ocg → [alias1, alias2, ...]
-    alias_por_nombre: dict[str, list] = {}
-    for alias, nombre in _alias_a_nombre_ocg(page.obj, ogmap).items():
-        alias_por_nombre.setdefault(nombre, []).append("/" + alias)
-
-    pdf.close()
-
-    # Monkey-patch temporal de _imprimir_nodo para añadir los alias
-    # (más sencillo: reimprimir el árbol con la info extra)
-    pdf2    = Pdf.open(pdf_path)
-    estados = _leer_estados(pdf2)
-
+    pdf = Pdf.open(pdf_path)
     try:
-        oc_props = pdf2.Root["/OCProperties"]
-        order    = oc_props["/D"]["/Order"]
+        order = pdf.Root["/OCProperties"]["/D"]["/Order"]
     except (KeyError, AttributeError):
-        pdf2.close()
-        print("  Sin /Order. Usa ver_arbol_ocg() directamente.")
+        print("  Sin /Order.")
+        pdf.close()
         return
 
-    total = len(list(oc_props["/OCGs"]))
-    print(f"\n{'═' * 65}")
-    print(f"  Árbol OCG + alias de página 1: {pdf_path}   ({total} OCGs)")
-    print(f"{'═' * 65}")
-
-    def _nodo_con_alias(item, prefijo="", es_ultimo=True):
-        rama    = "└── " if es_ultimo else "├── "
-        sangria = prefijo + ("    " if es_ultimo else "│   ")
-
-        if isinstance(item, pikepdf.Array):
-            elementos = list(item)
-            if not elementos:
-                return
-            primer = elementos[0]
-            if isinstance(primer, pikepdf.String):
-                print(f"{prefijo}{rama}📁 [{str(primer)}]")
-                hijos = elementos[1:]
-            else:
-                try:
-                    nombre  = str(primer["/Name"])
-                    on      = estados.get(primer.objgen, True)
-                    icono   = "🟢" if on else "⚫"
-                    aliases = alias_por_nombre.get(nombre, [])
-                    sufijo  = "  alias: " + ", ".join(aliases) if aliases else ""
-                    print(f"{prefijo}{rama}{icono} {nombre}{sufijo}")
-                except Exception:
-                    print(f"{prefijo}{rama}❓")
-                hijos = elementos[1:]
-            for j, hijo in enumerate(hijos):
-                _nodo_con_alias(hijo, sangria, es_ultimo=(j == len(hijos) - 1))
-
-        elif hasattr(item, "objgen"):
-            try:
-                nombre  = str(item["/Name"])
-                on      = estados.get(item.objgen, True)
-                icono   = "🟢" if on else "⚫"
-                aliases = alias_por_nombre.get(nombre, [])
-                sufijo  = "  alias: " + ", ".join(aliases) if aliases else ""
-                print(f"{prefijo}{rama}{icono} {nombre}{sufijo}")
-            except Exception:
-                print(f"{prefijo}{rama}❓")
-
-        elif isinstance(item, pikepdf.String):
-            print(f"{prefijo}{rama}📁 [{str(item)}]")
-
-    nodos = list(order)
-    for i, nodo in enumerate(nodos):
-        _nodo_con_alias(nodo, prefijo="  ", es_ultimo=(i == len(nodos) - 1))
-
+    print(f"\n{'─' * 55}")
+    print("  /Order RAW")
+    print(f"{'─' * 55}")
+    _volcar(order, "  ")
     print()
-    pdf2.close()
+    pdf.close()
 
 
-# ─────────────────────────────────────────────────────────────
-# EJEMPLO DE USO
-# ─────────────────────────────────────────────────────────────
+def _volcar(item, ind: str = ""):
+    if isinstance(item, pikepdf.Array):
+        print(f"{ind}[")
+        for sub in item:
+            _volcar(sub, ind + "  ")
+        print(f"{ind}]")
+    elif hasattr(item, "objgen"):
+        try:
+            nombre = str(item["/Name"])
+            print(f"{ind}OCG ref → '{nombre}'  {item.objgen}")
+        except Exception:
+            print(f"{ind}ref → {item.objgen}")
+    elif isinstance(item, pikepdf.String):
+        print(f"{ind}String → '{str(item)}'")
+    else:
+        print(f"{ind}{type(item).__name__} → {item}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ejemplo de uso
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     PDF = "diseño.pdf"
 
-    # Árbol básico
+    # Árbol limpio
     ver_arbol_ocg(PDF)
 
-    # Árbol + alias del content stream (requiere mover_pdf_directo.py)
-    # ver_arbol_ocg_con_alias(PDF)
+    # Con alias /MC0, /MC1… (requiere mover_pdf_directo.py)
+    # ver_arbol_ocg(PDF, mostrar_alias=True)
+
+    # Si el árbol aún no sale bien → ver estructura cruda
+    # debug_order_raw(PDF)
