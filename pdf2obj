@@ -69,9 +69,13 @@ def analizar_ocgs_en_stream(pdf_path: str):
     pdf = Pdf.open(pdf_path)
     page = pdf.pages[0]
 
-    raw = b"".join(page.obj.get("/Contents").read_bytes()
-                   if hasattr(page.obj.get("/Contents"), "read_bytes")
-                   else [page.obj["/Contents"].read_bytes()])
+    contenido = page.obj.get("/Contents")
+    if isinstance(contenido, pikepdf.Array):
+        # Múltiples streams — concatenar cada uno
+        raw = b"".join(stream.read_bytes() for stream in contenido)
+    else:
+        # Stream único
+        raw = contenido.read_bytes()
 
     # Buscar todos los marcadores BDC con /OC
     patron = rb'/OC\s+/(\w+)\s+BDC'
