@@ -1,13 +1,14 @@
 """
-ocg_hierarchy_bbox.py
-=====================
-Deduce la jerarquía padre-hijo entre OCGs comparando sus bounding boxes.
+ocg_elements.py
+===============
+Como Illustrator solo exporta OCGs a nivel raíz, los sub-grupos se pierden.
+Este script analiza los elementos (paths, imágenes, texto) dentro de cada OCG
+y los agrupa espacialmente para inferir sub-grupos.
 
-Lógica:
-    Si bbox(A) contiene a bbox(B)  →  B es hijo de A.
-    El padre de B es el OCG con bbox contenedor MÁS PEQUEÑO
-    (el contenedor más ajustado), para evitar que un OCG raíz
-    que abarca todo sea padre de todos.
+Estrategia:
+    1. Para cada OCG, obtener todos sus elementos con sus bboxes.
+    2. Agrupar elementos por proximidad / contención (clustering por gap).
+    3. Mostrar cuántos elementos hay y qué sub-grupos se detectan.
 
 Dependencias:
     pip install pikepdf pymupdf
@@ -20,8 +21,7 @@ import pikepdf
 from pikepdf import Pdf, Array
 
 
-# ── Reutilizamos helpers de mover_pdf_directo.py ─────────────────────────────
-# Si no los tienes en el path, cópialos aquí o importa el módulo.
+# ── Helpers (copias mínimas si no está mover_pdf_directo.py) ─────────────────
 try:
     from mover_pdf_directo import (
         _ocg_objgen_a_nombre,
@@ -30,7 +30,6 @@ try:
         _restaurar_estados,
     )
 except ImportError:
-    # ── Copias mínimas por si no está el módulo ───────────────────────────────
     def _ocg_objgen_a_nombre(pdf):
         r = {}
         try:
@@ -66,219 +65,264 @@ except ImportError:
     def _restaurar_estados(pdf, estados):
         try:
             oc = pdf.Root["/OCProperties"]
-            off_list = [r for r in oc["/OCGs"] if not estados.get(str(r["/Name"]), True)]
+            off_list = [r for r in oc["/OCGs"]
+                        if not estados.get(str(r["/Name"]), True)]
             oc["/D"]["/OFF"] = Array(off_list)
         except Exception:
             pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Obtener bbox de cada OCG
+# 1. Obtener elementos de un OCG
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _bbox_ocg(pdf: Pdf, nombre: str, estados_orig: dict) -> tuple | None:
-    """
-    Devuelve (x0, y0, x1, y1) en coordenadas top-down (fitz),
-    o None si el OCG no tiene elementos medibles.
-    """
+def _pdf_solo_ocg(pdf: Pdf, nombre: str, estados_orig: dict) -> str:
+    """Guarda un PDF temporal con solo ese OCG visible. Devuelve la ruta."""
     _encender_solo(pdf, nombre)
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.close()
     pdf.save(tmp.name)
     _restaurar_estados(pdf, estados_orig)
+    return tmp.name
 
-    doc   = fitz.open(tmp.name)
-    paths = doc[0].get_drawings()
+
+def _obtener_elementos(tmp_path: str) -> list[dict]:
+    """
+    Extrae todos los elementos de la página y devuelve lista de dicts:
+        { type, bbox, area, color }
+    Tipos: 'path', 'image', 'text'
+    """
+    doc      = fitz.open(tmp_path)
+    page     = doc[0]
+    elementos = []
+
+    # Paths y formas vectoriales
+    for p in page.get_drawings():
+        r = p["rect"]
+        if r.width < 0.5 and r.height < 0.5:
+            continue   # puntos/artefactos
+        color = p.get("color") or p.get("fill")
+        elementos.append({
+            "type" : "path",
+            "bbox" : (r.x0, r.y0, r.x1, r.y1),
+            "area" : r.width * r.height,
+            "color": color,
+        })
+
+    # Imágenes
+    for img in page.get_image_info(xrefs=True):
+        r = fitz.Rect(img["bbox"])
+        elementos.append({
+            "type" : "image",
+            "bbox" : (r.x0, r.y0, r.x1, r.y1),
+            "area" : r.width * r.height,
+            "color": None,
+        })
+
+    # Texto
+    for blk in page.get_text("dict")["blocks"]:
+        if blk["type"] != 0:
+            continue
+        r = fitz.Rect(blk["bbox"])
+        texto = " ".join(
+            span["text"]
+            for line in blk.get("lines", [])
+            for span in line.get("spans", [])
+        ).strip()
+        if texto:
+            elementos.append({
+                "type" : "text",
+                "bbox" : (r.x0, r.y0, r.x1, r.y1),
+                "area" : r.width * r.height,
+                "color": None,
+                "text" : texto[:60],
+            })
+
     doc.close()
-    os.unlink(tmp.name)
+    return elementos
 
-    if not paths:
-        return None
 
-    x0 = min(p["rect"].x0 for p in paths)
-    y0 = min(p["rect"].y0 for p in paths)
-    x1 = max(p["rect"].x1 for p in paths)
-    y1 = max(p["rect"].y1 for p in paths)
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Clustering espacial por gap
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bbox_union(elementos: list[dict]) -> tuple:
+    x0 = min(e["bbox"][0] for e in elementos)
+    y0 = min(e["bbox"][1] for e in elementos)
+    x1 = max(e["bbox"][2] for e in elementos)
+    y1 = max(e["bbox"][3] for e in elementos)
     return (x0, y0, x1, y1)
 
 
-def obtener_bboxes(pdf_path: str, tolerancia: float = 2.0) -> dict:
+def _distancia(a: tuple, b: tuple) -> float:
+    """Distancia mínima entre dos bboxes (0 si se solapan)."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    dx = max(0, max(ax0, bx0) - min(ax1, bx1))
+    dy = max(0, max(ay0, by0) - min(ay1, by1))
+    return (dx**2 + dy**2) ** 0.5
+
+
+def clustering_por_gap(elementos: list[dict], gap: float) -> list[list[dict]]:
     """
-    Devuelve {nombre_ocg: (x0, y0, x1, y1)} para todos los OCGs.
-    tolerancia: margen en pts para considerar un bbox como contenedor.
+    Agrupa elementos cuya distancia mutua es <= gap.
+    Algoritmo: union-find sobre pares cercanos.
+    """
+    n       = len(elementos)
+    padre   = list(range(n))
+
+    def find(x):
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    def union(x, y):
+        padre[find(x)] = find(y)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _distancia(elementos[i]["bbox"], elementos[j]["bbox"]) <= gap:
+                union(i, j)
+
+    grupos: dict = {}
+    for i in range(n):
+        raiz = find(i)
+        grupos.setdefault(raiz, []).append(elementos[i])
+
+    # Ordenar grupos por posición top-left de su bbox unión
+    resultado = list(grupos.values())
+    resultado.sort(key=lambda g: (_bbox_union(g)[1], _bbox_union(g)[0]))
+    return resultado
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Análisis completo de un OCG
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analizar_ocg(pdf_path: str, nombre_ocg: str,
+                 gap: float = 20.0) -> dict:
+    """
+    Analiza los elementos de un OCG y devuelve:
+        {
+          total     : int,
+          bbox      : (x0,y0,x1,y1),
+          por_tipo  : {path: N, image: N, text: N},
+          grupos    : [ {bbox, elementos:[...]} ]
+        }
+
+    gap: distancia máxima en pts para considerar elementos del mismo sub-grupo.
     """
     pdf          = Pdf.open(pdf_path)
     ogmap        = _ocg_objgen_a_nombre(pdf)
     estados_orig = _leer_estados_originales(pdf)
-    bboxes       = {}
 
-    print(f"\n  Midiendo bboxes ({len(ogmap)} OCGs)...")
-    for nombre in ogmap.values():
-        bb = _bbox_ocg(pdf, nombre, estados_orig)
-        if bb:
-            bboxes[nombre] = bb
-            print(f"    {nombre:30s}  x={bb[0]:.1f} y={bb[1]:.1f}  "
-                  f"w={bb[2]-bb[0]:.1f} h={bb[3]-bb[1]:.1f}")
-        else:
-            print(f"    {nombre:30s}  (sin elementos)")
+    if nombre_ocg not in ogmap.values():
+        pdf.close()
+        raise ValueError(f"OCG '{nombre_ocg}' no encontrado. "
+                         f"Disponibles: {list(ogmap.values())}")
 
+    tmp = _pdf_solo_ocg(pdf, nombre_ocg, estados_orig)
     pdf.close()
-    return bboxes
+
+    elementos = _obtener_elementos(tmp)
+    os.unlink(tmp)
+
+    if not elementos:
+        return {"total": 0, "bbox": None, "por_tipo": {}, "grupos": []}
+
+    por_tipo = {}
+    for e in elementos:
+        por_tipo[e["type"]] = por_tipo.get(e["type"], 0) + 1
+
+    grupos_raw = clustering_por_gap(elementos, gap)
+    grupos = [
+        {
+            "bbox"     : _bbox_union(g),
+            "total"    : len(g),
+            "por_tipo" : {t: sum(1 for e in g if e["type"] == t)
+                          for t in set(e["type"] for e in g)},
+            "elementos": g,
+        }
+        for g in grupos_raw
+    ]
+
+    return {
+        "total"   : len(elementos),
+        "bbox"    : _bbox_union(elementos),
+        "por_tipo": por_tipo,
+        "grupos"  : grupos,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Deducir jerarquía por contención
+# 4. Analizar todos los OCGs
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _contiene(padre: tuple, hijo: tuple, tol: float = 2.0) -> bool:
+def analizar_todos(pdf_path: str, gap: float = 20.0,
+                   mostrar_elementos: bool = False):
     """
-    True si bbox padre contiene a bbox hijo (con margen de tolerancia).
-    Un bbox no se contiene a sí mismo (requiere que sea estrictamente mayor).
-    """
-    px0, py0, px1, py1 = padre
-    hx0, hy0, hx1, hy1 = hijo
-
-    # El padre debe ser más grande en al menos un lado
-    mismo = (abs(px0 - hx0) < tol and abs(py0 - hy0) < tol and
-             abs(px1 - hx1) < tol and abs(py1 - hy1) < tol)
-    if mismo:
-        return False
-
-    return (px0 - tol <= hx0 and
-            py0 - tol <= hy0 and
-            px1 + tol >= hx1 and
-            py1 + tol >= hy1)
-
-
-def _area(bbox: tuple) -> float:
-    return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-
-
-def deducir_jerarquia(bboxes: dict, tolerancia: float = 2.0) -> dict:
-    """
-    Deduce padre-hijo por contención de bboxes.
-
-    Para cada OCG B, su padre es el OCG A tal que:
-      - bbox(A) contiene a bbox(B)
-      - area(A) es la MENOR entre todos los contenedores de B
-        (el contenedor más ajustado = padre más directo)
-
-    Devuelve {nombre: nombre_padre | None}
-    """
-    nombres = list(bboxes.keys())
-    padre   = {n: None for n in nombres}
-
-    for hijo in nombres:
-        bb_hijo        = bboxes[hijo]
-        mejor_padre    = None
-        mejor_area     = float("inf")
-
-        for candidato in nombres:
-            if candidato == hijo:
-                continue
-            bb_cand = bboxes[candidato]
-            if _contiene(bb_cand, bb_hijo, tolerancia):
-                a = _area(bb_cand)
-                if a < mejor_area:
-                    mejor_area  = a
-                    mejor_padre = candidato
-
-        padre[hijo] = mejor_padre
-
-    return padre
-
-
-def construir_arbol(padre: dict) -> dict:
-    """
-    Convierte {hijo: padre} en {padre: [hijos]} (árbol de listas).
-    Los nodos sin padre son raíces.
-    """
-    arbol: dict = {n: [] for n in padre}
-    for hijo, p in padre.items():
-        if p is not None:
-            arbol[p].append(hijo)
-    return arbol
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Imprimir árbol
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _imprimir_nodo(nombre: str, arbol: dict, bboxes: dict,
-                   estados: dict, prefijo: str = "", es_ultimo: bool = True):
-    rama    = "└── " if es_ultimo else "├── "
-    sangria = prefijo + ("    " if es_ultimo else "│   ")
-
-    hijos   = arbol.get(nombre, [])
-    bb      = bboxes.get(nombre)
-    on      = estados.get(nombre, True)
-    icono   = "🟢" if on else "⚫"
-    carpeta = "📂" if hijos else "  "
-
-    bbox_str = (f"  [{bb[0]:.0f},{bb[1]:.0f} → {bb[2]:.0f},{bb[3]:.0f}  "
-                f"{bb[2]-bb[0]:.0f}×{bb[3]-bb[1]:.0f}pt]") if bb else ""
-
-    print(f"{prefijo}{rama}{carpeta} {icono} {nombre}{bbox_str}")
-
-    for i, hijo in enumerate(sorted(hijos)):
-        _imprimir_nodo(hijo, arbol, bboxes, estados,
-                       sangria, es_ultimo=(i == len(hijos) - 1))
-
-
-def ver_arbol_por_bbox(pdf_path: str, tolerancia: float = 2.0,
-                       mostrar_bbox: bool = True):
-    """
-    Construye y muestra la jerarquía de OCGs deducida por contención de bboxes.
+    Analiza cada OCG y muestra su desglose de elementos y sub-grupos.
 
     Args:
-        tolerancia  : margen en pts para considerar contención (default 2.0).
-                      Súbelo si OCGs hermanos se solapan ligeramente.
-        mostrar_bbox: muestra las coordenadas junto a cada nodo.
-
-    Leyenda:
-        🟢 visible   ⚫ oculto   📂 tiene hijos
+        gap               : distancia en pts para agrupar (default 20).
+        mostrar_elementos : si True, lista cada elemento individual.
     """
-    # Bboxes
-    bboxes = obtener_bboxes(pdf_path, tolerancia)
-    if not bboxes:
-        print("  Ningún OCG tiene elementos medibles.")
-        return
-
-    # Estados de visibilidad
-    pdf          = Pdf.open(pdf_path)
+    pdf    = Pdf.open(pdf_path)
+    ogmap  = _ocg_objgen_a_nombre(pdf)
     estados_orig = _leer_estados_originales(pdf)
     pdf.close()
 
-    # Jerarquía
-    padre = deducir_jerarquia(bboxes, tolerancia)
-    arbol = construir_arbol(padre)
-    raices = [n for n, p in padre.items() if p is None]
+    print(f"\n{'═' * 65}")
+    print(f"  Análisis de elementos por OCG: {pdf_path}")
+    print(f"  gap={gap}pt")
+    print(f"{'═' * 65}")
 
-    print(f"\n{'═' * 60}")
-    print(f"  Jerarquía por bbox: {pdf_path}")
-    print(f"  tolerancia={tolerancia}pt   OCGs con bbox={len(bboxes)}")
-    print(f"{'═' * 60}")
+    resultados = {}
+    for nombre in ogmap.values():
+        info = analizar_ocg(pdf_path, nombre, gap)
+        resultados[nombre] = info
 
-    if not mostrar_bbox:
-        bboxes_param = {k: None for k in bboxes}
-    else:
-        bboxes_param = bboxes
+        on    = estados_orig.get(nombre, True)
+        icono = "🟢" if on else "⚫"
+        total = info["total"]
 
-    for i, raiz in enumerate(sorted(raices)):
-        _imprimir_nodo(raiz, arbol, bboxes_param, estados_orig,
-                       "  ", es_ultimo=(i == len(raices) - 1))
+        if total == 0:
+            print(f"\n  {icono} {nombre}  — sin elementos")
+            continue
 
-    # OCGs sin bbox (sin elementos)
-    pdf2  = Pdf.open(pdf_path)
-    ogmap = _ocg_objgen_a_nombre(pdf2)
-    pdf2.close()
-    sin_bbox = [n for n in ogmap.values() if n not in bboxes]
-    if sin_bbox:
-        print(f"\n  ── Sin elementos medibles ({'─'*30})")
-        for n in sin_bbox:
-            print(f"     • {n}")
+        bb  = info["bbox"]
+        pt  = info["por_tipo"]
+        gs  = info["grupos"]
+
+        tipo_str = "  ".join(f"{t}:{n}" for t, n in sorted(pt.items()))
+        print(f"\n  {icono} {nombre}")
+        print(f"     elementos : {total}  ({tipo_str})")
+        print(f"     bbox      : x={bb[0]:.0f} y={bb[1]:.0f}  "
+              f"{bb[2]-bb[0]:.0f}×{bb[3]-bb[1]:.0f} pt")
+
+        if len(gs) == 1:
+            print(f"     sub-grupos: 1  (todos contiguos)")
+        else:
+            print(f"     sub-grupos: {len(gs)}  (gap={gap}pt)")
+            for i, g in enumerate(gs, 1):
+                bb2     = g["bbox"]
+                pt2     = g["por_tipo"]
+                tipo2   = "  ".join(f"{t}:{n}" for t, n in sorted(pt2.items()))
+                print(f"       [{i}] {g['total']} elem  ({tipo2})"
+                      f"  x={bb2[0]:.0f} y={bb2[1]:.0f}"
+                      f"  {bb2[2]-bb2[0]:.0f}×{bb2[3]-bb2[1]:.0f} pt")
+
+                if mostrar_elementos:
+                    for e in g["elementos"]:
+                        eb = e["bbox"]
+                        extra = f"  \"{e.get('text','')}\"" if e["type"] == "text" else ""
+                        print(f"           · {e['type']:5s}"
+                              f"  x={eb[0]:.0f} y={eb[1]:.0f}"
+                              f"  {eb[2]-eb[0]:.0f}×{eb[3]-eb[1]:.0f}{extra}")
 
     print()
+    return resultados
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,8 +332,16 @@ def ver_arbol_por_bbox(pdf_path: str, tolerancia: float = 2.0,
 if __name__ == "__main__":
     PDF = "diseño.pdf"
 
-    ver_arbol_por_bbox(PDF)
+    # Ver todos los OCGs con sus sub-grupos detectados
+    analizar_todos(PDF, gap=20.0)
 
-    # Si hay OCGs hermanos que se solapan y aparecen como hijos,
-    # aumenta la tolerancia negativa para ser más estricto:
-    # ver_arbol_por_bbox(PDF, tolerancia=-5.0)
+    # Más detalle: listar cada elemento individual
+    # analizar_todos(PDF, gap=20.0, mostrar_elementos=True)
+
+    # Ajustar gap si los sub-grupos no tienen sentido:
+    #   gap pequeño (5-10)  → más sub-grupos, más granular
+    #   gap grande (50-100) → menos sub-grupos, agrupa más cosas juntas
+
+    # Analizar un solo OCG
+    # info = analizar_ocg(PDF, "dec", gap=20.0)
+    # print(info)
