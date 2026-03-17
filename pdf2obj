@@ -1,233 +1,343 @@
-"""
-SOLUCIÓN: mover_multiples_ocgs
-==============================
-Permite mover /MC0, /MC1, /MC2 (cualquier combinación) de forma
-INDEPENDIENTE, sin necesidad de encadenar llamadas.
-
-Pega esta función al final de tu archivo mover_pdf_directo.py
-(o en un archivo aparte que importe las funciones base).
-
-Problema original
------------------
-mover_ocg_directo() abre el PDF original cada vez → si quieres
-mover MC0 + MC1 + MC2, hay que:
-    1. mover_ocg_directo(PDF,    "MC0", dx0, dy0, "tmp1.pdf")
-    2. mover_ocg_directo("tmp1", "MC1", dx1, dy1, "tmp2.pdf")  # depende de tmp1
-    3. mover_ocg_directo("tmp2", "MC2", dx2, dy2, "final.pdf") # depende de tmp2
-
-Solución
---------
-mover_multiples_ocgs() aplica TODOS los movimientos al mismo PDF
-abierto en memoria y lo guarda una sola vez → sin dependencias.
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Asegúrate de tener importadas las funciones base de mover_pdf_directo.py:
-#   _ocg_objgen_a_nombre, _nombre_ocg_a_alias, _modificar_stream
-# Si usas este archivo de forma autónoma, importa así:
-#
-#   from mover_pdf_directo import (
-#       _ocg_objgen_a_nombre, _nombre_ocg_a_alias, _modificar_stream
-#   )
-# ──────────────────────────────────────────────────────────────────────────────
-
 import pikepdf
-from pikepdf import Pdf
+from pikepdf import parse_content_stream, unparse_content_stream, Object, Array, Name
+from pikepdf._qpdf import ContentStreamInstruction, ContentStreamInlineImage
 
 
-def mover_multiples_ocgs(
-    pdf_path: str,
-    movimientos: dict,          # {nombre_ocg: (dx, dy)}
-    output_pdf: str = "resultado.pdf"
-) -> str:
+# ============================================================
+# 1. TRASLACIÓN DE OPERADORES PDF
+# ============================================================
+
+def to_float(operand):
+    """Convierte un operando pikepdf a float."""
+    return float(operand)
+
+def to_pdf_number(value):
+    """Convierte un float a objeto pikepdf numérico."""
+    return pikepdf.Decimal(f"{value:.4f}")
+
+def translate_instruction(instruction, dx, dy):
     """
-    Mueve varios OCGs en una sola pasada sobre el mismo PDF.
-    No hay dependencias entre capas: puedes mover MC0, MC1 y MC2
-    en cualquier orden o sólo algunos.
-
-    Args:
-        pdf_path   : Ruta al PDF de entrada.
-        movimientos: Diccionario  {nombre_ocg: (dx, dy)}
-                     Ejemplo:
-                         {
-                             "MC0": (100, -50),
-                             "MC1": (0,   30),
-                             "MC2": (-20,  0),
-                         }
-        output_pdf : PDF de salida.
-
-    Returns:
-        Ruta del PDF guardado.
-
-    Ejemplo de uso
-    --------------
-    mover_multiples_ocgs(
-        pdf_path   = "diseño.pdf",
-        movimientos = {
-            "MC0": (100, -50),   # 100 pts derecha, 50 pts abajo
-            "MC1": (0,    30),   # solo vertical
-            # MC2 no se mueve → simplemente no lo incluyas
-        },
-        output_pdf = "resultado.pdf"
-    )
+    Recibe un ContentStreamInstruction y retorna los operandos modificados.
+    Aplica dx, dy a los operadores que contienen coordenadas.
     """
-    pdf   = Pdf.open(pdf_path)
-    ogmap = _ocg_objgen_a_nombre(pdf)
+    op = str(instruction.operator)
+    operands = list(instruction.operands)
 
-    # Validar que todos los OCGs pedidos existen
-    nombres_disponibles = list(ogmap.values())
-    for nombre in movimientos:
-        if nombre not in nombres_disponibles:
-            pdf.close()
-            raise ValueError(
-                f"OCG '{nombre}' no encontrado.\n"
-                f"Disponibles: {nombres_disponibles}"
-            )
+    def s(val, delta):
+        return to_pdf_number(to_float(val) + delta)
 
-    streams_modificados = 0
+    # ── Path construction ──────────────────────────────────
+    if op == 're':        # x y w h re  →  rectángulo
+        return [s(operands[0], dx), s(operands[1], dy), operands[2], operands[3]]
 
-    for i, page in enumerate(pdf.pages):
-        # Mapa nombre_ocg → [alias, ...] para esta página
-        nombre_a_aliases = _nombre_ocg_a_alias(page.obj, ogmap)
+    if op == 'm':         # x y m  →  moveto
+        return [s(operands[0], dx), s(operands[1], dy)]
 
-        contenido = page.obj.get("/Contents")
-        if contenido is None:
+    if op == 'l':         # x y l  →  lineto
+        return [s(operands[0], dx), s(operands[1], dy)]
+
+    if op == 'c':         # x1 y1 x2 y2 x3 y3 c  →  curveto
+        return [s(operands[0], dx), s(operands[1], dy),
+                s(operands[2], dx), s(operands[3], dy),
+                s(operands[4], dx), s(operands[5], dy)]
+
+    if op == 'v':         # x2 y2 x3 y3 v
+        return [s(operands[0], dx), s(operands[1], dy),
+                s(operands[2], dx), s(operands[3], dy)]
+
+    if op == 'y':         # x1 y1 x3 y3 y
+        return [s(operands[0], dx), s(operands[1], dy),
+                s(operands[2], dx), s(operands[3], dy)]
+
+    # ── Texto ──────────────────────────────────────────────
+    if op == 'Td' or op == 'TD':   # tx ty Td
+        return [s(operands[0], dx), s(operands[1], dy)]
+
+    if op == 'Tm':        # a b c d e f Tm  (e=tx, f=ty)
+        return [operands[0], operands[1], operands[2], operands[3],
+                s(operands[4], dx), s(operands[5], dy)]
+
+    # ── Transformación de matriz ───────────────────────────
+    if op == 'cm':        # a b c d e f cm  (e=tx, f=ty)
+        return [operands[0], operands[1], operands[2], operands[3],
+                s(operands[4], dx), s(operands[5], dy)]
+
+    return operands  # operador sin coordenadas → sin cambio
+
+
+# ============================================================
+# 2. BOUNDING BOX (hit-test como herramienta V)
+# ============================================================
+
+def get_bounding_box(instructions):
+    """
+    Calcula el bounding box de todos los paths del content stream.
+    Retorna (x_min, y_min, x_max, y_max) o None.
+    """
+    xs, ys = [], []
+
+    for inst in instructions:
+        if not hasattr(inst, 'operator'):
             continue
+        op = str(inst.operator)
+        ops = list(inst.operands)
 
-        # Leer el stream (puede ser un objeto único o un Array)
-        if isinstance(contenido, pikepdf.Array):
-            objetos_stream = list(contenido)
-        else:
-            objetos_stream = [contenido]
+        try:
+            if op == 're' and len(ops) == 4:
+                x, y, w, h = [float(o) for o in ops]
+                xs += [x, x + w]; ys += [y, y + h]
 
-        for stream_obj in objetos_stream:
-            raw = stream_obj.read_bytes()
-            mod = raw
+            elif op in ('m', 'l') and len(ops) == 2:
+                xs.append(float(ops[0])); ys.append(float(ops[1]))
 
-            # Aplicar cada movimiento pedido al mismo bloque de bytes
-            for nombre_ocg, (dx, dy) in movimientos.items():
-                aliases = nombre_a_aliases.get(nombre_ocg, [])
-                if not aliases:
-                    continue
-                mod = _modificar_stream(mod, aliases, dx, dy)
+            elif op == 'c' and len(ops) == 6:
+                for i in range(0, 6, 2):
+                    xs.append(float(ops[i])); ys.append(float(ops[i+1]))
 
-            if mod != raw:
-                stream_obj.write(mod)
-                streams_modificados += 1
-                print(f"  Página {i+1}: stream modificado con {list(movimientos.keys())}")
+            elif op == 'Tm' and len(ops) == 6:
+                xs.append(float(ops[4])); ys.append(float(ops[5]))
 
-    if streams_modificados == 0:
-        print("  ADVERTENCIA: no se modificó ningún stream.")
-        print(f"  Ejecuta analizar_ocgs_en_stream('{pdf_path}') para diagnosticar.")
+            elif op == 'Td' and len(ops) == 2:
+                xs.append(float(ops[0])); ys.append(float(ops[1]))
+        except Exception:
+            pass
+
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def point_in_bbox(px, py, bbox, margin=5):
+    """¿Está el punto (px,py) dentro del bounding box? (hit-test)"""
+    x0, y0, x1, y1 = bbox
+    return (x0 - margin) <= px <= (x1 + margin) and \
+           (y0 - margin) <= py <= (y1 + margin)
+
+
+# ============================================================
+# 3. LEER / ESCRIBIR CONTENT STREAM
+# ============================================================
+
+def get_content_stream_instructions(page):
+    """
+    Extrae y parsea el content stream de una página.
+    Maneja tanto /Contents como arrays de streams.
+    """
+    contents = page.get("/Contents")
+    if contents is None:
+        return [], None
+
+    # Normalizar: puede ser un objeto directo o un array
+    if isinstance(contents, pikepdf.Array):
+        # Concatenar todos los streams
+        all_bytes = b""
+        for ref in contents:
+            stream_obj = ref
+            all_bytes += stream_obj.read_bytes()
+        # Parsear el stream combinado
+        instructions = parse_content_stream(all_bytes)
+        return instructions, contents
     else:
-        print(f"  Total streams modificados: {streams_modificados}")
-
-    pdf.save(output_pdf)
-    pdf.close()
-    print(f"\n  Guardado: {output_pdf}")
-    return output_pdf
+        stream_obj = contents
+        instructions = parse_content_stream(stream_obj)
+        return instructions, stream_obj
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# VARIANTE: mover_multiples_ocgs_absoluto
-# Igual que mover_ocg_a_posicion pero para N capas a la vez.
-# ──────────────────────────────────────────────────────────────────────────────
-
-import os
-import tempfile
-import fitz
-
-
-def mover_multiples_ocgs_absoluto(
-    pdf_path: str,
-    posiciones: dict,           # {nombre_ocg: (nuevo_x, nuevo_y)}  top-down
-    output_pdf: str = "resultado.pdf"
-) -> str:
+def write_content_stream(stream_ref, new_instructions):
     """
-    Mueve varios OCGs a posiciones absolutas (coordenadas top-down
-    como Illustrator) en una sola pasada.
-
-    Args:
-        posiciones: {nombre_ocg: (nuevo_x, nuevo_y)}
-                    Ejemplo:
-                        {
-                            "MC0": (400, 200),
-                            "MC1": (100,  50),
-                        }
+    Serializa las instrucciones y las escribe de vuelta en el stream.
+    pikepdf se encarga de la compresión automáticamente.
     """
-    pdf    = Pdf.open(pdf_path)
-    ogmap  = _ocg_objgen_a_nombre(pdf)
-    estados_orig = _leer_estados_originales(pdf)
+    new_bytes = unparse_content_stream(new_instructions)
 
-    movimientos = {}
+    if isinstance(stream_ref, pikepdf.Array):
+        # Si hay múltiples streams, escribir todo en el primero y vaciar el resto
+        first = True
+        for ref in stream_ref:
+            if first:
+                ref.write(new_bytes)
+                first = False
+            else:
+                ref.write(b"")  # vaciar streams adicionales
+    else:
+        stream_ref.write(new_bytes)
 
-    for nombre_ocg, (nuevo_x, nuevo_y) in posiciones.items():
-        if nombre_ocg not in ogmap.values():
-            pdf.close()
-            raise ValueError(
-                f"OCG '{nombre_ocg}' no encontrado.\n"
-                f"Disponibles: {list(ogmap.values())}"
+
+# ============================================================
+# 4. API PRINCIPAL
+# ============================================================
+
+def move_all_objects(input_path, output_path, dx, dy, page_index=0):
+    """
+    Mueve TODOS los objetos gráficos de una página en dx, dy puntos PDF.
+    (1 punto = 1/72 pulgada; eje Y crece hacia arriba en PDF)
+    """
+    with pikepdf.open(input_path) as pdf:
+        page = pdf.pages[page_index]
+        instructions, stream_ref = get_content_stream_instructions(page)
+
+        if not instructions:
+            print("No se encontró content stream.")
+            return
+
+        bb = get_bounding_box(instructions)
+        print(f"Bounding box de la página: {bb}")
+        print(f"Total instrucciones: {len(instructions)}")
+
+        new_instructions = []
+        for inst in instructions:
+            if isinstance(inst, ContentStreamInlineImage):
+                new_instructions.append(inst)  # imágenes inline → sin cambio
+                continue
+
+            new_ops = translate_instruction(inst, dx, dy)
+            new_instructions.append(
+                ContentStreamInstruction(new_ops, inst.operator)
             )
 
-        # Obtener posición actual con fitz
-        _encender_solo(pdf, nombre_ocg)
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        tmp.close()
-        pdf.save(tmp.name)
-        _restaurar_estados(pdf, estados_orig)
+        write_content_stream(stream_ref, new_instructions)
+        pdf.save(output_path)
+        print(f"Guardado: {output_path}")
 
-        doc   = fitz.open(tmp.name)
-        paths = doc[0].get_drawings()
-        doc.close()
-        os.unlink(tmp.name)
 
-        if not paths:
-            print(f"  AVISO: '{nombre_ocg}' no tiene elementos medibles, se omite.")
+def move_object_at(input_path, output_path, click_x, click_y, dx, dy, page_index=0):
+    """
+    Simula la herramienta V de Illustrator:
+    - Hace hit-test en (click_x, click_y)
+    - Si hay un objeto ahí, lo mueve dx, dy
+    - El resto permanece intacto
+
+    NOTA: En coordenadas PDF el origen es abajo-izquierda.
+    """
+    with pikepdf.open(input_path) as pdf:
+        page = pdf.pages[page_index]
+        instructions, stream_ref = get_content_stream_instructions(page)
+
+        if not instructions:
+            print("No se encontró content stream.")
+            return
+
+        # ── Segmentar en sub-paths (grupos de instrucciones por objeto) ──
+        segments = segment_by_object(instructions)
+        print(f"Objetos detectados en la página: {len(segments)}")
+
+        hit_segment = None
+        for i, seg in enumerate(segments):
+            bb = get_bounding_box(seg)
+            if bb:
+                print(f"  Objeto {i}: bbox={bb}")
+                if point_in_bbox(click_x, click_y, bb):
+                    hit_segment = i
+                    print(f"  → HIT en objeto {i}")
+
+        if hit_segment is None:
+            print("No se encontró ningún objeto en esa posición.")
+            return
+
+        # ── Reconstruir el stream moviendo solo el objeto seleccionado ──
+        new_instructions = []
+        current = 0
+        for i, seg in enumerate(segments):
+            for inst in seg:
+                if isinstance(inst, ContentStreamInlineImage):
+                    new_instructions.append(inst)
+                    continue
+
+                if i == hit_segment:
+                    new_ops = translate_instruction(inst, dx, dy)
+                    new_instructions.append(
+                        ContentStreamInstruction(new_ops, inst.operator)
+                    )
+                else:
+                    new_instructions.append(inst)
+
+        write_content_stream(stream_ref, new_instructions)
+        pdf.save(output_path)
+        print(f"Guardado: {output_path}")
+
+
+def segment_by_object(instructions):
+    """
+    Divide el content stream en segmentos lógicos.
+    Cada 'q ... Q' (save/restore) es un objeto independiente.
+    Si no hay q/Q, separa por operadores de pintado (f, S, B...).
+    """
+    segments = []
+    current = []
+    depth = 0
+
+    paint_ops = {'f', 'F', 'S', 's', 'B', 'b', 'f*', 'B*', 'b*', 'n'}
+
+    for inst in instructions:
+        if not hasattr(inst, 'operator'):
+            current.append(inst)
             continue
 
-        x0_actual = min(p["rect"].x0 for p in paths)
-        y0_actual = min(p["rect"].y0 for p in paths)
+        op = str(inst.operator)
+        current.append(inst)
 
-        dx =  nuevo_x - x0_actual
-        dy = -(nuevo_y - y0_actual)   # invertir Y (PDF: bottom-up)
+        if op == 'q':
+            depth += 1
+        elif op == 'Q':
+            depth -= 1
+            if depth == 0:
+                segments.append(current[:])
+                current = []
+        elif op in paint_ops and depth == 0:
+            # Sin q/Q: separar por cada operación de pintado
+            segments.append(current[:])
+            current = []
 
-        print(f"  '{nombre_ocg}' pos actual ({x0_actual:.1f}, {y0_actual:.1f})"
-              f" → destino ({nuevo_x:.1f}, {nuevo_y:.1f})"
-              f"  cm: dx={dx:.1f}, dy={dy:.1f}")
+    if current:
+        segments.append(current)
 
-        movimientos[nombre_ocg] = (dx, dy)
-
-    pdf.close()
-
-    return mover_multiples_ocgs(pdf_path, movimientos, output_pdf)
+    return segments
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# EJEMPLO DE USO
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 5. INSPECCIÓN (utilidad de debug)
+# ============================================================
+
+def inspect_pdf(path, page_index=0):
+    """Muestra todos los operadores del content stream de una página."""
+    with pikepdf.open(path) as pdf:
+        page = pdf.pages[page_index]
+        instructions, _ = get_content_stream_instructions(page)
+
+        print(f"=== {path} — Página {page_index} ===")
+        print(f"Tamaño de página: {page.mediabox}")
+        print(f"Total instrucciones: {len(instructions)}\n")
+
+        for i, inst in enumerate(instructions):
+            if hasattr(inst, 'operator'):
+                op = str(inst.operator)
+                ops = [str(o) for o in inst.operands]
+                print(f"  [{i:3}]  {' '.join(ops):40s}  {op}")
+
+
+# ============================================================
+# 6. EJEMPLOS DE USO
+# ============================================================
 
 if __name__ == "__main__":
-    PDF = "diseño.pdf"
 
-    # ── Opción A: desplazamiento relativo para varias capas ──────────────────
-    mover_multiples_ocgs(
-        pdf_path    = PDF,
-        movimientos = {
-            "MC0": (100, -50),   # 100 pts derecha, 50 pts abajo
-            "MC1": (  0,  30),   # solo sube 30 pts
-            "MC2": (-20,   0),   # solo a la izquierda
-            # Puedes poner solo las capas que quieres mover.
-            # No hace falta incluir todas.
-        },
-        output_pdf  = "resultado.pdf"
+    # Ver qué hay en el PDF
+    inspect_pdf("entrada.pdf")
+
+    # Mover TODO 50pt a la derecha y 30pt arriba
+    move_all_objects(
+        input_path="entrada.pdf",
+        output_path="salida_todo.pdf",
+        dx=50,
+        dy=30
     )
 
-    # ── Opción B: posición absoluta para varias capas ────────────────────────
-    # mover_multiples_ocgs_absoluto(
-    #     pdf_path   = PDF,
-    #     posiciones = {
-    #         "MC0": (400, 200),
-    #         "MC1": (100,  50),
-    #     },
-    #     output_pdf = "resultado.pdf"
-    # )
+    # Mover solo el objeto bajo el punto (200, 400) — equivalente a click con V
+    move_object_at(
+        input_path="entrada.pdf",
+        output_path="salida_objeto.pdf",
+        click_x=200,   # coordenadas en puntos PDF
+        click_y=400,   # origen abajo-izquierda
+        dx=100,        # mover 100pt a la derecha
+        dy=0
+    )
