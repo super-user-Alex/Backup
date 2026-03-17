@@ -1,419 +1,283 @@
 """
-ocg_illustrator_layers.py
-=========================
-Lee la jerarquía de capas tal como Illustrator la tiene internamente,
-desde dos fuentes dentro del PDF:
+ocg_hierarchy_bbox.py
+=====================
+Deduce la jerarquía padre-hijo entre OCGs comparando sus bounding boxes.
 
-  Fuente 1 — XMP Metadata (/Root/Metadata)
-      Illustrator escribe las capas en el namespace xap/ai con atributos
-      de orden, visibilidad y bloqueo.
-
-  Fuente 2 — Stream nativo .ai embebido
-      Si guardaste con "Preserve Illustrator Editing Capabilities",
-      el .ai completo vive dentro del PDF como un stream comprimido.
-      Contiene marcadores %AI5_BeginLayer con nombre, visibilidad,
-      bloqueo, color de etiqueta y jerarquía real padre-hijo.
+Lógica:
+    Si bbox(A) contiene a bbox(B)  →  B es hijo de A.
+    El padre de B es el OCG con bbox contenedor MÁS PEQUEÑO
+    (el contenedor más ajustado), para evitar que un OCG raíz
+    que abarca todo sea padre de todos.
 
 Dependencias:
-    pip install pikepdf
-    (xml.etree.ElementTree viene en stdlib)
+    pip install pikepdf pymupdf
 """
 
-import re
-import zlib
+import os
+import tempfile
+import fitz
 import pikepdf
-from pikepdf import Pdf
-import xml.etree.ElementTree as ET
+from pikepdf import Pdf, Array
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FUENTE 1: XMP Metadata
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Namespaces que usa Illustrator en el XMP
-NS = {
-    "x"        : "adobe:ns:meta/",
-    "rdf"      : "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-    "dc"       : "http://purl.org/dc/elements/1.1/",
-    "xap"      : "http://ns.adobe.com/xap/1.0/",
-    "pdf"      : "http://ns.adobe.com/pdf/1.3/",
-    "ai"       : "http://ns.adobe.com/AdobeIllustrator/10.0/",
-    "illustrator": "http://ns.adobe.com/illustrator/1.0/",
-    "xapGImg"  : "http://ns.adobe.com/xap/1.0/g/img/",
-}
-
-
-def leer_capas_xmp(pdf_path: str) -> list[dict]:
-    """
-    Extrae información de capas desde el XMP del PDF.
-    Devuelve lista de dicts:
-        [{ name, visible, locked, printable, order }, ...]
-    ordenada por 'order' si está disponible.
-    """
-    pdf = Pdf.open(pdf_path)
-    try:
-        meta_stream = pdf.Root["/Metadata"]
-        xmp_bytes   = meta_stream.read_bytes()
-    except (KeyError, AttributeError):
-        print("  Sin /Metadata en este PDF.")
-        pdf.close()
-        return []
-    pdf.close()
-
-    # Limpiar BOM y namespaces problemáticos para el parser
-    xmp_str = xmp_bytes.decode("utf-8", errors="replace")
-
-    try:
-        root = ET.fromstring(xmp_str)
-    except ET.ParseError as e:
-        print(f"  Error parseando XMP: {e}")
-        return []
-
-    capas = []
-
-    # Buscar elementos con atributo ai:layer o en el namespace de illustrator
-    # Illustrator escribe algo como:
-    #   <rdf:Description ai:Layers="...">
-    # o bien una estructura anidada con cada capa como nodo
-
-    # Estrategia: buscar cualquier nodo que tenga atributo de nombre de capa
-    # Los atributos varían por versión de Illustrator, buscar patrones comunes
-
-    xmp_raw = xmp_str
-
-    # Patrón 1: capas en atributo "stFnt:fontName" style (Illustrator CS+)
-    # <illustrator:Layer illustrator:Name="Capa 1" .../>
-    patron_capa = re.compile(
-        r'<(?:[\w:]+:)?[Ll]ayer\b([^>]*)/>|'
-        r'<(?:[\w:]+:)?[Ll]ayer\b([^>]*)>(.*?)</(?:[\w:]+:)?[Ll]ayer>',
-        re.DOTALL
+# ── Reutilizamos helpers de mover_pdf_directo.py ─────────────────────────────
+# Si no los tienes en el path, cópialos aquí o importa el módulo.
+try:
+    from mover_pdf_directo import (
+        _ocg_objgen_a_nombre,
+        _leer_estados_originales,
+        _encender_solo,
+        _restaurar_estados,
     )
-
-    for m in patron_capa.finditer(xmp_raw):
-        attrs_raw = m.group(1) or m.group(2) or ""
-        nombre    = _extraer_attr(attrs_raw, ["Name", "name", "ai:name",
-                                               "illustrator:Name"])
-        visible   = _extraer_attr(attrs_raw, ["Visible", "visible"]) or "true"
-        locked    = _extraer_attr(attrs_raw, ["Locked", "locked"])   or "false"
-        if nombre:
-            capas.append({
-                "name"    : nombre,
-                "visible" : visible.lower() not in ("false", "0"),
-                "locked"  : locked.lower()  in  ("true",  "1"),
-            })
-
-    if capas:
-        print(f"  [XMP] {len(capas)} capas encontradas vía patrón <Layer>")
-        return capas
-
-    # Patrón 2: buscar nombres entre etiquetas de cualquier ns con "layer"
-    patron_nombre = re.compile(
-        r'(?:ai|illustrator|xap):(?:Name|LayerName|layer)["\s]+[=:]\s*["\']([^"\']+)["\']',
-        re.IGNORECASE
-    )
-    nombres = patron_nombre.findall(xmp_raw)
-    if nombres:
-        print(f"  [XMP] {len(nombres)} nombres de capa encontrados vía atributos")
-        return [{"name": n, "visible": True, "locked": False} for n in nombres]
-
-    print("  [XMP] No se encontraron capas con estructura reconocible.")
-    print("  Tip: usa debug_xmp() para ver el XML crudo.")
-    return []
-
-
-def _extraer_attr(attrs_str: str, nombres: list) -> str | None:
-    """Busca el valor de cualquiera de los nombres de atributo dados."""
-    for nombre in nombres:
-        patron = re.compile(
-            rf'(?:^|\s){re.escape(nombre)}\s*=\s*["\']([^"\']*)["\']'
-        )
-        m = patron.search(attrs_str)
-        if m:
-            return m.group(1)
-    return None
-
-
-def debug_xmp(pdf_path: str, max_chars: int = 3000):
-    """Vuelca los primeros max_chars del XMP para inspeccionarlo manualmente."""
-    pdf = Pdf.open(pdf_path)
-    try:
-        xmp = pdf.Root["/Metadata"].read_bytes().decode("utf-8", errors="replace")
-        pdf.close()
-        print(f"\n{'─'*60}")
-        print("  XMP (primeros", max_chars, "chars)")
-        print(f"{'─'*60}")
-        print(xmp[:max_chars])
-        if len(xmp) > max_chars:
-            print(f"\n  ... ({len(xmp) - max_chars} chars más)")
-    except (KeyError, AttributeError):
-        pdf.close()
-        print("  Sin /Metadata.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FUENTE 2: Stream nativo .ai embebido
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Marcadores de capa en el formato .ai / PostScript de Illustrator
-# %AI5_BeginLayer
-# 1 1 1 1 0 0 0 0 0 0 Lb    ← flags: visible locked printable ...
-# (Nombre de la capa) Ln     ← nombre entre paréntesis
-# ...contenido...
-# LB                         ← end layer
-# %AI5_EndLayer
-
-RE_BEGIN_LAYER = re.compile(
-    rb'%AI(?:5|8|9|10)?_BeginLayer\s*\n'
-    rb'([\d ]+)Lb\s*\n'          # flags en línea anterior a nombre
-    rb'\(([^)]*)\)\s*Ln',        # nombre entre paréntesis
-    re.DOTALL
-)
-
-# Versión alternativa que Illustrator CS+ usa:
-# %%Layer: 1 1 1 1
-# (Nombre) Ln
-RE_LAYER_ALT = re.compile(
-    rb'%%Layer:\s*([\d ]+)\s*\n(?:.*?\n)?\(([^)]*)\)\s*Ln',
-    re.DOTALL
-)
-
-# Marcador de sub-capa / grupo de capas
-RE_BEGIN_SUBLAYER = re.compile(
-    rb'%AI5_BeginGroup\s*\n'
-    rb'\(([^)]*)\)\s*Ln',
-    re.DOTALL
-)
-
-
-def _buscar_stream_ai(pdf: Pdf) -> bytes | None:
-    """
-    Localiza el stream .ai embebido en el PDF.
-    Illustrator lo guarda de varias formas según versión:
-      - Como EmbeddedFile en /Names/EmbeddedFiles
-      - Como stream con /Subtype /application#2Fpostscript o similar
-      - Como objeto con clave /AI o comentario %AI en el contenido
-    """
-    # Intento 1: EmbeddedFiles
-    try:
-        ef = pdf.Root["/Names"]["/EmbeddedFiles"]["/Names"]
-        for i in range(0, len(ef), 2):
-            nombre = str(ef[i])
-            if nombre.endswith(".ai") or "illustrator" in nombre.lower():
-                stream_ref = ef[i + 1]
-                if "/EF" in stream_ref:
-                    data = stream_ref["/EF"]["/F"].read_bytes()
-                    print(f"  [AI stream] Encontrado en EmbeddedFiles: '{nombre}' "
-                          f"({len(data):,} bytes)")
-                    return data
-    except (KeyError, AttributeError, IndexError, TypeError):
-        pass
-
-    # Intento 2: Recorrer todos los objetos buscando stream con contenido .ai
-    print("  [AI stream] Buscando en objetos del PDF...")
-    for obj in pdf.objects:
+except ImportError:
+    # ── Copias mínimas por si no está el módulo ───────────────────────────────
+    def _ocg_objgen_a_nombre(pdf):
+        r = {}
         try:
-            if not hasattr(obj, "stream_dict"):
-                continue
-            # Verificar si parece un stream Illustrator
-            subtype = str(obj.stream_dict.get("/Subtype", ""))
-            if "postscript" in subtype.lower() or "illustrator" in subtype.lower():
-                data = obj.read_bytes()
-                if b"%AI" in data[:200] or b"%!PS-Adobe" in data[:200]:
-                    print(f"  [AI stream] Encontrado por /Subtype ({len(data):,} bytes)")
-                    return data
+            for ref in pdf.Root["/OCProperties"]["/OCGs"]:
+                r[ref.objgen] = str(ref["/Name"])
         except Exception:
-            continue
+            pass
+        return r
 
-    # Intento 3: Primer stream grande que contenga %AI5_BeginLayer
-    for obj in pdf.objects:
+    def _leer_estados_originales(pdf):
+        estados = {}
         try:
-            if not hasattr(obj, "read_bytes"):
-                continue
-            # Solo probar objetos con tamaño razonable (>10KB)
-            length = obj.stream_dict.get("/Length", 0)
-            if int(length) < 10_000:
-                continue
-            data = obj.read_bytes()
-            if b"%AI5_BeginLayer" in data or b"%%Layer:" in data:
-                print(f"  [AI stream] Encontrado por contenido ({len(data):,} bytes)")
-                return data
+            oc  = pdf.Root["/OCProperties"]
+            off = set()
+            if "/OFF" in oc["/D"]:
+                for r in oc["/D"]["/OFF"]:
+                    if hasattr(r, "objgen"):
+                        off.add(r.objgen)
+            for ref in oc["/OCGs"]:
+                estados[str(ref["/Name"])] = ref.objgen not in off
         except Exception:
-            continue
+            pass
+        return estados
 
-    return None
-
-
-def leer_capas_stream_ai(pdf_path: str) -> list[dict]:
-    """
-    Extrae la jerarquía de capas desde el stream nativo .ai embebido.
-    Devuelve lista de dicts con jerarquía real:
-        [{
-            name     : str,
-            visible  : bool,
-            locked   : bool,
-            printable: bool,
-            color    : int,       # color de etiqueta (0-26)
-            children : [...]      # sub-capas
-        }, ...]
-
-    Solo funciona si el PDF fue guardado con
-    "Preserve Illustrator Editing Capabilities" activado.
-    """
-    pdf  = Pdf.open(pdf_path)
-    data = _buscar_stream_ai(pdf)
-    pdf.close()
-
-    if data is None:
-        print("  [AI stream] No encontrado.")
-        print("  El PDF debe guardarse con 'Preserve Illustrator Editing")
-        print("  Capabilities' activado (Archivo > Guardar como > PDF > Avanzado).")
-        return []
-
-    # Descomprimir si es necesario
-    if data[:2] in (b'\x78\x9c', b'\x78\xda', b'\x78\x01'):
+    def _encender_solo(pdf, nombre):
         try:
-            data = zlib.decompress(data)
-        except zlib.error:
+            oc = pdf.Root["/OCProperties"]
+            off_list = [r for r in oc["/OCGs"] if str(r["/Name"]) != nombre]
+            oc["/D"]["/OFF"] = Array(off_list)
+        except Exception:
             pass
 
-    capas = _parsear_capas_ai(data)
-    return capas
-
-
-def _parsear_capas_ai(data: bytes) -> list[dict]:
-    """
-    Parsea los marcadores de capa del stream .ai.
-    Maneja anidamiento con un stack.
-    """
-    lineas = data.split(b"\n")
-    stack  = [[]]   # stack de listas de capas; stack[0] = raíz
-    i      = 0
-
-    while i < len(lineas):
-        linea = lineas[i].strip()
-
-        # ── Inicio de capa ────────────────────────────────────────────────────
-        if linea in (b"%AI5_BeginLayer", b"%%BeginSetup"):
-            # Buscar flags (Lb) y nombre (Ln) en las siguientes líneas
-            flags_line = b""
-            nombre     = ""
-            for j in range(i + 1, min(i + 10, len(lineas))):
-                l = lineas[j].strip()
-                if l.endswith(b"Lb"):
-                    flags_line = l
-                if l.endswith(b"Ln"):
-                    m = re.match(rb'\(([^)]*)\)', l)
-                    if m:
-                        nombre = m.group(1).decode("latin-1", errors="replace")
-                    break
-
-            if nombre:
-                flags  = flags_line.replace(b"Lb", b"").split()
-                capa   = {
-                    "name"     : nombre,
-                    "visible"  : _flag(flags, 0, True),
-                    "locked"   : not _flag(flags, 1, True),
-                    "printable": _flag(flags, 2, True),
-                    "color"    : int(flags[7]) if len(flags) > 7 else 0,
-                    "children" : [],
-                }
-                stack[-1].append(capa)
-                stack.append(capa["children"])
-
-        # ── Fin de capa ───────────────────────────────────────────────────────
-        elif linea in (b"LB", b"%AI5_EndLayer") and len(stack) > 1:
-            stack.pop()
-
-        # ── Capa en formato alternativo (%%Layer:) ────────────────────────────
-        elif linea.startswith(b"%%Layer:"):
-            partes = linea.split()
-            nombre = ""
-            # El nombre viene en la siguiente línea con Ln
-            if i + 1 < len(lineas):
-                siguiente = lineas[i + 1].strip()
-                m = re.match(rb'\(([^)]*)\)\s*Ln', siguiente)
-                if m:
-                    nombre = m.group(1).decode("latin-1", errors="replace")
-            if nombre:
-                flags = partes[1:]
-                capa  = {
-                    "name"     : nombre,
-                    "visible"  : _flag(flags, 0, True),
-                    "locked"   : not _flag(flags, 1, True),
-                    "printable": _flag(flags, 2, True),
-                    "color"    : int(flags[3]) if len(flags) > 3 else 0,
-                    "children" : [],
-                }
-                stack[-1].append(capa)
-
-        i += 1
-
-    return stack[0]
-
-
-def _flag(flags: list, idx: int, default: bool) -> bool:
-    """Lee un flag booleano de la lista; 1=True, 0=False."""
-    try:
-        return flags[idx] == b"1"
-    except IndexError:
-        return default
+    def _restaurar_estados(pdf, estados):
+        try:
+            oc = pdf.Root["/OCProperties"]
+            off_list = [r for r in oc["/OCGs"] if not estados.get(str(r["/Name"]), True)]
+            oc["/D"]["/OFF"] = Array(off_list)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Imprimir árbol resultante
+# 1. Obtener bbox de cada OCG
 # ─────────────────────────────────────────────────────────────────────────────
 
-COLORES_CAPA = {
-    0: "rojo", 1: "naranja", 2: "amarillo", 3: "verde", 4: "azul",
-    5: "violeta", 6: "magenta", 7: "marrón", 8: "negro",
-}
+def _bbox_ocg(pdf: Pdf, nombre: str, estados_orig: dict) -> tuple | None:
+    """
+    Devuelve (x0, y0, x1, y1) en coordenadas top-down (fitz),
+    o None si el OCG no tiene elementos medibles.
+    """
+    _encender_solo(pdf, nombre)
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp.close()
+    pdf.save(tmp.name)
+    _restaurar_estados(pdf, estados_orig)
+
+    doc   = fitz.open(tmp.name)
+    paths = doc[0].get_drawings()
+    doc.close()
+    os.unlink(tmp.name)
+
+    if not paths:
+        return None
+
+    x0 = min(p["rect"].x0 for p in paths)
+    y0 = min(p["rect"].y0 for p in paths)
+    x1 = max(p["rect"].x1 for p in paths)
+    y1 = max(p["rect"].y1 for p in paths)
+    return (x0, y0, x1, y1)
 
 
-def _imprimir_capa(capa: dict, prefijo: str = "", es_ultimo: bool = True):
+def obtener_bboxes(pdf_path: str, tolerancia: float = 2.0) -> dict:
+    """
+    Devuelve {nombre_ocg: (x0, y0, x1, y1)} para todos los OCGs.
+    tolerancia: margen en pts para considerar un bbox como contenedor.
+    """
+    pdf          = Pdf.open(pdf_path)
+    ogmap        = _ocg_objgen_a_nombre(pdf)
+    estados_orig = _leer_estados_originales(pdf)
+    bboxes       = {}
+
+    print(f"\n  Midiendo bboxes ({len(ogmap)} OCGs)...")
+    for nombre in ogmap.values():
+        bb = _bbox_ocg(pdf, nombre, estados_orig)
+        if bb:
+            bboxes[nombre] = bb
+            print(f"    {nombre:30s}  x={bb[0]:.1f} y={bb[1]:.1f}  "
+                  f"w={bb[2]-bb[0]:.1f} h={bb[3]-bb[1]:.1f}")
+        else:
+            print(f"    {nombre:30s}  (sin elementos)")
+
+    pdf.close()
+    return bboxes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Deducir jerarquía por contención
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _contiene(padre: tuple, hijo: tuple, tol: float = 2.0) -> bool:
+    """
+    True si bbox padre contiene a bbox hijo (con margen de tolerancia).
+    Un bbox no se contiene a sí mismo (requiere que sea estrictamente mayor).
+    """
+    px0, py0, px1, py1 = padre
+    hx0, hy0, hx1, hy1 = hijo
+
+    # El padre debe ser más grande en al menos un lado
+    mismo = (abs(px0 - hx0) < tol and abs(py0 - hy0) < tol and
+             abs(px1 - hx1) < tol and abs(py1 - hy1) < tol)
+    if mismo:
+        return False
+
+    return (px0 - tol <= hx0 and
+            py0 - tol <= hy0 and
+            px1 + tol >= hx1 and
+            py1 + tol >= hy1)
+
+
+def _area(bbox: tuple) -> float:
+    return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+
+def deducir_jerarquia(bboxes: dict, tolerancia: float = 2.0) -> dict:
+    """
+    Deduce padre-hijo por contención de bboxes.
+
+    Para cada OCG B, su padre es el OCG A tal que:
+      - bbox(A) contiene a bbox(B)
+      - area(A) es la MENOR entre todos los contenedores de B
+        (el contenedor más ajustado = padre más directo)
+
+    Devuelve {nombre: nombre_padre | None}
+    """
+    nombres = list(bboxes.keys())
+    padre   = {n: None for n in nombres}
+
+    for hijo in nombres:
+        bb_hijo        = bboxes[hijo]
+        mejor_padre    = None
+        mejor_area     = float("inf")
+
+        for candidato in nombres:
+            if candidato == hijo:
+                continue
+            bb_cand = bboxes[candidato]
+            if _contiene(bb_cand, bb_hijo, tolerancia):
+                a = _area(bb_cand)
+                if a < mejor_area:
+                    mejor_area  = a
+                    mejor_padre = candidato
+
+        padre[hijo] = mejor_padre
+
+    return padre
+
+
+def construir_arbol(padre: dict) -> dict:
+    """
+    Convierte {hijo: padre} en {padre: [hijos]} (árbol de listas).
+    Los nodos sin padre son raíces.
+    """
+    arbol: dict = {n: [] for n in padre}
+    for hijo, p in padre.items():
+        if p is not None:
+            arbol[p].append(hijo)
+    return arbol
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Imprimir árbol
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _imprimir_nodo(nombre: str, arbol: dict, bboxes: dict,
+                   estados: dict, prefijo: str = "", es_ultimo: bool = True):
     rama    = "└── " if es_ultimo else "├── "
     sangria = prefijo + ("    " if es_ultimo else "│   ")
 
-    on      = capa.get("visible",   True)
-    locked  = capa.get("locked",    False)
-    hijos   = capa.get("children",  [])
-    color   = COLORES_CAPA.get(capa.get("color", -1), "")
-
-    icono  = "🟢" if on else "⚫"
-    candado = " 🔒" if locked else ""
-    tag    = f"  [{color}]" if color else ""
+    hijos   = arbol.get(nombre, [])
+    bb      = bboxes.get(nombre)
+    on      = estados.get(nombre, True)
+    icono   = "🟢" if on else "⚫"
     carpeta = "📂" if hijos else "  "
 
-    print(f"{prefijo}{rama}{carpeta} {icono} {capa['name']}{candado}{tag}")
+    bbox_str = (f"  [{bb[0]:.0f},{bb[1]:.0f} → {bb[2]:.0f},{bb[3]:.0f}  "
+                f"{bb[2]-bb[0]:.0f}×{bb[3]-bb[1]:.0f}pt]") if bb else ""
 
-    for i, hijo in enumerate(hijos):
-        _imprimir_capa(hijo, sangria, es_ultimo=(i == len(hijos) - 1))
+    print(f"{prefijo}{rama}{carpeta} {icono} {nombre}{bbox_str}")
+
+    for i, hijo in enumerate(sorted(hijos)):
+        _imprimir_nodo(hijo, arbol, bboxes, estados,
+                       sangria, es_ultimo=(i == len(hijos) - 1))
 
 
-def ver_arbol_illustrator(pdf_path: str):
+def ver_arbol_por_bbox(pdf_path: str, tolerancia: float = 2.0,
+                       mostrar_bbox: bool = True):
     """
-    Imprime la jerarquía real de capas desde el stream .ai interno.
-    Más fiel al panel de Capas de Illustrator que /Order.
+    Construye y muestra la jerarquía de OCGs deducida por contención de bboxes.
+
+    Args:
+        tolerancia  : margen en pts para considerar contención (default 2.0).
+                      Súbelo si OCGs hermanos se solapan ligeramente.
+        mostrar_bbox: muestra las coordenadas junto a cada nodo.
+
+    Leyenda:
+        🟢 visible   ⚫ oculto   📂 tiene hijos
     """
-    print(f"\n{'═' * 60}")
-    print(f"  Capas Illustrator (stream .ai): {pdf_path}")
-    print(f"{'═' * 60}")
-
-    capas = leer_capas_stream_ai(pdf_path)
-
-    if not capas:
-        print("\n  Intentando desde XMP...")
-        capas_xmp = leer_capas_xmp(pdf_path)
-        if capas_xmp:
-            for i, c in enumerate(capas_xmp):
-                es_ult = (i == len(capas_xmp) - 1)
-                rama   = "└── " if es_ult else "├── "
-                on     = c.get("visible", True)
-                print(f"  {rama}{'🟢' if on else '⚫'} {c['name']}")
+    # Bboxes
+    bboxes = obtener_bboxes(pdf_path, tolerancia)
+    if not bboxes:
+        print("  Ningún OCG tiene elementos medibles.")
         return
 
-    print()
-    for i, capa in enumerate(capas):
-        _imprimir_capa(capa, "  ", es_ultimo=(i == len(capas) - 1))
+    # Estados de visibilidad
+    pdf          = Pdf.open(pdf_path)
+    estados_orig = _leer_estados_originales(pdf)
+    pdf.close()
+
+    # Jerarquía
+    padre = deducir_jerarquia(bboxes, tolerancia)
+    arbol = construir_arbol(padre)
+    raices = [n for n, p in padre.items() if p is None]
+
+    print(f"\n{'═' * 60}")
+    print(f"  Jerarquía por bbox: {pdf_path}")
+    print(f"  tolerancia={tolerancia}pt   OCGs con bbox={len(bboxes)}")
+    print(f"{'═' * 60}")
+
+    if not mostrar_bbox:
+        bboxes_param = {k: None for k in bboxes}
+    else:
+        bboxes_param = bboxes
+
+    for i, raiz in enumerate(sorted(raices)):
+        _imprimir_nodo(raiz, arbol, bboxes_param, estados_orig,
+                       "  ", es_ultimo=(i == len(raices) - 1))
+
+    # OCGs sin bbox (sin elementos)
+    pdf2  = Pdf.open(pdf_path)
+    ogmap = _ocg_objgen_a_nombre(pdf2)
+    pdf2.close()
+    sin_bbox = [n for n in ogmap.values() if n not in bboxes]
+    if sin_bbox:
+        print(f"\n  ── Sin elementos medibles ({'─'*30})")
+        for n in sin_bbox:
+            print(f"     • {n}")
+
     print()
 
 
@@ -424,11 +288,8 @@ def ver_arbol_illustrator(pdf_path: str):
 if __name__ == "__main__":
     PDF = "diseño.pdf"
 
-    # Árbol desde stream .ai (más completo, requiere editing capabilities)
-    ver_arbol_illustrator(PDF)
+    ver_arbol_por_bbox(PDF)
 
-    # Solo XMP
-    # leer_capas_xmp(PDF)
-
-    # Ver XMP crudo si nada funciona
-    # debug_xmp(PDF)
+    # Si hay OCGs hermanos que se solapan y aparecen como hijos,
+    # aumenta la tolerancia negativa para ser más estricto:
+    # ver_arbol_por_bbox(PDF, tolerancia=-5.0)
