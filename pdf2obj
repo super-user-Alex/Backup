@@ -1,407 +1,96 @@
 """
-ocg_transform.py
-================
-Aplica transformaciones affine independientes a OCGs de un PDF.
-
-FIX PRINCIPAL:
-  - Un único recorrido del stream procesa todos los OCGs a la vez.
-    Las pasadas múltiples hacían que la inyección de MC0 contaminara
-    la búsqueda de MC1/MC2, y el cm de MC0 se "filtraba" a los siguientes.
-
-Instalación:
-    pip install pikepdf numpy
+debug_ocg.py
+============
+Diagnóstico: muestra exactamente cómo están escritos los OCGs
+en el content stream de tu PDF.
 
 Uso:
-    from ocg_transform import PDFOCGTransformer
+    python debug_ocg.py tu_archivo.pdf
 
-    t = PDFOCGTransformer("entrada.pdf")
-    t.list_ocgs()                          # ver nombres exactos primero
-    t.translate("Capa1", tx=50, ty=-30)
-    t.rotate("Capa2", angle_deg=45, cx=100, cy=200)
-    t.scale("Capa3", sx=1.5, sy=1.5)
-    t.save("salida.pdf")
+Pega el output completo para que podamos ver el formato exacto.
 """
 
-import math
+import sys
 import re
-import numpy as np
 import pikepdf
-from pikepdf import Pdf, Array, Name, Dictionary
+from pikepdf import Pdf
 
 
-# ── Matrices affine ────────────────────────────────────────────────────────
+def debug_pdf(path: str):
+    pdf = Pdf.open(path)
 
-def mat_identity() -> np.ndarray:
-    return np.eye(3)
-
-def mat_translate(tx: float, ty: float) -> np.ndarray:
-    m = np.eye(3)
-    m[2, 0] = tx
-    m[2, 1] = ty
-    return m
-
-def mat_rotate(angle_deg: float, cx: float = 0.0, cy: float = 0.0) -> np.ndarray:
-    rad = math.radians(angle_deg)
-    cos_a, sin_a = math.cos(rad), math.sin(rad)
-    r = np.array([[cos_a, sin_a, 0],
-                  [-sin_a, cos_a, 0],
-                  [0,      0,     1]])
-    return mat_translate(-cx, -cy) @ r @ mat_translate(cx, cy)
-
-def mat_scale(sx: float, sy: float, cx: float = 0.0, cy: float = 0.0) -> np.ndarray:
-    s = np.array([[sx, 0, 0],
-                  [0, sy, 0],
-                  [0,  0, 1]])
-    return mat_translate(-cx, -cy) @ s @ mat_translate(cx, cy)
-
-def mat_to_cm(m: np.ndarray) -> str:
-    """Matriz 3×3 numpy → 6 operandos del operador PDF 'cm'."""
-    # PDF cm: a b c d e f  donde:
-    #   a=m[0,0]  b=m[0,1]  c=m[1,0]  d=m[1,1]  e=m[2,0]  f=m[2,1]
-    return (f"{m[0,0]:.6f} {m[0,1]:.6f} "
-            f"{m[1,0]:.6f} {m[1,1]:.6f} "
-            f"{m[2,0]:.6f} {m[2,1]:.6f} cm")
-
-
-# ── Streams ────────────────────────────────────────────────────────────────
-
-def _read_stream(page: pikepdf.Page) -> bytes:
-    """Lee y concatena el/los content stream(s) de la página."""
-    contents = page.obj.get("/Contents")
-    if contents is None:
-        return b""
-    if isinstance(contents, pikepdf.Array):
-        return b" ".join(item.read_bytes() for item in contents)
-    return contents.read_bytes()
-
-def _write_stream(pdf: Pdf, page: pikepdf.Page, data: bytes):
-    """Reemplaza el content de la página con un único stream nuevo."""
-    page.obj["/Contents"] = pdf.make_stream(data)
-
-
-# ── Mapeo recurso ↔ nombre OCG ────────────────────────────────────────────
-
-def _page_resource_map(page: pikepdf.Page) -> dict:
-    """
-    Devuelve {clave_recurso_bytes: nombre_ocg_str} para la página.
-    Ejemplo: {b"Mc0": "Capa1", b"Mc1": "Capa2"}
-    La clave de recurso es lo que aparece en el stream: /OC /Mc0 BDC
-    """
-    mapping = {}
+    # ── 1. OCGs declarados ───────────────────────────────────────────────
+    print("=" * 60)
+    print("1. OCGs en /OCProperties")
+    print("=" * 60)
     try:
-        props = page.obj["/Resources"]["/Properties"]
-        for key, ref in props.items():
-            name_val = ref.get("/Name")
-            if name_val is not None:
-                clean = str(key).lstrip("/").encode()
-                mapping[clean] = str(name_val)
-    except (KeyError, AttributeError):
-        pass
-    return mapping
+        for ref in pdf.Root["/OCProperties"]["/OCGs"]:
+            print(f"   Name={ref.get('/Name')!r}  ref={ref.objgen}")
+    except Exception as e:
+        print(f"   ERROR: {e}")
 
-
-# ── Tokenizador de content stream ─────────────────────────────────────────
-
-# Cubre los casos relevantes de la gramática PDF (ISO 32000)
-_TOKEN_RE = re.compile(
-    rb'\((?:[^\\()]|\\.)*\)'   # string literal ( ... )
-    rb'|<[0-9A-Fa-f\s]*>'     # string hex < ... >
-    rb'|<<|>>'                 # delimitadores de diccionario
-    rb'|/[^\s\x00\(\)<>\[\]{}/%]+'   # nombre PDF  /Foo
-    rb'|[+\-]?(?:\d+\.?\d*|\.\d+)'  # número
-    rb'|[^\s\x00\(\)<>\[\]{}/%]+'   # operador u otro token
-    rb'|\s+'                   # espacios / saltos de línea
-    ,
-    re.DOTALL,
-)
-
-def _tokenize(data: bytes) -> list:
-    return [m.group() for m in _TOKEN_RE.finditer(data)]
-
-
-# ── Inyección en único recorrido ───────────────────────────────────────────
-
-def _inject_all(data: bytes, rkey_to_cm: dict) -> bytes:
-    """
-    Recorre el stream UNA SOLA VEZ.
-
-    rkey_to_cm: {resource_key_bytes: cm_string}
-        Ejemplo: {b"Mc0": "1 0 0 1 50 30 cm", b"Mc1": "0.866 0.5 ... cm"}
-
-    Por cada coincidencia de /OC /<key> BDC donde key está en rkey_to_cm:
-        /OC /key BDC          ← original
-        q                     ← guardar estado gráfico
-        <cm_str>              ← aplicar transformación
-        ... contenido ...     ← intacto
-        Q                     ← restaurar estado (AÍSLA esta capa)
-        EMC                   ← original
-
-    El q/Q garantiza que la transformación de cada OCG NO afecta a los demás.
-    """
-    tokens = _tokenize(data)
-    n = len(tokens)
-    out = []
-    i = 0
-
-    while i < n:
-        tok = tokens[i].strip()
-
-        # Buscar secuencia: /OC  /KEY  BDC
-        if tok == b"/OC":
-            # saltar espacios hasta la clave de recurso
-            j = i + 1
-            while j < n and not tokens[j].strip():
-                j += 1
-            rk_tok = tokens[j].strip() if j < n else b""  # ej. b"/Mc1"
-
-            # saltar espacios hasta el operador BDC
-            k = j + 1
-            while k < n and not tokens[k].strip():
-                k += 1
-            bdc_tok = tokens[k].strip() if k < n else b""
-
-            # La clave en el dict NO lleva slash; rk_tok sí lo lleva
-            rk_name = rk_tok.lstrip(b"/")
-
-            if bdc_tok == b"BDC" and rk_name in rkey_to_cm:
-                cm_str = rkey_to_cm[rk_name]
-
-                # Emitir: /OC /key BDC  +  q  +  cm
-                out.extend(tokens[i : k + 1])
-                out.append(b"\nq\n")
-                out.append(cm_str.encode())
-                out.append(b"\n")
-                i = k + 1
-
-                # ── Recorrer hasta el EMC correspondiente ──────────────
-                # depth empieza en 1 (el BDC que acabamos de emitir).
-                # Cualquier BDC/BMC anidado incrementa; su EMC decrementa.
-                # Cuando depth==0 hemos llegado al EMC de ESTE OCG.
-                depth = 1
-                while i < n:
-                    t = tokens[i].strip()
-
-                    if t in (b"BDC", b"BMC"):
-                        depth += 1
-                        out.append(tokens[i])
-                        i += 1
-
-                    elif t == b"EMC":
-                        depth -= 1
-                        if depth == 0:
-                            # Cerrar: Q  EMC
-                            out.append(b"\nQ\n")
-                            out.append(tokens[i])   # EMC
-                            i += 1
-                            break
-                        else:
-                            # EMC de un BDC anidado, no del nuestro
-                            out.append(tokens[i])
-                            i += 1
-
-                    else:
-                        out.append(tokens[i])
-                        i += 1
-
-                # Si depth > 0 aquí, el stream estaba malformado; continuar de todos modos
-                continue
-
-        # Token normal: copiar tal cual
-        out.append(tokens[i])
-        i += 1
-
-    return b"".join(out)
-
-
-# ── Clase principal ────────────────────────────────────────────────────────
-
-class PDFOCGTransformer:
-    """
-    Aplica transformaciones affine independientes a OCGs de un PDF.
-
-    Cada OCG se transforma de forma completamente independiente:
-    el q/Q envuelve SÓLO el bloque de ese OCG, aislando su CTM.
-
-    Ejemplo:
-        t = PDFOCGTransformer("plano.pdf")
-        t.list_ocgs()
-        t.translate("Capa1", tx=100, ty=0)
-        t.rotate("Capa2", angle_deg=15, cx=297, cy=420)
-        t.scale("Capa3", sx=0.5, sy=0.5, cx=150, cy=300)
-        t.save("plano_modificado.pdf")
-    """
-
-    def __init__(self, path: str):
-        self.pdf = Pdf.open(path)
-        self._transforms: dict[str, np.ndarray] = {}  # nombre_OCG → matriz 3×3
-
-    # ── Inspección ────────────────────────────────────────────────────────
-
-    def list_ocgs(self):
-        """
-        Muestra los OCGs del PDF.
-        IMPORTANTE: usa el nombre exacto que aparece en 'Recurso → OCG'
-        al llamar a translate/rotate/scale.
-        """
-        print("\n=== OCGs en /OCProperties ===")
+    # ── 2. Recursos por página ───────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print("2. /Resources/Properties por página")
+    print("=" * 60)
+    for pnum, page in enumerate(pdf.pages):
         try:
-            for ref in self.pdf.Root["/OCProperties"]["/OCGs"]:
-                name = str(ref.get("/Name", "(sin nombre)"))
-                mark = "★" if name in self._transforms else " "
-                print(f"  [{mark}] '{name}'")
+            props = page.obj["/Resources"]["/Properties"]
+            print(f"  Página {pnum+1}:")
+            for key, ref in props.items():
+                name = ref.get("/Name")
+                print(f"    clave='{key}'  Name={name!r}  ref={ref.objgen}")
         except (KeyError, AttributeError):
-            print("  No se encontró /OCProperties.")
+            print(f"  Página {pnum+1}: sin /Properties")
 
-        print("\n=== Recursos por página (clave → nombre OCG) ===")
-        for i, page in enumerate(self.pdf.pages):
-            rmap = _page_resource_map(page)
-            if rmap:
-                for rk, oname in rmap.items():
-                    print(f"  Pág {i+1}: '{rk.decode()}' → '{oname}'")
-        print()
+    # ── 3. Content stream bruto (primeros 4000 bytes) ────────────────────
+    print()
+    print("=" * 60)
+    print("3. Content stream BRUTO (primeros 4000 bytes de cada página)")
+    print("=" * 60)
+    for pnum, page in enumerate(pdf.pages):
+        contents = page.obj.get("/Contents")
+        if contents is None:
+            print(f"  Página {pnum+1}: sin /Contents")
+            continue
 
-    # ── Transformaciones ──────────────────────────────────────────────────
-
-    def _acc(self, name: str, m: np.ndarray):
-        """Acumula (multiplica) una nueva matriz sobre la existente para este OCG."""
-        prev = self._transforms.get(name, mat_identity())
-        self._transforms[name] = prev @ m
-
-    def translate(self, ocg_name: str, tx: float, ty: float):
-        """Traslación en puntos PDF (1 pt = 1/72 in)."""
-        self._acc(ocg_name, mat_translate(tx, ty))
-        print(f"[translate] '{ocg_name}'  tx={tx}  ty={ty}")
-
-    def rotate(self, ocg_name: str, angle_deg: float,
-               cx: float = 0.0, cy: float = 0.0):
-        """Rotación antihoraria en grados alrededor del punto (cx, cy)."""
-        self._acc(ocg_name, mat_rotate(angle_deg, cx, cy))
-        print(f"[rotate]    '{ocg_name}'  {angle_deg}°  centro=({cx},{cy})")
-
-    def scale(self, ocg_name: str, sx: float, sy: float,
-              cx: float = 0.0, cy: float = 0.0):
-        """Escala con centro en (cx, cy). sx=sy=1 es identidad."""
-        self._acc(ocg_name, mat_scale(sx, sy, cx, cy))
-        print(f"[scale]     '{ocg_name}'  sx={sx}  sy={sy}  centro=({cx},{cy})")
-
-    def set_matrix(self, ocg_name: str, matrix: np.ndarray):
-        """Fija directamente la matriz affine 3×3 para un OCG."""
-        assert matrix.shape == (3, 3), "Se requiere matriz 3×3"
-        self._transforms[ocg_name] = matrix.copy()
-        print(f"[set_matrix] '{ocg_name}'")
-
-    # ── Guardar ───────────────────────────────────────────────────────────
-
-    def save(self, output_path: str):
-        """
-        Aplica todas las transformaciones y guarda el PDF.
-
-        Una sola pasada por página procesa todos los OCGs simultáneamente,
-        garantizando independencia total entre capas.
-        """
-        if not self._transforms:
-            print("⚠  Sin transformaciones. Llama a translate/rotate/scale primero.")
-
-        changed = 0
-        for page_num, page in enumerate(self.pdf.pages):
-            rmap = _page_resource_map(page)  # {b"Mc0": "Capa1", ...}
-
-            # Construir {clave_bytes: cm_string} para esta página
-            rkey_to_cm: dict[bytes, str] = {}
-            for ocg_name, mat in self._transforms.items():
-                for rk_bytes, oname in rmap.items():
-                    if oname == ocg_name:
-                        rkey_to_cm[rk_bytes] = mat_to_cm(mat)
-
-            if not rkey_to_cm:
-                continue  # ningún OCG de interés en esta página
-
-            raw = _read_stream(page)
-            modified = _inject_all(raw, rkey_to_cm)
-
-            if modified != raw:
-                _write_stream(self.pdf, page, modified)
-                changed += 1
-                print(f"  Página {page_num + 1}: modificada "
-                      f"({', '.join(k.decode() for k in rkey_to_cm)})")
-
-        if changed == 0:
-            print("⚠  No se modificó ninguna página.")
-            print("   Ejecuta list_ocgs() y verifica que los nombres coincidan exactamente.")
+        if isinstance(contents, pikepdf.Array):
+            raw = b" ".join(item.read_bytes() for item in contents)
         else:
-            self.pdf.save(output_path)
-            print(f"\n✅  Guardado en: {output_path}")
+            raw = contents.read_bytes()
 
+        print(f"\n--- Página {pnum+1} ({len(raw)} bytes) ---")
+        print(raw[:4000].decode("latin-1", errors="replace"))
 
-# ── Demo standalone ───────────────────────────────────────────────────────
+    # ── 4. Extraer todas las líneas con BDC / EMC ────────────────────────
+    print()
+    print("=" * 60)
+    print("4. Líneas que contienen BDC o EMC")
+    print("=" * 60)
+    for pnum, page in enumerate(pdf.pages):
+        contents = page.obj.get("/Contents")
+        if contents is None:
+            continue
+        if isinstance(contents, pikepdf.Array):
+            raw = b" ".join(item.read_bytes() for item in contents)
+        else:
+            raw = contents.read_bytes()
+
+        lines = raw.decode("latin-1", errors="replace").splitlines()
+        print(f"\n  Página {pnum+1}:")
+        for i, line in enumerate(lines):
+            if "BDC" in line or "EMC" in line or "BMC" in line:
+                print(f"    L{i+1:4d}: {line!r}")
+
+    print()
+    print("=" * 60)
+    print("FIN DEL DIAGNÓSTICO — pega todo el output")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) >= 2:
-        inp = sys.argv[1]
-        out = sys.argv[2] if len(sys.argv) > 2 else "output.pdf"
-
-        t = PDFOCGTransformer(inp)
-        t.list_ocgs()   # ← ejecuta primero; copia los nombres exactos
-
-        # ── Edita aquí ───────────────────────────────────────────────
-        # t.translate("NombreExacto", tx=100,  ty=-50)
-        # t.rotate("OtraCapa",   angle_deg=30, cx=297.5, cy=421)
-        # t.scale("TerceraCapa", sx=1.5, sy=1.5, cx=0, cy=0)
-        # ─────────────────────────────────────────────────────────────
-
-        t.save(out)
-
-    else:
-        # Demo: crea PDF con 3 OCGs independientes y los transforma
-        print("Generando demo con 3 OCGs independientes...")
-        pdf = Pdf.new()
-
-        ocg1 = pdf.make_indirect(Dictionary(Type=Name("/OCG"), Name="Capa1"))
-        ocg2 = pdf.make_indirect(Dictionary(Type=Name("/OCG"), Name="Capa2"))
-        ocg3 = pdf.make_indirect(Dictionary(Type=Name("/OCG"), Name="Capa3"))
-
-        pdf.Root["/OCProperties"] = Dictionary(
-            OCGs=Array([ocg1, ocg2, ocg3]),
-            D=Dictionary(Order=Array([ocg1, ocg2, ocg3])),
-        )
-
-        # Tres OCGs al nivel raíz, sin anidamiento
-        content = (
-            b"/OC /Mc0 BDC\n"
-            b"  1 0 0 RG 2 w\n"
-            b"  50 50 m 150 50 l 150 150 l 50 150 l h S\n"   # cuadrado rojo
-            b"EMC\n"
-            b"/OC /Mc1 BDC\n"
-            b"  0 0.8 0 RG 2 w\n"
-            b"  200 200 m 300 200 l 300 300 l 200 300 l h S\n" # cuadrado verde
-            b"EMC\n"
-            b"/OC /Mc2 BDC\n"
-            b"  0 0 1 RG 2 w\n"
-            b"  400 400 m 500 400 l 500 500 l 400 500 l h S\n" # cuadrado azul
-            b"EMC\n"
-        )
-
-        page_obj = Dictionary(
-            Type=Name("/Page"),
-            MediaBox=Array([0, 0, 595, 842]),
-            Contents=pdf.make_stream(content),
-            Resources=Dictionary(
-                Properties=Dictionary(Mc0=ocg1, Mc1=ocg2, Mc2=ocg3)
-            ),
-        )
-        pdf.pages.append(pikepdf.Page(page_obj))
-        pdf.save("demo_in.pdf")
-        print("Creado: demo_in.pdf")
-
-        t = PDFOCGTransformer("demo_in.pdf")
-        t.list_ocgs()
-
-        # Cada capa se mueve de forma completamente independiente
-        t.translate("Capa1", tx=100, ty=50)        # mover cuadrado rojo
-        t.rotate("Capa2", angle_deg=30, cx=250, cy=250)  # rotar cuadrado verde
-        t.scale("Capa3", sx=0.5, sy=0.5, cx=450, cy=450) # escalar cuadrado azul
-
-        t.save("demo_out.pdf")
-        print("Creado: demo_out.pdf  — verifica que cada capa se movió independientemente")
+    if len(sys.argv) < 2:
+        print("Uso: python debug_ocg.py tu_archivo.pdf")
+        sys.exit(1)
+    debug_pdf(sys.argv[1])
