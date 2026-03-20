@@ -1,264 +1,743 @@
 """
-ocg_transform.py
-================
-Mueve paths de OCGs en un PDF usando matrices affine.
-Cada OCG se transforma de forma completamente independiente.
+PDF Vector–Raster Pipeline
+===========================
+Combina análisis del content stream con pikepdf, rasterización con PyMuPDF,
+binarización/dilatación con NumPy y detección de contornos con OpenCV para
+relacionar cada elemento vectorial con el contorno rasterizado al que pertenece.
 
-Instalación:
-    pip install pikepdf numpy
-
-Uso:
-    from ocg_transform import PDFOCGTransformer
-
-    t = PDFOCGTransformer("entrada.pdf")
-    t.list_ocgs()                          # ver nombres exactos primero
-    t.translate("publish",  tx=1000, ty=-50)
-    t.translate("decorate", tx=-200, ty=-80)
-    t.save("salida.pdf")
+Requisitos:
+    pip install pikepdf pymupdf numpy opencv-python pandas matplotlib
 """
 
+from __future__ import annotations
+
 import math
-import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import cv2
+import fitz  # PyMuPDF
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pikepdf
-from pikepdf import Pdf, Array, Name, Dictionary
+from pikepdf import Array, Name, Object, Pdf
 
 
-# ── Matrices affine ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. TIPOS Y ESTRUCTURAS DE DATOS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def mat_identity():
-    return np.eye(3)
-
-def mat_translate(tx, ty):
-    m = np.eye(3)
-    m[2, 0] = tx
-    m[2, 1] = ty
-    return m
-
-def mat_rotate(angle_deg, cx=0.0, cy=0.0):
-    a = math.radians(angle_deg)
-    c, s = math.cos(a), math.sin(a)
-    R = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
-    return mat_translate(-cx, -cy) @ R @ mat_translate(cx, cy)
-
-def mat_scale(sx, sy, cx=0.0, cy=0.0):
-    S = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]])
-    return mat_translate(-cx, -cy) @ S @ mat_translate(cx, cy)
-
-def mat_to_cm(m):
-    # PDF 'cm' operandos: a b c d e f
-    # a=m[0,0] b=m[0,1] c=m[1,0] d=m[1,1] e=m[2,0] f=m[2,1]
-    return (f"{m[0,0]:.6f} {m[0,1]:.6f} "
-            f"{m[1,0]:.6f} {m[1,1]:.6f} "
-            f"{m[2,0]:.6f} {m[2,1]:.6f} cm")
+@dataclass
+class VectorElement:
+    """Representa un elemento extraído del content stream del PDF."""
+    stream_index: int          # Índice del content stream donde se encontró
+    element_type: str          # "path", "xobject", "image"
+    pdf_x: float               # Coordenada X en espacio PDF (bottom-left origin)
+    pdf_y: float               # Coordenada Y en espacio PDF (bottom-left origin)
+    resource_name: str = ""    # Nombre del recurso (XObject, imagen, etc.)
+    ocg_name: str = ""         # Nombre del OCG/capa si está disponible
+    extra: dict = field(default_factory=dict)  # Información adicional
 
 
-# ── Leer/escribir stream ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. UTILIDADES DE TRANSFORMACIÓN DE MATRICES
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _read_stream(page):
-    c = page.obj.get("/Contents")
-    if c is None:
-        return b""
-    if isinstance(c, pikepdf.Array):
-        return b"\n".join(item.read_bytes() for item in c)
-    return c.read_bytes()
-
-def _write_stream(pdf, page, data):
-    page.obj["/Contents"] = pdf.make_stream(data)
+def identity_matrix() -> list[float]:
+    """Matriz identidad 3x3 en formato [a,b,c,d,e,f] (columnas)."""
+    return [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 
 
-# ── Mapeo recursos ─────────────────────────────────────────────────────────
+def multiply_matrix(m1: list[float], m2: list[float]) -> list[float]:
+    """Multiplica dos matrices de transformación PDF [a,b,c,d,e,f]."""
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return [
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    ]
 
-def _get_resource_map(page):
+
+def apply_matrix(m: list[float], x: float, y: float) -> tuple[float, float]:
+    """Aplica una matriz de transformación a un punto (x, y)."""
+    a, b, c, d, e, f = m
+    return (a * x + c * y + e, b * x + d * y + f)
+
+
+def pdf_to_image_coords(
+    pdf_x: float,
+    pdf_y: float,
+    page_height: float,
+    scale: float,
+) -> tuple[float, float]:
     """
-    Devuelve {nombre_ocg: resource_key} para la página.
-    Ejemplo: {"publish": "MC0", "decorate": "MC1"}
+    Convierte coordenadas PDF (origen bottom-left, Y hacia arriba)
+    a coordenadas de imagen (origen top-left, Y hacia abajo).
+
+    Args:
+        pdf_x, pdf_y : punto en espacio PDF
+        page_height  : altura de la página en puntos PDF
+        scale        : factor DPI/72
     """
-    result = {}
+    img_x = pdf_x * scale
+    img_y = (page_height - pdf_y) * scale
+    return img_x, img_y
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. ANÁLISIS VECTORIAL CON PIKEPDF
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Operadores de trazado de path que marcan el comienzo de una subpath
+PATH_START_OPS = {"m", "re"}
+
+# Operadores de segmento de path (continúan el path actual)
+PATH_SEGMENT_OPS = {"l", "c", "v", "y", "h"}
+
+# Operadores de pintado (terminan/pintan el path actual)
+PATH_PAINT_OPS = {"S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"}
+
+
+def _resolve_float(op: Any) -> float:
+    """Convierte un operando pikepdf a float."""
     try:
-        props = page.obj["/Resources"]["/Properties"]
-        for key, ref in props.items():
-            name_val = ref.get("/Name")
-            if name_val is not None:
-                # key es "/MC0" o "MC0" dependiendo de pikepdf; normalizamos
-                rk = str(key).lstrip("/")
-                result[str(name_val)] = rk
-    except (KeyError, AttributeError):
+        return float(op)
+    except Exception:
+        return 0.0
+
+
+def _get_ocg_name(props: dict | None) -> str:
+    """Extrae el nombre del OCG a partir del diccionario de propiedades de un BDC."""
+    if props is None:
+        return ""
+    try:
+        if "/OC" in props:
+            oc = props["/OC"]
+            if hasattr(oc, "get"):
+                name = oc.get("/Name", "")
+                if name:
+                    return str(name)
+    except Exception:
         pass
-    return result
+    return ""
 
 
-# ── Inyección de transformaciones ──────────────────────────────────────────
-
-def _find_matching_emc(text, pos):
+def extract_vector_elements(pdf_path: str) -> list[VectorElement]:
     """
-    Dado un texto y la posición justo DESPUÉS de un BDC,
-    devuelve la posición del inicio del EMC correspondiente,
-    respetando el anidamiento de BDC/BMC/EMC.
-    Devuelve -1 si no se encuentra.
+    Recorre el content stream de la primera página del PDF con pikepdf
+    y extrae todos los elementos vectoriales (paths, XObjects, imágenes)
+    con sus coordenadas PDF y metadatos.
+
+    Args:
+        pdf_path: Ruta al archivo PDF.
+
+    Returns:
+        Lista de VectorElement.
     """
-    depth = 1
-    # Buscar tokens BDC, BMC, EMC como palabras completas (rodeadas de espacio/salto)
-    pattern = re.compile(r'(?<!\w)(BDC|BMC|EMC)(?!\w)')
-    for m in pattern.finditer(text, pos):
-        tok = m.group(1)
-        if tok in ("BDC", "BMC"):
-            depth += 1
-        elif tok == "EMC":
-            depth -= 1
-            if depth == 0:
-                return m.start()
-    return -1
+    elements: list[VectorElement] = []
 
+    with Pdf.open(pdf_path) as pdf:
+        page = pdf.pages[0]
+        page_resources = page.get("/Resources", pikepdf.Dictionary())
 
-def _inject_transforms(stream_bytes, ocg_name_to_cm):
-    """
-    Parámetro ocg_name_to_cm: {resource_key: cm_string}
-    Ejemplo: {"MC0": "1 0 0 1 100 50 cm", "MC1": "1 0 0 1 -200 -80 cm"}
+        # ── Estado gráfico ──────────────────────────────────────────────────
+        # Pila de estados: cada entrada es (CTM, OCG_name)
+        ctm_stack: list[tuple[list[float], str]] = [(identity_matrix(), "")]
+        current_ctm = identity_matrix()
+        current_ocg = ""
 
-    Por cada OCG encontrado, envuelve su bloque con q/Q:
-        /OC /KEY BDC        (original)
-        q                   (guardar estado - AÍSLA este OCG)
-        <cm_string>         (transformación)
-        ...contenido...     (intacto)
-        Q                   (restaurar estado)
-        EMC                 (original)
+        # Posición actual del cursor dentro del path
+        current_x: float = 0.0
+        current_y: float = 0.0
 
-    Se procesan todos los OCGs en una sola pasada sobre el texto original,
-    construyendo el resultado de izquierda a derecha sin retokenizar.
-    """
-    text = stream_bytes.decode("latin-1")
-    
-    # Encontrar todos los BDC de los OCGs que nos interesan, en orden de aparición
-    # Patrón: /OC  <espacios>  /KEY  <espacios>  BDC
-    segments = []  # lista de (start_bdc, end_bdc, start_emc, end_emc, cm_str)
+        # Punto inicial del subpath activo (para registrar coordenadas)
+        subpath_start_x: float = 0.0
+        subpath_start_y: float = 0.0
+        in_path = False            # Estamos construyendo un path activo?
+        pending_path_start: tuple[float, float] | None = None  # (x, y) del primer "m"
 
-    for rkey, cm_str in ocg_name_to_cm.items():
-        pattern = re.compile(
-            r'/OC\s+/' + re.escape(rkey) + r'\s+BDC'
-        )
-        for m in pattern.finditer(text):
-            emc_start = _find_matching_emc(text, m.end())
-            if emc_start == -1:
-                print(f"  ADVERTENCIA: no se encontró EMC para '{rkey}'")
-                continue
-            emc_end = emc_start + len("EMC")
-            segments.append((m.start(), m.end(), emc_start, emc_end, cm_str))
+        # Índice de la instrucción en el stream
+        stream_idx: int = 0
 
-    if not segments:
-        return stream_bytes  # nada que hacer
+        # ── Obtener streams ─────────────────────────────────────────────────
+        # Una página puede tener un único stream o un array de streams
+        raw_contents = page.get("/Contents")
+        if raw_contents is None:
+            return elements
 
-    # Ordenar por posición de aparición en el stream
-    segments.sort(key=lambda x: x[0])
-
-    # Construir resultado intercalando q/cm y Q en los lugares correctos
-    out = []
-    cursor = 0
-
-    for bdc_start, bdc_end, emc_start, emc_end, cm_str in segments:
-        # Texto antes del BDC (sin modificar)
-        out.append(text[cursor:bdc_end])
-        # Insertar q + cm DESPUÉS del BDC
-        out.append(f"\nq\n{cm_str}\n")
-        # Contenido del bloque (entre BDC y EMC)
-        out.append(text[bdc_end:emc_start])
-        # Insertar Q ANTES del EMC
-        out.append("Q\n")
-        # EMC original
-        out.append(text[emc_start:emc_end])
-        cursor = emc_end
-
-    # Resto del stream
-    out.append(text[cursor:])
-
-    return "".join(out).encode("latin-1")
-
-
-# ── Clase principal ────────────────────────────────────────────────────────
-
-class PDFOCGTransformer:
-
-    def __init__(self, path):
-        self.pdf = Pdf.open(path)
-        self._transforms = {}  # nombre_OCG → np.ndarray 3×3
-
-    # ── Inspección ────────────────────────────────────────────────────────
-
-    def list_ocgs(self):
-        print("\n=== OCGs del PDF ===")
-        try:
-            for ref in self.pdf.Root["/OCProperties"]["/OCGs"]:
-                name = str(ref.get("/Name", "(sin nombre)"))
-                mark = "★" if name in self._transforms else " "
-                print(f"  [{mark}] '{name}'")
-        except (KeyError, AttributeError):
-            print("  No se encontró /OCProperties.")
-
-        print("\n=== Recursos por página (nombre OCG → resource_key) ===")
-        for i, page in enumerate(self.pdf.pages):
-            rmap = _get_resource_map(page)
-            for oname, rk in rmap.items():
-                print(f"  Pág {i+1}:  '{oname}'  →  '{rk}'")
-        print()
-
-    # ── Transformaciones ──────────────────────────────────────────────────
-
-    def _acc(self, name, m):
-        prev = self._transforms.get(name, mat_identity())
-        self._transforms[name] = prev @ m
-
-    def translate(self, ocg_name, tx, ty):
-        self._acc(ocg_name, mat_translate(tx, ty))
-        print(f"[translate] '{ocg_name}'  tx={tx}  ty={ty}")
-
-    def rotate(self, ocg_name, angle_deg, cx=0.0, cy=0.0):
-        self._acc(ocg_name, mat_rotate(angle_deg, cx, cy))
-        print(f"[rotate]    '{ocg_name}'  {angle_deg}°  cx={cx} cy={cy}")
-
-    def scale(self, ocg_name, sx, sy, cx=0.0, cy=0.0):
-        self._acc(ocg_name, mat_scale(sx, sy, cx, cy))
-        print(f"[scale]     '{ocg_name}'  sx={sx} sy={sy}  cx={cx} cy={cy}")
-
-    def set_matrix(self, ocg_name, matrix):
-        assert np.array(matrix).shape == (3, 3)
-        self._transforms[ocg_name] = np.array(matrix, dtype=float)
-        print(f"[set_matrix] '{ocg_name}'")
-
-    # ── Guardar ───────────────────────────────────────────────────────────
-
-    def save(self, output_path):
-        if not self._transforms:
-            print("⚠  Sin transformaciones. Llama a translate/rotate/scale primero.")
-            return
-
-        changed = 0
-        for page_num, page in enumerate(self.pdf.pages):
-            # Invertir mapa: nombre_ocg → resource_key, para esta página
-            rmap = _get_resource_map(page)  # {nombre: rkey}
-
-            # Construir {resource_key: cm_string} solo para los OCGs con transform
-            rkey_to_cm = {}
-            for ocg_name, mat in self._transforms.items():
-                rk = rmap.get(ocg_name)
-                if rk:
-                    rkey_to_cm[rk] = mat_to_cm(mat)
-                    print(f"  Pág {page_num+1}: '{ocg_name}' → key='{rk}'  cm='{rkey_to_cm[rk]}'")
-
-            if not rkey_to_cm:
-                continue
-
-            raw = _read_stream(page)
-            modified = _inject_transforms(raw, rkey_to_cm)
-
-            if modified != raw:
-                _write_stream(self.pdf, page, modified)
-                changed += 1
-                print(f"  Pág {page_num+1}: stream modificado ✓")
-            else:
-                print(f"  Pág {page_num+1}: ⚠ stream sin cambios (verificar nombres)")
-
-        if changed == 0:
-            print("\n⚠  No se modificó ninguna página.")
+        if isinstance(raw_contents, pikepdf.Array):
+            content_streams = [pdf.get_object(ref) for ref in raw_contents]
         else:
-            self.pdf.save(output_path)
-            print(f"\n✅  Guardado en: {output_path}")
+            content_streams = [pdf.get_object(raw_contents)]
+
+        # Concatenamos los bytes de todos los streams para parsear como uno solo
+        combined_bytes = b""
+        for cs in content_streams:
+            combined_bytes += bytes(cs.read_raw_bytes() if hasattr(cs, "read_raw_bytes") else cs.read_bytes())
+
+        # ── Parsear instrucciones ───────────────────────────────────────────
+        instructions = pikepdf.parse_content_stream(combined_bytes)
+
+        for stream_idx, (operands, operator) in enumerate(instructions):
+            op = str(operator)
+
+            # ── Gestión del estado gráfico ──────────────────────────────────
+            if op == "q":
+                ctm_stack.append((list(current_ctm), current_ocg))
+
+            elif op == "Q":
+                if ctm_stack:
+                    current_ctm, current_ocg = ctm_stack.pop()
+
+            elif op == "cm":
+                # Concatenar nueva matriz al CTM actual
+                if len(operands) == 6:
+                    new_m = [_resolve_float(o) for o in operands]
+                    current_ctm = multiply_matrix(current_ctm, new_m)
+
+            # ── Marcadores de contenido opcional (OCG) ──────────────────────
+            elif op in ("BDC", "BMC"):
+                # BDC: tag + properties_dict
+                if op == "BDC" and len(operands) >= 2:
+                    tag = str(operands[0])
+                    if tag == "/OC":
+                        prop_ref = operands[1]
+                        try:
+                            # Puede ser un nombre de recurso o un dict inline
+                            if isinstance(prop_ref, Name):
+                                props_key = str(prop_ref)
+                                props_obj = page_resources.get("/Properties", pikepdf.Dictionary())
+                                if props_key.lstrip("/") in [str(k).lstrip("/") for k in props_obj.keys()]:
+                                    oc_obj = props_obj[props_key]
+                                    current_ocg = str(oc_obj.get("/Name", ""))
+                                else:
+                                    current_ocg = props_key
+                            elif hasattr(prop_ref, "get"):
+                                current_ocg = str(prop_ref.get("/Name", ""))
+                        except Exception:
+                            current_ocg = ""
+                elif op == "BMC" and len(operands) >= 1:
+                    current_ocg = str(operands[0])
+
+            elif op == "EMC":
+                current_ocg = ""
+
+            # ── Operadores de construcción de path ─────────────────────────
+            elif op == "m":
+                # moveto: inicia un nuevo subpath
+                if len(operands) >= 2:
+                    x = _resolve_float(operands[0])
+                    y = _resolve_float(operands[1])
+                    tx, ty = apply_matrix(current_ctm, x, y)
+                    current_x, current_y = tx, ty
+                    subpath_start_x, subpath_start_y = tx, ty
+                    if not in_path:
+                        pending_path_start = (tx, ty)
+                    in_path = True
+
+            elif op == "re":
+                # rectangle: m + 3×l + h implícito
+                if len(operands) >= 4:
+                    x = _resolve_float(operands[0])
+                    y = _resolve_float(operands[1])
+                    tx, ty = apply_matrix(current_ctm, x, y)
+                    current_x, current_y = tx, ty
+                    subpath_start_x, subpath_start_y = tx, ty
+                    if not in_path:
+                        pending_path_start = (tx, ty)
+                    in_path = True
+
+            elif op == "l":
+                if len(operands) >= 2:
+                    x = _resolve_float(operands[0])
+                    y = _resolve_float(operands[1])
+                    tx, ty = apply_matrix(current_ctm, x, y)
+                    current_x, current_y = tx, ty
+
+            elif op in ("c", "v", "y"):
+                # curva bezier (los últimos 2 operandos son el punto final)
+                if len(operands) >= 6:
+                    x = _resolve_float(operands[-2])
+                    y = _resolve_float(operands[-1])
+                    tx, ty = apply_matrix(current_ctm, x, y)
+                    current_x, current_y = tx, ty
+                elif len(operands) >= 4:
+                    x = _resolve_float(operands[-2])
+                    y = _resolve_float(operands[-1])
+                    tx, ty = apply_matrix(current_ctm, x, y)
+                    current_x, current_y = tx, ty
+
+            elif op == "h":
+                # closepath: regresa al inicio del subpath
+                current_x, current_y = subpath_start_x, subpath_start_y
+
+            # ── Operadores de pintado de path ───────────────────────────────
+            elif op in PATH_PAINT_OPS:
+                if in_path and pending_path_start is not None:
+                    px, py = pending_path_start
+                    elements.append(VectorElement(
+                        stream_index=stream_idx,
+                        element_type="path",
+                        pdf_x=px,
+                        pdf_y=py,
+                        ocg_name=current_ocg,
+                        extra={"paint_op": op},
+                    ))
+                in_path = False
+                pending_path_start = None
+
+            # ── XObjects e imágenes (operador Do) ───────────────────────────
+            elif op == "Do":
+                if len(operands) >= 1:
+                    res_name = str(operands[0])
+                    # Determinar si es Image o Form XObject
+                    xobj_type = "xobject"
+                    try:
+                        xobjects = page_resources.get("/XObject", pikepdf.Dictionary())
+                        key = res_name.lstrip("/")
+                        xobj = None
+                        for k in xobjects.keys():
+                            if str(k).lstrip("/") == key:
+                                xobj = xobjects[k]
+                                break
+                        if xobj is not None:
+                            subtype = str(xobj.get("/Subtype", ""))
+                            if subtype == "/Image":
+                                xobj_type = "image"
+                    except Exception:
+                        pass
+
+                    # Posición: origen de la transformación actual
+                    tx, ty = apply_matrix(current_ctm, 0.0, 0.0)
+                    elements.append(VectorElement(
+                        stream_index=stream_idx,
+                        element_type=xobj_type,
+                        pdf_x=tx,
+                        pdf_y=ty,
+                        resource_name=res_name,
+                        ocg_name=current_ocg,
+                        extra={"ctm": list(current_ctm)},
+                    ))
+
+    return elements
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. RASTERIZACIÓN CON PYMUPDF
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rasterize_pdf(pdf_path: str, dpi: int = 150) -> tuple[np.ndarray, float, float]:
+    """
+    Rasteriza la primera (y única) página del PDF con PyMuPDF.
+
+    Args:
+        pdf_path : Ruta al PDF.
+        dpi      : Resolución en puntos por pulgada.
+
+    Returns:
+        (image_array, page_width_pts, page_height_pts)
+        image_array: NumPy array RGB uint8, shape (H, W, 3)
+        page_width_pts, page_height_pts: dimensiones en puntos PDF.
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[0]
+
+    # Dimensiones originales en puntos PDF
+    rect = page.rect
+    page_width_pts = rect.width
+    page_height_pts = rect.height
+
+    scale = dpi / 72.0
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+
+    # Convertir a NumPy (RGB)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    doc.close()
+    return img.copy(), page_width_pts, page_height_pts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. PROCESAMIENTO RASTER CON NUMPY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def binarize_image(rgb_image: np.ndarray, dilation_kernel: int = 5) -> np.ndarray:
+    """
+    Convierte la imagen RGB a binaria (fondo=0, objeto=255).
+
+    Pasos:
+        1. Escala de grises
+        2. Binarización Otsu (asume fondo blanco)
+        3. Inversión para que los objetos sean 255
+        4. Dilatación con kernel NxN
+
+    Args:
+        rgb_image       : Array NumPy RGB uint8.
+        dilation_kernel : Tamaño del kernel cuadrado de dilatación.
+
+    Returns:
+        Imagen binaria uint8 con valores 0 y 255, shape (H, W).
+    """
+    # Escala de grises
+    gray = np.dot(rgb_image[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+
+    # Otsu threshold (vía OpenCV ya que NumPy puro no implementa Otsu)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Dilatación
+    kernel = np.ones((dilation_kernel, dilation_kernel), dtype=np.uint8)
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+
+    return dilated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. DETECCIÓN DE CONTORNOS CON OPENCV
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_contours(
+    binary_image: np.ndarray,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """
+    Detecta contornos exteriores en la imagen binaria.
+
+    Args:
+        binary_image: Imagen uint8 con valores 0/255, shape (H, W).
+
+    Returns:
+        (contours, hierarchy)
+        contours  : lista de arrays de contornos OpenCV
+        hierarchy : array de jerarquía shape (1, N, 4)
+    """
+    contours, hierarchy = cv2.findContours(
+        binary_image,
+        cv2.RETR_EXTERNAL,   # Solo contornos exteriores
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if hierarchy is None:
+        hierarchy = np.array([])
+    return list(contours), hierarchy
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. RELACIÓN VECTOR–RASTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_contour_label_map(
+    contours: list[np.ndarray],
+    image_shape: tuple[int, int],
+) -> np.ndarray:
+    """
+    Renderiza cada contorno relleno en una máscara de etiquetas.
+
+    Cada píxel tiene el valor (índice_contorno + 1); el valor 0 indica
+    que el píxel no pertenece a ningún contorno.  Usar índice+1 permite
+    distinguir "contorno 0" de "sin contorno".
+
+    Args:
+        contours    : Lista de contornos OpenCV.
+        image_shape : (alto, ancho) de la imagen rasterizada.
+
+    Returns:
+        Array int32 shape (H, W).
+    """
+    label_map = np.zeros(image_shape, dtype=np.int32)
+    for i, cnt in enumerate(contours):
+        cv2.drawContours(label_map, [cnt], -1, color=i + 1, thickness=cv2.FILLED)
+    return label_map
+
+
+def assign_elements_to_contours(
+    elements: list[VectorElement],
+    contours: list[np.ndarray],
+    page_height_pts: float,
+    scale: float,
+    image_shape: tuple[int, int],
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Para cada elemento vectorial, determina a qué contorno pertenece
+    mediante una consulta directa al mapa de etiquetas pre-renderizado.
+
+    Flujo:
+        1. Se pre-renderiza un mapa de etiquetas (una sola pasada sobre
+           los contornos).  Coste: O(área total de contornos).
+        2. Por cada elemento, se convierte su punto de inicio a
+           coordenadas de imagen y se consulta el valor del píxel.
+           Coste: O(1) por elemento.
+
+    Conversión de coordenadas:
+        img_x = pdf_x × scale
+        img_y = (page_height_pts − pdf_y) × scale
+
+    Args:
+        elements        : Lista de VectorElement extraídos del PDF.
+        contours        : Lista de contornos detectados por OpenCV.
+        page_height_pts : Altura de la página en puntos PDF.
+        scale           : Factor de escala DPI/72.
+        image_shape     : (alto, ancho) de la imagen rasterizada.
+
+    Returns:
+        (dataframe, label_map)
+        dataframe : DataFrame con columnas stream_index, contour_index,
+                    pdf_x, pdf_y, img_x, img_y, ocg, element_type.
+        label_map : Mapa de etiquetas int32 shape (H, W).
+    """
+    h, w = image_shape
+
+    # ── Pre-renderizar mapa de etiquetas (una sola vez) ──────────────────────
+    label_map = build_contour_label_map(contours, image_shape)
+
+    # ── Consulta O(1) por elemento ───────────────────────────────────────────
+    records = []
+    for elem in elements:
+        img_x, img_y = pdf_to_image_coords(
+            elem.pdf_x, elem.pdf_y, page_height_pts, scale
+        )
+
+        # Clamp para evitar accesos fuera de los límites de la imagen
+        px = int(round(img_x))
+        py = int(round(img_y))
+        px = max(0, min(px, w - 1))
+        py = max(0, min(py, h - 1))
+
+        # label_map[py, px] == 0  → sin contorno  (-1 en el DataFrame)
+        # label_map[py, px] == k  → contorno k-1
+        label_val = int(label_map[py, px])
+        assigned_contour = label_val - 1  # -1 si no pertenece a ninguno
+
+        records.append({
+            "stream_index":  elem.stream_index,
+            "contour_index": assigned_contour,
+            "pdf_x":         round(elem.pdf_x, 3),
+            "pdf_y":         round(elem.pdf_y, 3),
+            "img_x":         round(img_x, 2),
+            "img_y":         round(img_y, 2),
+            "ocg":           elem.ocg_name,
+            "element_type":  elem.element_type,
+        })
+
+    df = pd.DataFrame(records, columns=[
+        "stream_index", "contour_index",
+        "pdf_x", "pdf_y",
+        "img_x", "img_y",
+        "ocg", "element_type",
+    ])
+    return df, label_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. VISUALIZACIÓN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def visualize_results(
+    rgb_image: np.ndarray,
+    binary_image: np.ndarray,
+    contours: list[np.ndarray],
+    df: pd.DataFrame,
+    output_path: str | None = None,
+) -> None:
+    """
+    Genera una visualización con tres paneles:
+        1. Imagen original con contornos coloreados superpuestos.
+        2. Imagen binaria.
+        3. Imagen original con los puntos de inicio de cada path
+           coloreados según su contorno asignado.
+
+    Args:
+        rgb_image   : Imagen original RGB.
+        binary_image: Imagen binarizada.
+        contours    : Lista de contornos OpenCV.
+        df          : DataFrame con la asignación vectorial–raster.
+        output_path : Si se especifica, guarda la figura en esa ruta.
+    """
+    # Paleta de colores para contornos (BGR → RGB para matplotlib)
+    cmap = plt.cm.get_cmap("tab20", max(len(contours), 1))
+    colors_rgb = [cmap(i)[:3] for i in range(len(contours))]
+    colors_bgr = [(int(r * 255), int(g * 255), int(b * 255)) for r, g, b in colors_rgb]
+
+    # ── Panel 1: contornos coloreados sobre imagen original ─────────────────
+    overlay = rgb_image.copy()
+    for i, cnt in enumerate(contours):
+        color_bgr = colors_bgr[i % len(colors_bgr)]
+        # Convertir BGR a RGB para dibujar (overlay es RGB)
+        color_rgb_int = (color_bgr[2], color_bgr[1], color_bgr[0])
+        cv2.drawContours(overlay, [cnt], -1, color_rgb_int, 2)
+        # Etiqueta del contorno en su centroide
+        M = cv2.moments(cnt)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            cv2.putText(
+                overlay, f"C{i}", (cx - 10, cy),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_rgb_int, 2,
+            )
+
+    # ── Panel 3: puntos de path sobre imagen original ───────────────────────
+    points_img = rgb_image.copy()
+
+    # Colores para puntos sin contorno (gris)
+    unassigned_color = (150, 150, 150)
+
+    for _, row in df.iterrows():
+        ix = int(round(row["img_x"]))
+        iy = int(round(row["img_y"]))
+        c_idx = int(row["contour_index"])
+        if c_idx >= 0 and c_idx < len(colors_bgr):
+            col = colors_bgr[c_idx]
+            pt_color = (col[2], col[1], col[0])  # BGR→RGB
+        else:
+            pt_color = unassigned_color
+
+        cv2.circle(points_img, (ix, iy), 5, pt_color, -1)
+
+        # Etiqueta "C{idx}" cerca del punto
+        label = f"C{c_idx}" if c_idx >= 0 else "—"
+        cv2.putText(
+            points_img, label, (ix + 6, iy - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, pt_color, 1,
+        )
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(18, 7))
+    fig.suptitle("PDF Vector–Raster Pipeline", fontsize=14, fontweight="bold")
+
+    axes[0].imshow(overlay)
+    axes[0].set_title("Contornos detectados")
+    axes[0].axis("off")
+    # Leyenda de contornos
+    patches = [
+        mpatches.Patch(color=colors_rgb[i], label=f"Contorno {i}")
+        for i in range(len(contours))
+    ]
+    if patches:
+        axes[0].legend(handles=patches, loc="lower right", fontsize=7)
+
+    axes[1].imshow(binary_image, cmap="gray")
+    axes[1].set_title("Imagen binarizada + dilatación")
+    axes[1].axis("off")
+
+    axes[2].imshow(points_img)
+    axes[2].set_title("Puntos de inicio de paths (por contorno)")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"[visualize] Figura guardada en: {output_path}")
+
+    plt.show()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. PIPELINE PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_pdf(
+    pdf_path: str,
+    dpi: int = 150,
+    dilation_kernel: int = 5,
+    output_image_path: str | None = None,
+    verbose: bool = True,
+) -> tuple[np.ndarray, list[np.ndarray], pd.DataFrame]:
+    """
+    Pipeline completo: análisis vectorial + rasterización + segmentación
+    + asignación contorno–path.
+
+    Args:
+        pdf_path           : Ruta al PDF de una sola página.
+        dpi                : Resolución de rasterización.
+        dilation_kernel    : Tamaño del kernel de dilatación (NxN).
+        output_image_path  : Ruta opcional para guardar la visualización.
+        verbose            : Imprimir resumen en consola.
+
+    Returns:
+        (binary_image, contours, dataframe)
+        binary_image : NumPy array uint8 shape (H, W), valores 0/255.
+        contours     : Lista de contornos OpenCV.
+        dataframe    : DataFrame con la asignación vectorial–raster.
+    """
+    scale = dpi / 72.0
+
+    # ── Paso 1: Análisis vectorial ───────────────────────────────────────────
+    if verbose:
+        print("[1/5] Extrayendo elementos vectoriales con pikepdf …")
+    elements = extract_vector_elements(pdf_path)
+    if verbose:
+        print(f"      {len(elements)} elementos encontrados.")
+
+    # ── Paso 2: Rasterización ────────────────────────────────────────────────
+    if verbose:
+        print("[2/5] Rasterizando el PDF con PyMuPDF …")
+    rgb_image, page_width_pts, page_height_pts = rasterize_pdf(pdf_path, dpi=dpi)
+    if verbose:
+        print(f"      Imagen: {rgb_image.shape[1]}×{rgb_image.shape[0]} px  "
+              f"| Página: {page_width_pts:.1f}×{page_height_pts:.1f} pts")
+
+    # ── Paso 3: Binarización ─────────────────────────────────────────────────
+    if verbose:
+        print("[3/5] Binarizando y dilatando con NumPy/OpenCV …")
+    binary_image = binarize_image(rgb_image, dilation_kernel=dilation_kernel)
+
+    # ── Paso 4: Detección de contornos ───────────────────────────────────────
+    if verbose:
+        print("[4/5] Detectando contornos con OpenCV …")
+    contours, hierarchy = detect_contours(binary_image)
+    if verbose:
+        print(f"      {len(contours)} contornos exteriores detectados.")
+
+    # ── Paso 5: Asignación vector–raster ─────────────────────────────────────
+    if verbose:
+        print("[5/5] Asignando paths a contornos …")
+    image_shape = binary_image.shape[:2]  # (H, W)
+    df, label_map = assign_elements_to_contours(
+        elements, contours, page_height_pts, scale, image_shape
+    )
+    if verbose:
+        assigned = (df["contour_index"] >= 0).sum()
+        print(f"      {assigned}/{len(df)} paths asignados a un contorno.")
+        print()
+        print(df.to_string(index=False))
+
+    # ── Visualización ────────────────────────────────────────────────────────
+    visualize_results(
+        rgb_image, binary_image, contours, df,
+        output_path=output_image_path,
+    )
+
+    return binary_image, contours, df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. PUNTO DE ENTRADA
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Uso: python pdf_vector_raster_pipeline.py <ruta_al_pdf> [dpi] [kernel]")
+        print("Ejemplo: python pdf_vector_raster_pipeline.py documento.pdf 150 5")
+        sys.exit(1)
+
+    pdf_file = sys.argv[1]
+    dpi_arg = int(sys.argv[2]) if len(sys.argv) > 2 else 150
+    kernel_arg = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+
+    binary, cnts, dataframe = process_pdf(
+        pdf_path=pdf_file,
+        dpi=dpi_arg,
+        dilation_kernel=kernel_arg,
+        output_image_path="pipeline_output.png",
+        verbose=True,
+    )
+
+    # Guardar DataFrame como CSV
+    dataframe.to_csv("vector_raster_mapping.csv", index=False)
+    print("\nDataFrame exportado a: vector_raster_mapping.csv")
